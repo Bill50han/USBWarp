@@ -1,0 +1,7 @@
+# prepare necessary header files
+# git clone depth=1 from WSL kernel repository and cd into it
+make module_prepare LOCALVERSION=
+sudo ln -sf /path/to/WSL2-Linux-Kernel /lib/modules/$(uname -r)/build
+
+# then come back, and
+KBUILD_MODPOST_WARN=1 make
