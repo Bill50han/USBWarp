@@ -9,13 +9,13 @@ UsbWarp replaces network-based USB/IP with a zero-copy MMIO ring protocol, targe
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  WSL2 (Linux)                                               │
-│                                                             │
-│  /dev/ttyACM0  ←→  cdc_acm  ←→  usbwarp.ko (Virtual HCD)  │
-│                                       │                     │
-│                              Guest-to-Host Ring (MMIO)      │
-└───────────────────────────────────┼─────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  WSL2 (Linux)                                                            │
+│                                                                          │
+│  /dev/ttyACM0 (or other usermode interface)  ←→ usbwarp.ko (Virtual HCD) │
+│                                       │                                  │
+│                              Guest-to-Host Ring (MMIO)                   │
+└───────────────────────────────────┼──────────────────────────────────────┘
                           Section-backed MMIO
                         (Hyper-V HDV, zero-copy)
 ┌───────────────────────────────────┼─────────────────────────┐
@@ -192,7 +192,6 @@ Planned features roughly in priority order:
 - **CPU affinity for poll threads** — Pin host and guest poll threads to specific cores for consistent latency
 - **SCM service mode** — Run UsbWarpService as a proper Windows service with auto-start
 - **Configuration persistence** — Registry-based device binding that survives reboots
-- **Multi-VM support** — Bind different USB devices to different WSL2 distributions simultaneously
 - **Selective filter attachment** — Only attach UsbWarpFilter to devices that are actively bound, reducing overhead for unrelated USB devices
 - **Hot-plug support** — Detect physical USB device insertion/removal and propagate to Guest automatically
 - **USBDK-style driver replacement** — Optional mode to fully detach Windows function driver during bind for exclusive Guest access
