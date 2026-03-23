@@ -86,10 +86,8 @@ All four projects should build without errors. Output binaries are in `x64/Debug
 ```bash
 cd usbwarp_module
 
-# Edit build.sh.example or create your own build script:
-# Point KDIR to your WSL2 kernel source tree
+# !!! Edit build.sh.example or create your own build script:
 cp build.sh.example build.sh
-# Edit KDIR path in build.sh
 chmod +x build.sh
 ./build.sh
 
