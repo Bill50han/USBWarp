@@ -4,7 +4,13 @@
 
 UsbWarp replaces network-based USB/IP with a zero-copy MMIO ring protocol, targeting **<100μs round-trip latency** and **>1 GB/s throughput** for USB device access from within WSL2.
 
-> ⚠️ **Early Development** — This is the first version where end-to-end data flow works. The code is under active development, has known limitations, and has not been hardened for production use. **Use at your own risk.** Kernel drivers can cause BSODs if something goes wrong.
+> ⚠️ This project is still in active development.  
+Core protocol functionality, USB enumeration,
+bulk/control/interrupt transfers, and CDC ACM devices
+have been validated through protocol tests, fuzz testing,
+and real hardware experiments.  
+However, the implementation has not yet received
+large-scale testing, security review, or production hardening.
 
 ## How It Works
 
