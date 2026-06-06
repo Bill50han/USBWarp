@@ -250,11 +250,14 @@ static int usbwarp_poll_fn(void *data)
 			}
 		}
 
-		/* Periodic heartbeat (issue #10 fix: atomic 64-bit write). */
+		/* Periodic heartbeat (issue #10 fix: atomic 64-bit write).
+		 * Skip when G2H is paused for fuzz injection — the fuzz
+		 * injector becomes the sole G2H producer (SPSC invariant). */
 		{
 			uint64_t now = (uint64_t)ktime_get_ns();
 
-			if (now - last_heartbeat_ns >= heartbeat_interval_ns) {
+			if (now - last_heartbeat_ns >= heartbeat_interval_ns &&
+			    !usbwarp_debugfs_g2h_paused()) {
 				usbwarp_send_heartbeat(w);
 
 				/* Write 64-bit guest_heartbeat_ts as two

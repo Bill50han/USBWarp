@@ -306,6 +306,20 @@ static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 		submit.buffer_offset = usbwarp_buf_offset(w, buf_idx);
 	}
 
+	/* Reject URB submit while G2H is paused for fuzz injection.
+	 * Preserves SPSC invariant — fuzz injector is sole producer. */
+	if (usbwarp_debugfs_g2h_paused()) {
+		atomic_dec(&wdev->pending_urbs);
+		urb_table_remove(w, priv);
+		urb->hcpriv = NULL;
+		kfree(priv);
+		if (buf_idx >= 0) {
+			usbwarp_buf_free(w, buf_idx);
+			atomic_dec(&wdev->buf_in_use);
+		}
+		return -EBUSY;
+	}
+
 	ret = usbwarp_ring_produce(&w->g2h, &submit,
 				   submit.hdr.message_length);
 	if (ret) {

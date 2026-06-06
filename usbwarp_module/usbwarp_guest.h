@@ -320,4 +320,16 @@ void usbwarp_handle_device_added(struct usbwarp_hcd *w,
 void usbwarp_handle_device_removed(struct usbwarp_hcd *w,
 				   const struct usbwarp_msg_device_removed *msg);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §14  Debugfs fuzz support (gated by module param debug=1)
+ *
+ *   Always compiled in.  debugfs files only created when debug=1.
+ *   g2h_paused() returns false when debug=0 (zero overhead).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int  usbwarp_debugfs_init(void);
+void usbwarp_debugfs_exit(void);
+void usbwarp_debugfs_set_hcd(struct usbwarp_hcd *w);
+bool usbwarp_debugfs_g2h_paused(void);
+
 #endif /* USBWARP_GUEST_H */

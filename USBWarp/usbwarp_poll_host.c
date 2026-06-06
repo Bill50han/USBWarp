@@ -13,6 +13,40 @@
 
 #include "usbwarp_drv.h"
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §0  Ring produce with retry for critical messages
+ *
+ *   negotiate_resp and device_added/removed are critical — if the Ring is
+ *   full and we drop them, the Guest will never enter RUNNING or see the
+ *   device.  Retry with short delay (runs on poll thread at PASSIVE_LEVEL).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static NTSTATUS
+RingProduceRetry(
+    _In_ PUSBWARP_HOST_RING Ring,
+    _In_ const VOID *Msg,
+    _In_ ULONG MsgLen,
+    _In_ ULONG MaxRetries
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG i;
+    LARGE_INTEGER delay;
+
+    for (i = 0; i <= MaxRetries; i++) {
+        status = UsbWarpRingProduce(Ring, Msg, MsgLen);
+        if (NT_SUCCESS(status))
+            return status;
+        if (i < MaxRetries) {
+            delay.QuadPart = -10000;  /* 1 ms */
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+    }
+    KdPrint(("UsbWarp: RingProduceRetry FAILED after %u retries\n",
+             MaxRetries));
+    return status;
+}
+
 /* Forward declarations. */
 static VOID DispatchMessage(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
                             _In_ PVOID MsgBuf, _In_ ULONG MsgLen);
@@ -20,6 +54,134 @@ static VOID DispatchMessage(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
 static VOID FillMsgHeader(_Out_ struct usbwarp_msg_header *Hdr,
                            USHORT Type, ULONG DevId,
                            ULONG TxnId, ULONG TotalLen);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §0b  Ring corruption recovery
+ *
+ *   When RingConsume returns STATUS_DATA_ERROR (bad magic, impossible
+ *   message_length, etc.), the consumer is stuck — it can't determine
+ *   the corrupted message's length to skip past it.
+ *
+ *   Recovery algorithm:
+ *     1. From current ci, scan forward one cacheline (64B) at a time
+ *     2. At each position, peek the header
+ *     3. If it looks valid (magic OK + length reasonable + type in range),
+ *        advance ci to that position and resume normal consumption
+ *     4. If no valid header found within max scan distance, reset ci = pi
+ *        (drop all pending data) and log the event
+ *
+ *   All messages are cacheline-aligned, so the next valid message MUST
+ *   start on a cacheline boundary.  The triple-check (magic + length +
+ *   type range) makes false positive probability ~10^-15.
+ *
+ *   Max scan: data_size / cacheline_size cachelines (one full ring).
+ *   This runs at PASSIVE_LEVEL (poll thread) so it's safe.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Check if a header looks plausibly valid. */
+static BOOLEAN
+LooksLikeValidHeader(
+    _In_ const struct usbwarp_msg_header *Hdr,
+    _In_ ULONG UsedBytes,
+    _In_ ULONG MaxMessageSize
+    )
+{
+    ULONG aligned;
+
+    /* 1. Magic must match exactly. */
+    if (Hdr->magic != USBWARP_MSG_MAGIC)
+        return FALSE;
+
+    /* 2. Length must be at least header size and not exceed max. */
+    if (Hdr->message_length < USBWARP_MSG_HEADER_SIZE)
+        return FALSE;
+    if (Hdr->message_length > MaxMessageSize)
+        return FALSE;
+
+    /* 3. Aligned length must fit in available data. */
+    aligned = USBWARP_ALIGN_CACHELINE(Hdr->message_length);
+    if (aligned > UsedBytes)
+        return FALSE;
+
+    /* 4. Message type must be in a known range.
+     *    Valid G2H types: 1 (NEGOTIATE), 5 (ADD_ACK), 6 (REMOVE_ACK),
+     *    20 (HEARTBEAT), 31 (GUEST_SHUTDOWN), 32 (SHUTDOWN_ACK),
+     *    100 (URB_SUBMIT), 102 (URB_CANCEL), 200 (ISO_SUBMIT),
+     *    300-301 (CIRCUIT_BREAKER), 400-401 (STATS).
+     *    We use a broad range check rather than exhaustive enum match
+     *    to avoid false negatives from future message types. */
+    if (Hdr->message_type == 0 || Hdr->message_type > 500)
+        return FALSE;
+
+    return TRUE;
+}
+
+static VOID
+TryRingRecovery(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx
+    )
+{
+    PUSBWARP_HOST_RING ring = &Ctx->G2hRing;
+    ULONG ci = ring->Hdr->consumer_index;
+    ULONG pi = ReadULongAcquire(
+                   (volatile ULONG *)&ring->Hdr->producer_index);
+    ULONG used = usbwarp_ring_used(pi, ci, ring->DataMask);
+    ULONG maxScan = ring->DataSize / USBWARP_CACHELINE_SIZE;
+    ULONG scanned = 0;
+    ULONG probeIndex;
+    struct usbwarp_msg_header hdr;
+    NTSTATUS status;
+
+    if (used == 0)
+        return;  /* nothing to recover */
+
+    KdPrint(("UsbWarp: Ring corruption detected at ci=%u pi=%u used=%u, "
+             "entering recovery scan\n", ci, pi, used));
+
+    /* Scan forward one cacheline at a time. */
+    probeIndex = ci + USBWARP_CACHELINE_SIZE;
+
+    while (scanned < maxScan) {
+        scanned++;
+
+        /* Check if we've caught up with the producer. */
+        used = usbwarp_ring_used(pi, probeIndex, ring->DataMask);
+        if (used < sizeof(struct usbwarp_msg_header))
+            break;  /* no more data to scan */
+
+        status = UsbWarpRingPeekHeaderAt(ring, probeIndex, &hdr);
+        if (NT_SUCCESS(status) &&
+            LooksLikeValidHeader(&hdr, used, ring->Hdr->max_message_size)) {
+            /* Found a valid-looking header.  Advance ci to this position. */
+            ULONG skippedBytes = probeIndex - ci;
+            WriteULongRelease(
+                (volatile ULONG *)&ring->Hdr->consumer_index,
+                probeIndex);
+
+            InterlockedIncrement64(&Ctx->RingRecoveryCount);
+            InterlockedAdd64(&Ctx->RingCachelinesSkipped, (LONG64)scanned);
+
+            KdPrint(("UsbWarp: Ring RECOVERED — skipped %u bytes "
+                     "(%u cachelines) to valid message type=%u len=%u\n",
+                     skippedBytes, scanned,
+                     hdr.message_type, hdr.message_length));
+            return;
+        }
+
+        probeIndex += USBWARP_CACHELINE_SIZE;
+    }
+
+    /* No valid header found — drop all pending data. */
+    WriteULongRelease(
+        (volatile ULONG *)&ring->Hdr->consumer_index, pi);
+
+    InterlockedIncrement64(&Ctx->RingRecoveryResets);
+    InterlockedAdd64(&Ctx->RingCachelinesSkipped, (LONG64)scanned);
+
+    KdPrint(("UsbWarp: Ring RESET — scanned %u cachelines, no valid header "
+             "found. ci advanced from %u to %u (dropped %u bytes)\n",
+             scanned, ci, pi, usbwarp_ring_used(pi, ci, ring->DataMask)));
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Poll thread main function
@@ -81,6 +243,14 @@ UsbWarpPollThreadProc(
                          ((const struct usbwarp_msg_header *)msgBuf)->message_type));
             }
             gotMsg = TRUE;
+
+        } else if (consumeStatus == STATUS_DATA_ERROR) {
+            /* Ring corruption: bad magic, impossible length, or
+             * length exceeds available data.  The consumer is stuck
+             * because it can't determine the corrupted message's size.
+             * Scan forward to find the next valid message. */
+            TryRingRecovery(ctx);
+            gotMsg = TRUE;  /* don't enter idle — retry immediately */
         }
 
         /* ── Adaptive poll timing ───────────────────────────────────────── */
@@ -256,10 +426,6 @@ DispatchMessage(
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §4  Negotiate response
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 static VOID
 FillMsgHeader(
     _Out_ struct usbwarp_msg_header *Hdr,
@@ -276,6 +442,10 @@ FillMsgHeader(
     Hdr->device_id        = DevId;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §4  Negotiate response
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 VOID
 UsbWarpSendNegotiateResp(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
@@ -287,6 +457,24 @@ UsbWarpSendNegotiateResp(
 
     RtlZeroMemory(&resp, sizeof(resp));
 
+    /* Reject re-negotiation when already in RUNNING state.
+     * A fuzz or misbehaving Guest could downgrade capabilities (e.g.
+     * caps=0 disables inline data) or set max_pending_urbs=0, breaking
+     * all subsequent transfers.  Once negotiated, the session is locked. */
+    if (Ctx->Negotiated) {
+        KdPrint(("UsbWarp: negotiate REJECTED — already in RUNNING state\n"));
+        FillMsgHeader(&resp.hdr, USBWARP_MSG_NEGOTIATE_RESP, 0, 0,
+                      sizeof(resp));
+        resp.status = (int32_t)STATUS_ALREADY_REGISTERED;
+        /* Return current params so Guest can resync. */
+        resp.negotiated_version  = Ctx->NegotiatedVersion;
+        resp.capabilities        = Ctx->NegotiatedCaps;
+        resp.max_pending_urbs    = USBWARP_PENDING_URBS_DEFAULT;
+        resp.max_devices         = USBWARP_MAX_DEVICES_LIMIT;
+        RingProduceRetry(&Ctx->H2gRing, &resp, sizeof(resp), 10);
+        return;
+    }
+
     /* Choose the highest mutually-supported version. */
     version = USBWARP_PROTOCOL_VERSION;
     if (version < NegMsg->min_version || version > NegMsg->max_version) {
@@ -294,7 +482,7 @@ UsbWarpSendNegotiateResp(
         FillMsgHeader(&resp.hdr, USBWARP_MSG_NEGOTIATE_RESP, 0, 0,
                       sizeof(resp));
         resp.status = (int32_t)STATUS_NOT_SUPPORTED;
-        UsbWarpRingProduce(&Ctx->H2gRing, &resp, sizeof(resp));
+        RingProduceRetry(&Ctx->H2gRing, &resp, sizeof(resp), 10);
         KdPrint(("UsbWarp: negotiate rejected — version mismatch\n"));
         return;
     }
@@ -316,7 +504,7 @@ UsbWarpSendNegotiateResp(
     resp.max_pending_urbs    = USBWARP_PENDING_URBS_DEFAULT;
     resp.max_devices         = USBWARP_MAX_DEVICES_LIMIT;
 
-    UsbWarpRingProduce(&Ctx->H2gRing, &resp, sizeof(resp));
+    RingProduceRetry(&Ctx->H2gRing, &resp, sizeof(resp), 50);
 
     KdPrint(("UsbWarp: negotiate OK ver=%u.%u caps=0x%x\n",
              USBWARP_VERSION_MAJOR(version),
@@ -344,7 +532,7 @@ UsbWarpSendDeviceAdded(
     msg.product_id = DevCtx->ProductId;
     msg.speed     = DevCtx->Speed;
 
-    return UsbWarpRingProduce(&Ctx->H2gRing, &msg, sizeof(msg));
+    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
 }
 
 NTSTATUS
@@ -362,5 +550,5 @@ UsbWarpSendDeviceRemoved(
     msg.device_id = DevCtx->DeviceIndex;
     msg.reason    = Reason;
 
-    return UsbWarpRingProduce(&Ctx->H2gRing, &msg, sizeof(msg));
+    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
 }

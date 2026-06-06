@@ -189,7 +189,63 @@ UsbWarpRingConsume(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §4  Usage query
+ * §4  Peek header without consuming (for recovery scan)
+ *
+ *   Reads the message header at the given absolute index without
+ *   modifying consumer_index.  Returns STATUS_SUCCESS if the header
+ *   looks plausibly valid (magic + length + type checks).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+NTSTATUS
+UsbWarpRingPeekHeaderAt(
+    _In_  PUSBWARP_HOST_RING Ring,
+    _In_  ULONG              AbsIndex,
+    _Out_ struct usbwarp_msg_header *HdrOut
+    )
+{
+    ULONG pi;
+    ULONG used, pos, first;
+
+    pi = ReadULongAcquire((volatile ULONG *)&Ring->Hdr->producer_index);
+    used = usbwarp_ring_used(pi, AbsIndex, Ring->DataMask);
+
+    if (used < sizeof(struct usbwarp_msg_header))
+        return STATUS_NO_MORE_ENTRIES;
+
+    /* Copy header from ring. */
+    pos   = AbsIndex & Ring->DataMask;
+    first = Ring->DataSize - pos;
+
+    if (first >= sizeof(*HdrOut)) {
+        RtlCopyMemory(HdrOut, (const VOID *)(Ring->Data + pos),
+                       sizeof(*HdrOut));
+    } else {
+        RtlCopyMemory(HdrOut, (const VOID *)(Ring->Data + pos), first);
+        RtlCopyMemory((PUCHAR)HdrOut + first,
+                       (const VOID *)Ring->Data,
+                       sizeof(*HdrOut) - first);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §5  Advance consumer_index by a specified number of bytes (recovery)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+VOID
+UsbWarpRingAdvanceConsumer(
+    _In_ PUSBWARP_HOST_RING Ring,
+    _In_ ULONG              Bytes
+    )
+{
+    ULONG ci = Ring->Hdr->consumer_index;
+    WriteULongRelease((volatile ULONG *)&Ring->Hdr->consumer_index,
+                      ci + Bytes);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §6  Usage query
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 ULONG

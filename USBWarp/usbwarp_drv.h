@@ -275,6 +275,12 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
     LONG64               TotalUrbsProcessed;
     LONG64               TotalBytesTransferred;
 
+    /* Ring recovery stats — count of times consumer hit corruption
+     * and had to scan forward to find the next valid message. */
+    LONG64               RingRecoveryCount;     /* successful recoveries */
+    LONG64               RingRecoveryResets;     /* full ci=pi resets    */
+    LONG64               RingCachelinesSkipped;  /* total CLs scanned   */
+
     /* ── Transaction counter ────────────────────────────────────────────── */
     LONG                 TxnCounter;
 
@@ -333,6 +339,19 @@ UsbWarpRingConsume(
 ULONG
 UsbWarpRingUsagePercent(
     _In_ const PUSBWARP_HOST_RING Ring
+    );
+
+NTSTATUS
+UsbWarpRingPeekHeaderAt(
+    _In_  PUSBWARP_HOST_RING Ring,
+    _In_  ULONG              AbsIndex,
+    _Out_ struct usbwarp_msg_header *HdrOut
+    );
+
+VOID
+UsbWarpRingAdvanceConsumer(
+    _In_ PUSBWARP_HOST_RING Ring,
+    _In_ ULONG              Bytes
     );
 
 /* ═══════════════════════════════════════════════════════════════════════════

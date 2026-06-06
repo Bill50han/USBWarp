@@ -196,6 +196,8 @@ static int usbwarp_pci_probe(struct pci_dev *pdev,
 
 	device_wakeup_enable(hcd->self.controller);
 
+	usbwarp_debugfs_set_hcd(w);
+
 	ret = usbwarp_poll_start(w);
 	if (ret) {
 		dev_err(&pdev->dev, "usbwarp: poll thread failed: %d\n", ret);
@@ -243,6 +245,7 @@ static void usbwarp_pci_remove(struct pci_dev *pdev)
 
 	w->shutting_down = true;
 
+	usbwarp_debugfs_set_hcd(NULL);
 	usbwarp_poll_stop(w);
 	usb_remove_hcd(hcd);
 	usbwarp_buf_cleanup(w);
@@ -259,7 +262,7 @@ static void usbwarp_pci_remove(struct pci_dev *pdev)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §5  PCI driver struct + module init/exit
+ * §6  PCI driver struct + module init/exit
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static struct pci_driver usbwarp_pci_driver = {
@@ -271,15 +274,24 @@ static struct pci_driver usbwarp_pci_driver = {
 
 static int __init usbwarp_init(void)
 {
+	int ret;
+
 	pr_info("usbwarp: loading (protocol %u.%u)\n",
 		USBWARP_PROTOCOL_VERSION_MAJOR,
 		USBWARP_PROTOCOL_VERSION_MINOR);
-	return pci_register_driver(&usbwarp_pci_driver);
+
+	usbwarp_debugfs_init();
+
+	ret = pci_register_driver(&usbwarp_pci_driver);
+	if (ret)
+		usbwarp_debugfs_exit();
+	return ret;
 }
 
 static void __exit usbwarp_exit(void)
 {
 	pci_unregister_driver(&usbwarp_pci_driver);
+	usbwarp_debugfs_exit();
 	pr_info("usbwarp: unloaded\n");
 }
 

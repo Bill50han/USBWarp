@@ -20,10 +20,11 @@ usbwarp-objs := usbwarp_pci.o  \
                 usbwarp_ring.o \
                 usbwarp_buf.o  \
                 usbwarp_hcd.o  \
-                usbwarp_poll.o
+                usbwarp_poll.o \
+                usbwarp_debugfs.o
 
 # Extra include path for the shared protocol header.
-ccflags-y := -I$(src)/../include
+ccflags-y := -I$(src)/../include -Wall
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

@@ -274,6 +274,40 @@ HandleSubmitUrb(PFILTER_EXT Ext, PIRP OrigIrp)
     if (!Ext->UsbdHandle || !Ext->Started)
         return STATUS_INVALID_DEVICE_STATE;
 
+    /* ── Defense-in-depth: pre-validate BEFORE any allocation. ─────────
+     * These checks duplicate UsbWarp.sys Layer 4.  The filter is the
+     * LAST line of defense — if the main driver has a bug or is running
+     * an old binary, we must not send dangerous URBs to the USB stack. */
+    if (req->TransferType == USBWARP_FXFER_CONTROL) {
+        UCHAR bmReq = req->SetupPacket[0];
+        UCHAR bReq  = req->SetupPacket[1];
+        USHORT wLen = (USHORT)(req->SetupPacket[6] |
+                               (req->SetupPacket[7] << 8));
+
+        /* Block SET_ADDRESS — sends to xHCI cause fatal errors. */
+        if ((bmReq & 0x60) == 0x00 && bReq == 0x05) {
+            KdPrint(("UsbWarpFilter: BLOCKED SET_ADDRESS\n"));
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        /* wLength vs TransferLength mismatch. */
+        if (wLen != (USHORT)req->TransferLength) {
+            KdPrint(("UsbWarpFilter: BLOCKED wLen=%u != xferLen=%u\n",
+                     wLen, req->TransferLength));
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        /* Direction mismatch (only if data phase exists). */
+        if (wLen > 0) {
+            UCHAR setupDir = (bmReq & 0x80) ? 1 : 0;
+            if (setupDir != req->Direction) {
+                KdPrint(("UsbWarpFilter: BLOCKED dir mismatch setup=%u req=%u\n",
+                         setupDir, req->Direction));
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+    }
+
     /* Fix #3: Validate inline data length. */
     if (req->InlineDataLength > req->TransferLength) {
         return STATUS_INVALID_PARAMETER;
