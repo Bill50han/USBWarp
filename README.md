@@ -4,13 +4,14 @@
 
 UsbWarp replaces network-based USB/IP with a zero-copy MMIO ring protocol, targeting **<100μs round-trip latency** and **>1 GB/s throughput** for USB device access from within WSL2.
 
-> ⚠️ This project is still in active development.  
-Core protocol functionality, USB enumeration,
-bulk/control/interrupt transfers, and CDC ACM devices
-have been validated through protocol tests, fuzz testing,
-and real hardware experiments.  
-However, the implementation has not yet received
-large-scale testing, security review, or production hardening.
+> **⚠️ Alpha Release (v0.1.0-alpha)**
+>
+> This is the first working release. End-to-end USB data transfer has been
+> verified with a Raspberry Pi Pico (CDC ACM serial) through 22 hours of
+> continuous operation and 374-vector protocol fuzz testing with zero BSODs.
+>
+> **This is kernel-level software. Untested device types may cause BSODs.
+> Use in a VM with snapshots. Not for production.**
 
 ## How It Works
 
@@ -67,8 +68,15 @@ USBWarp.sln                 Visual Studio 2022 solution
 ├── USBWarpController/      CLI tool (C)
 │   └── list/bind/unbind/status commands
 │
-└── usbwarp_module/         Linux kernel module (out-of-tree)
-    └── Virtual HCD, PCI probe, Ring producer/consumer, poll thread
+├── usbwarp_module/         Linux kernel module (out-of-tree)
+│   └── Virtual HCD, PCI probe, Ring producer/consumer, poll thread
+│
+└── tests/                  Test suite
+    ├── ring_test.c             Layer 1: Ring protocol unit tests (54 tests)
+    ├── ring_fuzz.c             Layer 2: Protocol fuzz generator (374 vectors)
+    ├── run_fuzz.sh             Layer 2: Fuzz runner with pause/resume
+    ├── layer3_test.sh          Layer 3: Stress, bind/unbind, endurance
+    └── pico_helper.py          Persistent serial connection helper
 ```
 
 ## Building
@@ -92,7 +100,7 @@ All four projects should build without errors. Output binaries are in `x64/Debug
 ```bash
 cd usbwarp_module
 
-# !!! Edit build.sh.example or create your own build script:
+# Edit build.sh.example or create your own build script:
 cp build.sh.example build.sh
 chmod +x build.sh
 ./build.sh
@@ -101,6 +109,18 @@ chmod +x build.sh
 ```
 
 ## Installation
+
+### Step 0: Enable Test Signing
+
+The drivers are not WHQL-signed. Windows requires test signing mode to load them:
+
+```powershell
+bcdedit /set testsigning on
+# Reboot required
+shutdown /r /t 0
+```
+
+After reboot, a "Test Mode" watermark appears on the desktop. This is normal.
 
 ### Step 1: Install UsbWarpFilter.sys
 
@@ -117,7 +137,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-44
 # Create service entry
 sc create UsbWarpFilter type=kernel binPath=System32\drivers\UsbWarpFilter.sys
 
-# Reboot to activate (or replug USB devices)
+# Reboot to activate
 shutdown /r /t 0
 ```
 
@@ -144,7 +164,7 @@ sudo insmod usbwarp.ko
 
 ```powershell
 # Find your WSL2 VM GUID
-# (Use hcsdiag.exe list  in PowerShell)
+# (Use hcsdiag.exe list)
 
 # Start the service (console mode for now)
 .\USBWarpService.exe --id <WSL2-VM-GUID>
@@ -166,6 +186,32 @@ dmesg | tail -5
 ls /dev/ttyACM0
 ```
 
+## Test Results
+
+All testing performed with Raspberry Pi Pico (RP2040) running MicroPython, connected as USB CDC ACM serial device.
+
+| Layer | Test | Result | Details |
+|-------|------|--------|---------|
+| **1** | Ring protocol unit tests | **54/54 pass** | Alignment, wrap-around, fill/drain, 10K message data integrity |
+| **2** | Protocol fuzz (no device) | **374 vectors, zero BSOD** | Bad magic, invalid lengths, type/version/device_id/endpoint fuzzing, garbage injection |
+| **2** | Protocol fuzz (with device) | **374 vectors, zero BSOD** | SET_ADDRESS blocked, wLength mismatch blocked, re-negotiate rejected |
+| **3A** | Data echo verification | **100/100 correct** | Random arithmetic via MicroPython REPL |
+| **3B** | Bind/unbind cycles | **50/50 pass** | ~14s per cycle, zero resource leaks |
+| **3C** | Sustained load (1 hour) | **2,642 iter, zero errors** | Slab Δ=560kB (normal) |
+| **3D** | Abnormal recovery | **4/5 pass** | Double bind rejected, rapid cycles recovered, mid-transfer unbind recovered |
+| **4** | 22-hour endurance | **58,708 iter, zero errors** | Orphan mode recovery verified on sleep/wake |
+
+### Safety layers validated by fuzz testing
+
+- **L1** — Message magic validation
+- **L2** — Message type and protocol version checks
+- **L3** — Device ID bounds and binding verification
+- **L4** — Setup packet validation (SET_ADDRESS block, wLength/direction consistency)
+- **L5** — Buffer offset bounds checking
+- **Ring recovery** — Automatic scan-forward on corruption, full reset on unrecoverable damage
+- **Re-negotiate rejection** — Session locked after initial handshake
+- **Duplicate bind detection** — Container ID comparison prevents double-binding same physical device
+
 ## Current Status
 
 **What works:**
@@ -175,34 +221,61 @@ ls /dev/ttyACM0
 - ✅ Bulk IN/OUT transfers (zero-copy via shared memory)
 - ✅ Interrupt IN transfers
 - ✅ CDC ACM serial devices (tested with Raspberry Pi Pico / MicroPython)
-- ✅ Device bind/unbind lifecycle
-- ✅ Graceful shutdown with cancel propagation
+- ✅ Device bind/unbind lifecycle with duplicate detection
+- ✅ Graceful shutdown with URB cancel propagation through filter driver
+- ✅ Ring corruption recovery (scan-forward + reset)
 - ✅ Circuit breaker, rate limiter, and orphan detection safety layers
+- ✅ SHM page locking for safe DPC-level access
 
 **Known limitations:**
 
-- No isochronous transfer support (audio/video devices won't work yet)
+- Only tested with CDC ACM devices (Pi Pico) — other device types may have issues
+- No isochronous transfer support (audio/video devices won't work)
+- No hot-plug detection — unbind before unplugging; if you forget, unbind + rebind recovers
 - Single VM session only
-- Service runs in console mode (no Windows Service / SCM integration yet)
-- Filter driver attaches to *all* USB devices (no per-device targeting yet)
-- No automated driver signing (test signing required)
-- Limited error recovery on device surprise-removal
+- Service runs in console mode (no Windows Service / SCM integration)
+- Filter driver attaches to all USB class devices (no per-device targeting)
+- Drivers are not signed (test signing required)
+- Full-speed devices only validated; high-speed/super-speed devices untested
 
 ## Roadmap
 
 Planned features roughly in priority order:
 
+- **Hot-plug support** — Detect physical USB device insertion/removal and propagate to Guest automatically via `IRP_MN_SURPRISE_REMOVAL` handling in the filter driver
+- **High-speed / super-speed device testing** — Validate with USB 2.0/3.0 bulk devices (e.g., RTL-SDR, USB storage)
 - **Isochronous transfer support** — Enables USB audio interfaces, webcams, and other streaming devices
-- **Batch URB submission** — Coalesce multiple URBs into a single Ring message for reduced overhead
-- **ETW tracing** — Replace KdPrint with structured Event Tracing for Windows; sysfs stats on Linux side
-- **CPU affinity for poll threads** — Pin host and guest poll threads to specific cores for consistent latency
 - **SCM service mode** — Run UsbWarpService as a proper Windows service with auto-start
-- **Configuration persistence** — Registry-based device binding that survives reboots
 - **Selective filter attachment** — Only attach UsbWarpFilter to devices that are actively bound, reducing overhead for unrelated USB devices
-- **Hot-plug support** — Detect physical USB device insertion/removal and propagate to Guest automatically
-- **USBDK-style driver replacement** — Optional mode to fully detach Windows function driver during bind for exclusive Guest access
-- **Performance dashboard** — Real-time latency histograms and throughput metrics via a TUI or web interface
-- **Signed driver packages** — Proper WHQL or attestation signing for easy deployment without test mode
+- **ETW tracing** — Replace KdPrint with structured Event Tracing for Windows; sysfs stats on Linux side
+- **Batch URB submission** — Coalesce multiple URBs into a single Ring message for reduced overhead
+- **Configuration persistence** — Registry-based device binding that survives reboots
+- **Multi-VM support** — Bind different USB devices to different WSL2 distributions simultaneously
+- **Performance dashboard** — Real-time latency histograms and throughput metrics
+- **Signed driver packages** — WHQL or attestation signing for deployment without test mode
+
+## Running Tests
+
+```bash
+# Layer 1: Ring protocol (no hardware needed)
+cd tests
+gcc -O2 -Wall -I../include -o ring_test ring_test.c
+./ring_test
+
+# Layer 2: Protocol fuzz (requires usbwarp.ko loaded with debug=1)
+sudo insmod usbwarp.ko debug=1
+gcc -O2 -Wall -I../include -o ring_fuzz ring_fuzz.c
+sudo ./run_fuzz.sh -v
+
+# Layer 3: Stress tests (requires device bound)
+sudo ./layer3_test.sh -t 3a                          # data echo
+sudo ./layer3_test.sh -t 3b -b BUSID -s CTRL_PATH    # bind/unbind cycles
+sudo ./layer3_test.sh -t 3c -c 3600                   # 1-hour sustained
+sudo ./layer3_test.sh -t 3d -b BUSID -s CTRL_PATH    # abnormal recovery
+
+# Layer 4: 24-hour endurance
+sudo ./layer3_test.sh -t 3c -c 86400
+```
 
 ## Uninstalling
 
@@ -223,6 +296,9 @@ shutdown /r /t 0
 # Clean up files
 del C:\Windows\System32\drivers\UsbWarp.sys
 del C:\Windows\System32\drivers\UsbWarpFilter.sys
+
+# Disable test signing (optional)
+bcdedit /set testsigning off
 ```
 
 ## License

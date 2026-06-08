@@ -40,6 +40,12 @@
 #include <initguid.h>
 #include "../include/usbwarp_filter_ioctl.h"
 
+#define PRINT_LOG 0
+#if !(PRINT_LOG)
+#undef KdPrint
+#define KdPrint(_x_) 
+#endif
+
 #define FILTER_TAG  'tFwU'   /* UwFt */
 
 /* ═══════════════════════════════════════════════════════════════════════════
