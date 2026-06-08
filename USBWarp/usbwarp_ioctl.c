@@ -488,6 +488,8 @@ HandleBindDevice(
     size_t bufLen;
     ULONG slot;
     PUSBWARP_DEVICE_CONTEXT devCtx;
+    GUID  bindContainerId = { 0 };
+    BOOLEAN bindHaveContainerId = FALSE;
 
     if (InLen < sizeof(*in) || OutLen < sizeof(*out))
         return STATUS_BUFFER_TOO_SMALL;
@@ -527,9 +529,81 @@ HandleBindDevice(
     if (slot == 0)
         return STATUS_INSUFFICIENT_RESOURCES;
 
+    /* ── Duplicate detection via Container ID ────────────────────────
+     *
+     * Before touching devCtx or calling UsbWarpDeviceOpen (which sends
+     * SELECT_CONFIG and would invalidate existing pipe handles), open
+     * a lightweight temporary IoTarget to query the PDO's Container ID.
+     *
+     * Container ID is a PnP GUID that groups all devnodes of the same
+     * physical device — perfect for detecting double-bind.
+     */
+    {
+        WDFIOTARGET          tempTarget = NULL;
+        WDF_IO_TARGET_OPEN_PARAMS openParams;
+        UNICODE_STRING       devPath;
+        WCHAR                pathBuf[256];
+        PDEVICE_OBJECT       targetDO, pdo;
+        DEVPROPTYPE          propType;
+        ULONG                requiredSize = 0;
+        NTSTATUS             cidStatus;
+
+        /* Build path from input buffer (devCtx not initialized yet). */
+        RtlZeroMemory(pathBuf, sizeof(pathBuf));
+        RtlCopyMemory(pathBuf, in->InstancePath, in->InstancePathLength);
+        RtlInitUnicodeString(&devPath, pathBuf);
+
+        cidStatus = WdfIoTargetCreate(Ctx->ControlDevice,
+                                       WDF_NO_OBJECT_ATTRIBUTES, &tempTarget);
+        if (NT_SUCCESS(cidStatus)) {
+            WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(
+                &openParams, &devPath, GENERIC_READ | GENERIC_WRITE);
+            openParams.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+            cidStatus = WdfIoTargetOpen(tempTarget, &openParams);
+        }
+
+        if (NT_SUCCESS(cidStatus)) {
+            targetDO = WdfIoTargetWdmGetTargetDeviceObject(tempTarget);
+            if (targetDO) {
+                pdo = IoGetDeviceAttachmentBaseRef(targetDO);
+                if (pdo) {
+                    cidStatus = IoGetDevicePropertyData(
+                        pdo, &DEVPKEY_Device_ContainerId,
+                        LOCALE_NEUTRAL, 0,
+                        sizeof(GUID), &bindContainerId,
+                        &requiredSize, &propType);
+                    ObDereferenceObject(pdo);
+
+                    if (NT_SUCCESS(cidStatus) &&
+                        propType == DEVPROP_TYPE_GUID)
+                        bindHaveContainerId = TRUE;
+                }
+            }
+            WdfIoTargetClose(tempTarget);
+        }
+
+        if (tempTarget)
+            WdfObjectDelete(tempTarget);
+
+        /* Check for duplicate if we got a Container ID. */
+        if (bindHaveContainerId) {
+            for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
+                if (!Ctx->Devices[i].InUse) continue;
+                if (!Ctx->Devices[i].ContainerIdValid) continue;
+                if (RtlEqualMemory(&Ctx->Devices[i].ContainerId,
+                                    &bindContainerId, sizeof(GUID))) {
+                    KdPrint(("UsbWarp: DUPLICATE BIND rejected — "
+                             "same device already in slot %u\n", i + 1));
+                    return STATUS_ALREADY_REGISTERED;
+                }
+            }
+        }
+    }
+
+    /* ── Initialize device context ───────────────────────────────────── */
     devCtx = &Ctx->Devices[slot - 1];
 
-    /* Initialise device context. */
     RtlZeroMemory(devCtx, sizeof(*devCtx));
     devCtx->InUse       = TRUE;
     devCtx->DeviceIndex = slot;
@@ -541,14 +615,20 @@ HandleBindDevice(
     RtlCopyMemory(devCtx->InstancePathBuf, in->InstancePath,
                    in->InstancePathLength);
     RtlInitUnicodeString(&devCtx->InstancePath, devCtx->InstancePathBuf);
-    /* Ensure NUL termination. */
     devCtx->InstancePathBuf[in->InstancePathLength / sizeof(WCHAR)] = L'\0';
 
     /* Initialise rate limiter and circuit breaker. */
     UsbWarpTokenBucketInit(&devCtx->TokenBucket, 200, 100);
     UsbWarpBreakerInit(&devCtx->Breaker);
 
-    /* Open the USB device via WDF I/O target. */
+    /* Store Container ID from pre-open query. */
+    if (bindHaveContainerId) {
+        devCtx->ContainerId      = bindContainerId;
+        devCtx->ContainerIdValid = TRUE;
+    }
+
+    /* Open the USB device via WDF I/O target.
+     * Safe now — we know this isn't a duplicate. */
     status = UsbWarpDeviceOpen(Ctx, devCtx, &devCtx->InstancePath);
     if (!NT_SUCCESS(status)) {
         KdPrint(("UsbWarp: device open failed 0x%x for slot %u\n",

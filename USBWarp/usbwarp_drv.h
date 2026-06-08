@@ -18,6 +18,10 @@
 #include <usbdlib.h>
 #include <usbioctl.h>
 #include <initguid.h>
+#include <devpkey.h>   /* DEVPKEY_Device_ContainerId */
+
+ // ntoskrnl export, not declared in wdm.h
+NTKERNELAPI PDEVICE_OBJECT IoGetDeviceAttachmentBaseRef(PDEVICE_OBJECT DeviceObject);
 
 /* MmSectionObjectType is exported by ntoskrnl but not declared in all
  * WDK headers.  Declare it explicitly for ObReferenceObjectByHandle. */
@@ -187,6 +191,12 @@ typedef struct _USBWARP_DEVICE_CONTEXT {
     /* Statistics */
     LONG64               TotalUrbs;
     LONG64               TotalBytes;
+
+    /* Physical device identity — Container ID from PnP manager.
+     * Used to detect duplicate bind of the same physical device.
+     * All devnodes of a composite USB device share one Container ID. */
+    GUID                 ContainerId;
+    BOOLEAN              ContainerIdValid;
 } USBWARP_DEVICE_CONTEXT, *PUSBWARP_DEVICE_CONTEXT;
 
 /* ═══════════════════════════════════════════════════════════════════════════

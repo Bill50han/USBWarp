@@ -221,7 +221,7 @@ del C:\Windows\System32\drivers\UsbWarpFilter.sys
 
 ## License
 
-GPL-2.0-only. See [LICENSE.txt](LICENSE.txt).
+GPL-2.0-only. See [LICENSE](LICENSE).
 
 ## Acknowledgements
 
