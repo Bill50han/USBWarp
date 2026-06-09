@@ -707,6 +707,10 @@ HandleUnbindDevice(
     if (!devCtx)
         return STATUS_DEVICE_DOES_NOT_EXIST;
 
+    /* Atomically claim cleanup — prevents race with hot-remove callback. */
+    if (InterlockedCompareExchange(&devCtx->Removing, 1, 0) != 0)
+        return STATUS_DEVICE_DOES_NOT_EXIST;  /* hot-remove already handling it */
+
     /* Notify Guest BEFORE closing device.  If Ring is full, log warning
      * but proceed with close — we cannot leave a device open after the
      * user explicitly requested unbind. */
@@ -720,6 +724,7 @@ HandleUnbindDevice(
     UsbWarpDeviceClose(Ctx, devCtx);
 
     devCtx->InUse = FALSE;
+    InterlockedExchange(&devCtx->Removing, 0);
     InterlockedDecrement(&Ctx->ActiveDeviceCount);
 
     KdPrint(("UsbWarp: device unbound slot=%u\n", devCtx->DeviceIndex));

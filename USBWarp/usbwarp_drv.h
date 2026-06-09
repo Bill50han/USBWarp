@@ -197,6 +197,9 @@ typedef struct _USBWARP_DEVICE_CONTEXT {
      * All devnodes of a composite USB device share one Container ID. */
     GUID                 ContainerId;
     BOOLEAN              ContainerIdValid;
+
+    /* Atomic guard for concurrent cleanup (hot-remove vs manual unbind). */
+    LONG                 Removing;
 } USBWARP_DEVICE_CONTEXT, *PUSBWARP_DEVICE_CONTEXT;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -297,6 +300,15 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
 } USBWARP_GLOBAL_CONTEXT, *PUSBWARP_GLOBAL_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(USBWARP_GLOBAL_CONTEXT, UsbWarpGetContext)
+
+/* Context attached to each filter IoTarget — maps Target back to device slot
+ * for PnP removal callbacks (hot-plug auto-unbind). */
+typedef struct _USBWARP_TARGET_CONTEXT {
+    PUSBWARP_GLOBAL_CONTEXT GlobalCtx;
+    ULONG                   DeviceIndex;  /* 1-based */
+} USBWARP_TARGET_CONTEXT, *PUSBWARP_TARGET_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(USBWARP_TARGET_CONTEXT, UsbWarpGetTargetContext)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §10  Function declarations — usbwarp_entry.c

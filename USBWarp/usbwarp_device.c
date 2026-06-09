@@ -25,6 +25,11 @@
 
 static EVT_WDF_REQUEST_COMPLETION_ROUTINE UrbProxyCompletion;
 
+/* PnP hot-plug removal callbacks */
+static EVT_WDF_IO_TARGET_QUERY_REMOVE    UsbWarpEvtTargetQueryRemove;
+static EVT_WDF_IO_TARGET_REMOVE_CANCELED UsbWarpEvtTargetRemoveCanceled;
+static EVT_WDF_IO_TARGET_REMOVE_COMPLETE UsbWarpEvtTargetRemoveComplete;
+
 static VOID SendUrbComplete(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
     _In_opt_ PUSBWARP_URB_CONTEXT UrbCtx,
@@ -109,6 +114,94 @@ SendFilterIoctlSync(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * §1b  PnP hot-plug removal callbacks
+ *
+ *   When the physical USB device is unplugged while bound, WDF invokes
+ *   these callbacks on the IoTarget.  This enables automatic unbind
+ *   without user intervention.
+ *
+ *   Flow: unplug → PnP SURPRISE_REMOVAL → WDF detects target gone
+ *         → QueryRemove → RemoveComplete → we auto-unbind
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static NTSTATUS
+UsbWarpEvtTargetQueryRemove(WDFIOTARGET Target)
+{
+    /* PnP is asking "can this device be removed?"  Always agree —
+     * we're a passthrough consumer, not a storage volume. */
+    KdPrint(("UsbWarp: PnP QueryRemove for target %p\n", Target));
+    WdfIoTargetCloseForQueryRemove(Target);
+    return STATUS_SUCCESS;
+}
+
+static VOID
+UsbWarpEvtTargetRemoveCanceled(WDFIOTARGET Target)
+{
+    WDF_IO_TARGET_OPEN_PARAMS openParams;
+
+    /* PnP changed its mind — reopen the target. */
+    KdPrint(("UsbWarp: PnP RemoveCanceled — reopening target\n"));
+    WDF_IO_TARGET_OPEN_PARAMS_INIT_REOPEN(&openParams);
+    WdfIoTargetOpen(Target, &openParams);
+}
+
+static VOID
+UsbWarpEvtTargetRemoveComplete(WDFIOTARGET Target)
+{
+    PUSBWARP_TARGET_CONTEXT tgtCtx = UsbWarpGetTargetContext(Target);
+    PUSBWARP_GLOBAL_CONTEXT ctx;
+    PUSBWARP_DEVICE_CONTEXT devCtx;
+    ULONG idx;
+
+    if (!tgtCtx || !tgtCtx->GlobalCtx)
+        return;
+
+    ctx = tgtCtx->GlobalCtx;
+    idx = tgtCtx->DeviceIndex;
+
+    if (idx == 0 || idx > USBWARP_MAX_DEVICES_LIMIT)
+        return;
+
+    devCtx = &ctx->Devices[idx - 1];
+
+    /* Atomically claim cleanup.  If manual unbind already set Removing=1,
+     * we skip to prevent double-free / double-close. */
+    if (InterlockedCompareExchange(&devCtx->Removing, 1, 0) != 0)
+        return;  /* manual unbind already handling it */
+
+    if (!devCtx->InUse) {
+        InterlockedExchange(&devCtx->Removing, 0);
+        return;
+    }
+
+    KdPrint(("UsbWarp: HOT-REMOVE auto-unbind slot=%u VID=%04x PID=%04x\n",
+             idx, devCtx->VendorId, devCtx->ProductId));
+
+    /* Notify Guest: device disappeared. */
+    UsbWarpSendDeviceRemoved(ctx, devCtx, 1 /* reason = hot_remove */);
+
+    /* Cancel pending URBs.  WDF already stopped the IoTarget, so
+     * WdfIoTargetStop is not needed.  Just drain the pending list. */
+    if (InterlockedCompareExchange(&devCtx->PendingCount, 0, 0) > 0) {
+        KeClearEvent(&devCtx->DrainEvent);
+        /* Pending completions will fire with STATUS_CANCELLED as
+         * WDF completes the in-flight requests.  Wait briefly. */
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -50000000LL;  /* 5 seconds */
+        KeWaitForSingleObject(&devCtx->DrainEvent, Executive,
+                              KernelMode, FALSE, &timeout);
+    }
+
+    /* Mark slot as free.  Don't call UsbWarpDeviceClose — WDF has
+     * already closed/deleted the IoTarget internals. */
+    devCtx->InUse = FALSE;
+    InterlockedExchange(&devCtx->Removing, 0);
+    InterlockedDecrement(&ctx->ActiveDeviceCount);
+
+    KdPrint(("UsbWarp: hot-remove complete, slot %u freed\n", idx));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * §2  Device open — via UsbWarpFilter proxy
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -134,7 +227,7 @@ UsbWarpDeviceOpen(
     /* Open the USB device interface path.  This goes to the TOP of the
      * USB device stack.  UsbWarpFilter.sys (class upper filter) intercepts
      * our custom IOCTLs; normal IOCTLs pass through to the function driver. */
-    WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, USBWARP_TARGET_CONTEXT);
     attrs.ParentObject = Ctx->ControlDevice;
 
     status = WdfIoTargetCreate(Ctx->ControlDevice, &attrs, &DevCtx->FilterTarget);
@@ -143,10 +236,25 @@ UsbWarpDeviceOpen(
         return status;
     }
 
+    /* Store back-pointer so PnP callbacks can find the device context. */
+    {
+        PUSBWARP_TARGET_CONTEXT tgtCtx =
+            UsbWarpGetTargetContext(DevCtx->FilterTarget);
+        tgtCtx->GlobalCtx   = Ctx;
+        tgtCtx->DeviceIndex = DevCtx->DeviceIndex;
+    }
+
     WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(
         &openParams, &DevCtx->InstancePath,
         GENERIC_READ | GENERIC_WRITE);
     openParams.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    /* Register PnP removal callbacks for hot-plug auto-unbind.
+     * When the physical USB device is unplugged, WDF invokes these
+     * instead of leaving the IoTarget in a silently broken state. */
+    openParams.EvtIoTargetQueryRemove    = UsbWarpEvtTargetQueryRemove;
+    openParams.EvtIoTargetRemoveCanceled = UsbWarpEvtTargetRemoveCanceled;
+    openParams.EvtIoTargetRemoveComplete = UsbWarpEvtTargetRemoveComplete;
 
     status = WdfIoTargetOpen(DevCtx->FilterTarget, &openParams);
     if (!NT_SUCCESS(status)) {
@@ -384,6 +492,13 @@ UrbProxyCompletion(
 
     devCtx = &ctx->Devices[urbCtx->DeviceIndex - 1];
 
+    /* Defensive check: if device was unbound between URB submit and
+     * completion, skip statistics and breaker updates.  The DrainEvent
+     * mechanism normally guarantees completions finish before InUse is
+     * cleared, but belt-and-suspenders never hurts in kernel code. */
+    if (!devCtx->InUse)
+        goto FreeOnly;
+
     /* Record breaker status. */
     if (protoStatus == USBWARP_STATUS_SUCCESS)
         UsbWarpBreakerRecordSuccess(&devCtx->Breaker);
@@ -457,6 +572,42 @@ UsbWarpProcessUrbSubmit(
         return;
     }
 
+    /* Layer 4: Control transfer setup packet validation (spec §5.3) */
+    if (Msg->transfer_type == USBWARP_XFER_CONTROL) {
+        UCHAR bmReqType = Msg->setup_packet[0];
+        UCHAR bRequest  = Msg->setup_packet[1];
+        USHORT wLength  = (USHORT)(Msg->setup_packet[6] |
+                                    (Msg->setup_packet[7] << 8));
+
+        /* Block SET_ADDRESS — managed by HCD, not proxied. */
+        if ((bmReqType & 0x60) == 0x00 && bRequest == 0x05) {
+            SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+            return;
+        }
+
+        /* wLength must match transfer_length. */
+        if (wLength != Msg->transfer_length) {
+            KdPrint(("UsbWarp: setup wLength=%u != transfer_length=%u\n",
+                     wLength, Msg->transfer_length));
+            UsbWarpBreakerRecordProtoError(&devCtx->Breaker);
+            SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+            return;
+        }
+
+        /* Direction bit in bmRequestType must match message direction.
+         * Bit 7: 0=Host-to-Device(OUT), 1=Device-to-Host(IN). */
+        if (wLength > 0) {
+            UCHAR setupDir = (bmReqType & 0x80) ? 1 : 0;
+            if (setupDir != Msg->direction) {
+                KdPrint(("UsbWarp: setup dir=%u != msg dir=%u\n",
+                         setupDir, Msg->direction));
+                UsbWarpBreakerRecordProtoError(&devCtx->Breaker);
+                SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+                return;
+            }
+        }
+    }
+
     /* Layer 5: Buffer bounds (BUFFER mode) */
     PVOID transferVa = NULL;
     if (Msg->data_mode == USBWARP_DATA_BUFFER && Msg->transfer_length > 0) {
@@ -492,6 +643,9 @@ UsbWarpProcessUrbSubmit(
     KeQuerySystemTime(&urbCtx->SubmitTime);
     urbCtx->GuestSubmitTime.QuadPart = (LONGLONG)Msg->hdr.timestamp;
 
+    /* Setup packet validation (SET_ADDRESS block, wLength/direction checks)
+     * is done earlier in Layer 4, before any allocations.  Here we only
+     * copy the already-validated 8-byte setup packet. */
     if (Msg->transfer_type == USBWARP_XFER_CONTROL)
         RtlCopyMemory(urbCtx->SetupPacket, Msg->setup_packet, 8);
 
