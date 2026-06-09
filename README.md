@@ -198,8 +198,10 @@ All testing performed with Raspberry Pi Pico (RP2040) running MicroPython, conne
 | **3A** | Data echo verification | **100/100 correct** | Random arithmetic via MicroPython REPL |
 | **3B** | Bind/unbind cycles | **50/50 pass** | ~14s per cycle, zero resource leaks |
 | **3C** | Sustained load (1 hour) | **2,642 iter, zero errors** | Slab Δ=560kB (normal) |
-| **3D** | Abnormal recovery | **4/5 pass** | Double bind rejected, rapid cycles recovered, mid-transfer unbind recovered |
+| **3D** | Abnormal recovery | **pass\*** | Double bind rejected, rapid cycles recovered, mid-transfer unbind recovered |
 | **4** | 22-hour endurance | **58,708 iter, zero errors** | Orphan mode recovery verified on sleep/wake |
+
+> \*One scenario was inconclusive due to a known MicroPython CDC REPL issue where the device occasionally becomes unresponsive after reconnect. Rebinding the device restored normal operation.
 
 ### Safety layers validated by fuzz testing
 
