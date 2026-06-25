@@ -580,6 +580,18 @@ UsbWarpEmergencyShutdown(
         }
     }
 
+    /* CRITICAL: Flush all queued DPCs across all processors.
+     * UrbProxyCompletion runs as a DPC — even after DrainEvent fires,
+     * the DPC may still be queued but not yet executed.  Without this
+     * flush, unloading the driver while DPCs are in-flight causes
+     * DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS (0xCE).
+     *
+     * KeFlushQueuedDpcs blocks until all queued DPCs complete.
+     * Must be called at IRQL <= APC_LEVEL (we're at PASSIVE_LEVEL). */
+    KdPrint(("UsbWarp: flushing queued DPCs...\n"));
+    KeFlushQueuedDpcs();
+    KdPrint(("UsbWarp: DPC flush complete\n"));
+
     /* ── Priority 2: Stop poll thread ───────────────────────────────────── */
     UsbWarpPollStop(Ctx);
 

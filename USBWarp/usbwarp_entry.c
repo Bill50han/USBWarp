@@ -11,11 +11,17 @@
 
 #include "usbwarp_drv.h"
 
+/* Forward declarations */
+EVT_WDF_DRIVER_UNLOAD                   UsbWarpEvtDriverUnload;
+EVT_WDF_DEVICE_SHUTDOWN_NOTIFICATION    UsbWarpEvtShutdown;
+
+static EVT_WDF_OBJECT_CONTEXT_CLEANUP   UsbWarpEvtDeviceCleanup;
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
 #pragma alloc_text(PAGE, UsbWarpDeviceAdd)
 #pragma alloc_text(PAGE, UsbWarpEvtDriverUnload)
-#pragma alloc_text(PAGE, UsbWarpEvtDriverCleanup)
+#pragma alloc_text(PAGE, UsbWarpEvtDeviceCleanup)
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -44,7 +50,6 @@ DriverEntry(
     config.EvtDriverUnload  = UsbWarpEvtDriverUnload;
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
-    attributes.EvtCleanupCallback = UsbWarpEvtDriverCleanup;
 
     status = WdfDriverCreate(DriverObject,
                              RegistryPath,
@@ -111,9 +116,17 @@ UsbWarpDeviceAdd(
     WdfControlDeviceInitSetShutdownNotification(
         DeviceInit, UsbWarpEvtShutdown, WdfDeviceShutdown);
 
-    /* Device context. */
+    /* Device context + cleanup callback.
+     * EvtCleanupCallback on the WDFDEVICE fires when the device is
+     * being deleted (during sc stop / driver unload).  This is where
+     * we run EmergencyShutdown + KeFlushQueuedDpcs to guarantee all
+     * in-flight DPCs complete before driver code is unloaded.
+     *
+     * Using WDFDEVICE (not WDFDRIVER) means the callback parameter
+     * IS the device — we can call UsbWarpGetContext directly. */
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&devAttributes,
                                             USBWARP_GLOBAL_CONTEXT);
+    devAttributes.EvtCleanupCallback = UsbWarpEvtDeviceCleanup;
 
     status = WdfDeviceCreate(&DeviceInit, &devAttributes, &controlDevice);
     if (!NT_SUCCESS(status)) {
@@ -204,16 +217,40 @@ UsbWarpEvtDriverUnload(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §5  Driver cleanup (called when WDFDRIVER is deleted)
+ * §5  Device cleanup (WDFDEVICE being deleted — last chance before unload)
+ *
+ *   This fires when WDF deletes the control device during driver unload.
+ *   It is the FINAL callback before driver code is unloaded from memory.
+ *
+ *   If the Service disconnected and orphan mode hasn't completed
+ *   EmergencyShutdown yet, it runs here.  If it already ran (via
+ *   ran (via orphan timeout or system shutdown), the EmergencyMode flag
+ *   makes it a no-op.
+ *
+ *   KeFlushQueuedDpcs at the end is our absolute guarantee that no
+ *   DPC references UsbWarp.sys code when we return.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 VOID
-UsbWarpEvtDriverCleanup(
-    _In_ WDFOBJECT DriverObject
+UsbWarpEvtDeviceCleanup(
+    _In_ WDFOBJECT DeviceObject
     )
 {
-    UNREFERENCED_PARAMETER(DriverObject);
+    PUSBWARP_GLOBAL_CONTEXT ctx;
+
     PAGED_CODE();
 
-    KdPrint(("UsbWarp: driver cleanup\n"));
+    KdPrint(("UsbWarp: device cleanup (final)\n"));
+
+    ctx = UsbWarpGetContext((WDFDEVICE)DeviceObject);
+    if (!ctx)
+        return;
+
+    /* Run EmergencyShutdown if not already done (idempotent). */
+    UsbWarpEmergencyShutdown(ctx);
+
+    /* Final DPC flush — absolute last chance before code unloads. */
+    KeFlushQueuedDpcs();
+
+    KdPrint(("UsbWarp: device cleanup complete — safe to unload\n"));
 }
