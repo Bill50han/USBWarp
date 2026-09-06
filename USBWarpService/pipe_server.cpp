@@ -350,7 +350,7 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
         uint32_t deviceIndex;
         uint16_t vid, pid;
 
-        if (!DrvClientBindGuid(s, req->device_guid, widePath,
+        if (!DrvClientBindGuid(s, req->device_guid, widePath, req->speed,
                                &deviceIndex, &vid, &pid)) {
             SendSimple(hPipe, seqId, -1, "bind failed (driver rejected)");
             return;
@@ -397,6 +397,7 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
     dev->binding = true;
     dev->device_index = (uint32_t)(freeSlot + 1);
     memcpy(dev->device_guid, req->device_guid, 16);
+    dev->speed = req->speed;
     wcscpy_s(dev->instance_path, widePath);
 
     LeaveCriticalSection(&s->deviceLock);

@@ -218,6 +218,13 @@ static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 	xfer_len = urb->transfer_buffer_length;
 	is_out   = usb_pipeout(urb->pipe);
 
+	/* ISO transfers use separate ring messages (ISO_SUBMIT) which are
+	 * not implemented yet.  Fail cleanly — without this the URB falls
+	 * through the transfer-type chain as a zeroed control transfer and
+	 * the host's L4 validation rejects it as a confusing -EPROTO. */
+	if (usb_pipeisoc(urb->pipe))
+		return -ENOSYS;
+
 	use_inline = (xfer_len > 0 && xfer_len <= USBWARP_INLINE_DATA_SIZE &&
 		      (w->negotiated_caps & USBWARP_CAP_INLINE_DATA));
 
@@ -771,6 +778,14 @@ void usbwarp_handle_device_added(struct usbwarp_hcd *w,
 		break;
 	case USBWARP_SPEED_HIGH:
 		w->port_status[id - 1] |= USB_PORT_STAT_HIGH_SPEED;
+		break;
+	case USBWARP_SPEED_SUPER:
+		/* No super-speed port bit exists on a USB2 root hub —
+		 * enumerate as high-speed (best effort). */
+		w->port_status[id - 1] |= USB_PORT_STAT_HIGH_SPEED;
+		dev_info(&w->pdev->dev,
+			 "usbwarp: SS device id=%u enumerated as high-speed\n",
+			 id);
 		break;
 	default:
 		break;

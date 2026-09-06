@@ -64,6 +64,13 @@ USBWARP_STATIC_ASSERT(offsetof(USBWARP_ENUM_DEVICE_ENTRY, TotalBytes) == 40, "")
 USBWARP_STATIC_ASSERT(sizeof(USBWARP_ENUM_DEVICES_OUT) ==
                8 + USBWARP_MAX_DEVICES_LIMIT * sizeof(USBWARP_ENUM_DEVICE_ENTRY), "");
 
+/* Bind request layouts are frozen across versions — the speed fields
+ * reuse former padding, so offsets and total sizes are unchanged. */
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_bind_request) == 20, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_pipe_bind_request, speed) == 18, "");
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_BIND_DEVICE_IN) == 548, "");
+USBWARP_STATIC_ASSERT(offsetof(USBWARP_BIND_DEVICE_IN, Speed) == 540, "");
+
 /* Power-of-2 check macro */
 USBWARP_STATIC_ASSERT(USBWARP_IS_POWER_OF_2(64),    "");
 USBWARP_STATIC_ASSERT(USBWARP_IS_POWER_OF_2(4096),  "");

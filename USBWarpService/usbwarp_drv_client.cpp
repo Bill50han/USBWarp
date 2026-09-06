@@ -255,7 +255,7 @@ BOOL DrvClientEnumDevices(struct warp_session *s, USBWARP_ENUM_DEVICES_OUT *out)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 BOOL DrvClientBindGuid(struct warp_session *s, const uint8_t device_guid[16],
-                       const WCHAR *instance_path,
+                       const WCHAR *instance_path, uint8_t speed,
                        uint32_t *device_index, uint16_t *vendor_id,
                        uint16_t *product_id)
 {
@@ -270,6 +270,7 @@ BOOL DrvClientBindGuid(struct warp_session *s, const uint8_t device_guid[16],
     in.InstancePathLength =
         (uint32_t)(wcslen(instance_path) + 1) * sizeof(WCHAR);
     wcsncpy_s((wchar_t *)in.InstancePath, 256, instance_path, _TRUNCATE);
+    in.Speed = speed;
     memset(&out, 0, sizeof(out));
 
     AcquireSRWLockShared(&s->driverLock);

@@ -308,7 +308,7 @@ void ServiceSendDeviceAdded(struct warp_session *s, uint32_t devIdx)
     msg.device_id  = dev->device_index;
     msg.vendor_id  = dev->vendor_id;
     msg.product_id = dev->product_id;
-    msg.speed      = USBWARP_SPEED_HIGH;  /* default; actual from USB enum */
+    msg.speed      = dev->speed ? dev->speed : USBWARP_SPEED_FULL;
 
     if (ServiceRingProduce(s, &msg, sizeof(msg)) != 0)
         LogError("Failed to send DEVICE_ADDED (H2G ring full)");

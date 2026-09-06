@@ -96,9 +96,10 @@ struct usbwarp_pipe_device_list {
 /* ── 4.3  BIND / UNBIND request ───────────────────────────────────────────── */
 
 struct usbwarp_pipe_bind_request {
-    uint8_t  device_guid[16];
+    uint8_t  device_guid[16];            /* binary GUID                       */
     uint16_t instance_path_length;       /* bytes of UTF-8 instance path      */
-    uint16_t _pad;
+    uint8_t  speed;                      /* enum usbwarp_usb_speed, 0 = unknown */
+    uint8_t  _pad;
     /* char instance_path[];  — variable length, NOT NUL-terminated          */
 };
 

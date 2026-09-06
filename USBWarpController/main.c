@@ -111,10 +111,10 @@ static int CmdList(int argc, char *argv[])
 
     /* Print device list. */
     printf("\n");
-    printf("  %-10s  %-9s  %-8s  %s\n",
-           "BUSID", "VID:PID", "STATE", "DESCRIPTION");
-    printf("  %-10s  %-9s  %-8s  %s\n",
-           "----------", "---------", "--------",
+    printf("  %-10s  %-9s  %-4s  %-8s  %s\n",
+           "BUSID", "VID:PID", "SPD", "STATE", "DESCRIPTION");
+    printf("  %-10s  %-9s  %-4s  %-8s  %s\n",
+           "----------", "---------", "----", "--------",
            "-------------------------------------------");
 
     if (devList.count == 0) {
@@ -124,6 +124,7 @@ static int CmdList(int argc, char *argv[])
     for (i = 0; i < devList.count; i++) {
         USB_HOST_DEVICE *d = &devList.devices[i];
         const char *state;
+        char spd[2] = { SpeedLetter(d->speed), '\0' };
 
         if (d->bound)
             state = "Attached";
@@ -132,9 +133,10 @@ static int CmdList(int argc, char *argv[])
         else
             state = "Unknown";
 
-        printf("  %-10s  %04x:%04x  %-8s  %s\n",
+        printf("  %-10s  %04x:%04x  %-4s  %-8s  %s\n",
                d->busId,
                d->vendorId, d->productId,
+               spd,
                state,
                d->description);
     }
@@ -351,6 +353,7 @@ static int CmdBind(int argc, char *argv[])
         memset(&req, 0, sizeof(req));
         memcpy(req.device_guid, &found->containerId, 16);
         req.instance_path_length = (uint16_t)pathLen;
+        req.speed = found->speed;   /* 0 = unknown, kernel uses heuristic */
 
         memcpy(payload, &req, sizeof(req));
         memcpy(payload + sizeof(req), pathToSend, pathLen);

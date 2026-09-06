@@ -13,12 +13,27 @@
 #include <initguid.h>   /* must precede devpkey.h to define DEVPKEY GUIDs */
 #include <devpkey.h>
 #include <cfgmgr32.h>
+#include <winioctl.h>   /* FILE_ANY_ACCESS, used by usbioctl.h CTL_CODEs */
+#include <usbioctl.h>
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 static const GUID GUID_DEVINTERFACE_USB_DEVICE_LOCAL =
     { 0xA5DCBF10L, 0x6530, 0x11D2,
       { 0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED } };
+
+static const GUID GUID_DEVINTERFACE_USB_HUB_LOCAL =
+    { 0xF18A0E88L, 0xC30C, 0x11D0,
+      { 0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8 } };
+
+/* USB_DEVICE_SPEED values from the hub ioctl reply.  Defined locally —
+ * UsbSuperSpeedPlus is missing from older SDK headers. */
+#define USB_HUB_SPEED_LOW       0
+#define USB_HUB_SPEED_FULL      1
+#define USB_HUB_SPEED_HIGH      2
+#define USB_HUB_SPEED_SUPER     3
+#define USB_HUB_SPEED_SUPERPLUS 4
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  VID/PID parser
@@ -119,6 +134,81 @@ static bool GetContainerId(HDEVINFO devInfo, PSP_DEVINFO_DATA devData,
         }
     }
     return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §4b  Query connection speed from the parent hub
+ *
+ *   The kernel-side fallback infers speed from bulk-EP maxpacket, which
+ *   misreports devices without bulk endpoints (UVC/UAC) as full-speed and
+ *   never reports low-speed.  The hub driver knows the truth — ask it via
+ *   IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX.  Returns 0 (unknown) on
+ *   any failure; the kernel then uses its heuristic.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static uint8_t GetDeviceSpeed(HDEVINFO devInfo, PSP_DEVINFO_DATA devData)
+{
+    DEVINST      parent;
+    WCHAR        location[64];
+    DEVPROPTYPE  propType;
+    DWORD        propSize = 0;
+    ULONG        port = 0;
+    WCHAR        hubId[MAX_DEVICE_ID_LEN];
+    WCHAR        hubIfaces[2048];
+    HANDLE       hHub;
+    USB_NODE_CONNECTION_INFORMATION_EX ci;
+    DWORD        bytes = 0;
+    uint8_t      speed = 0;
+
+    if (CM_Get_Parent(&parent, devData->DevInst, 0) != CR_SUCCESS)
+        return 0;
+
+    /* Port number from LocationInfo, e.g. "Port_#0003.Hub_#0002". */
+    if (!SetupDiGetDevicePropertyW(devInfo, devData,
+            &DEVPKEY_Device_LocationInfo,
+            &propType, (PBYTE)location, sizeof(location),
+            &propSize, 0) ||
+        propType != DEVPROP_TYPE_STRING)
+        return 0;
+    if (swscanf(location, L"Port_#%lu", &port) != 1 || port == 0 ||
+        port > 255)
+        return 0;
+
+    if (CM_Get_Device_IDW(parent, hubId, MAX_DEVICE_ID_LEN, 0) != CR_SUCCESS)
+        return 0;
+
+    if (CM_Get_Device_Interface_ListW(
+            (GUID *)&GUID_DEVINTERFACE_USB_HUB_LOCAL,
+            hubId, hubIfaces, ARRAYSIZE(hubIfaces), 0) != CR_SUCCESS)
+        return 0;
+    if (!hubIfaces[0])
+        return 0;
+
+    /* Opening a hub with write access may require elevation — a plain
+     * failure just means "unknown speed", which is fine. */
+    hHub = CreateFileW(hubIfaces, GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, 0, NULL);
+    if (hHub == INVALID_HANDLE_VALUE)
+        return 0;
+
+    memset(&ci, 0, sizeof(ci));
+    ci.ConnectionIndex = port;
+
+    if (DeviceIoControl(hHub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX,
+                        &ci, sizeof(ci), &ci, sizeof(ci), &bytes, NULL)) {
+        switch (ci.Speed) {
+        case USB_HUB_SPEED_LOW:       speed = USBWARP_SPEED_LOW;   break;
+        case USB_HUB_SPEED_FULL:      speed = USBWARP_SPEED_FULL;  break;
+        case USB_HUB_SPEED_HIGH:      speed = USBWARP_SPEED_HIGH;  break;
+        case USB_HUB_SPEED_SUPER:
+        case USB_HUB_SPEED_SUPERPLUS: speed = USBWARP_SPEED_SUPER; break;
+        default:                      speed = 0;                   break;
+        }
+    }
+
+    CloseHandle(hHub);
+    return speed;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -254,6 +344,9 @@ int UsbEnumerate(USB_DEVICE_LIST *list)
             dev->containerId.Data3 = (unsigned short)(hash & 0xFFFF);
             memset(dev->containerId.Data4, 0, 8);
         }
+
+        /* Connection speed from the parent hub (0 = unknown). */
+        dev->speed = GetDeviceSpeed(devInfo, &devData);
 
         MakeBusId(dev->instanceId, dev->busId, sizeof(dev->busId));
 

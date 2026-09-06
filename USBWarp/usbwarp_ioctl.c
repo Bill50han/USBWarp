@@ -669,6 +669,13 @@ HandleBindDevice(
 
     InterlockedIncrement(&Ctx->ActiveDeviceCount);
 
+    /* Speed from the controller's hub query beats the bulk-maxpacket
+     * heuristic: it is correct for devices without bulk endpoints
+     * (UVC/UAC) and knows about low-speed.  0 (not queried) keeps the
+     * heuristic result from UsbWarpDeviceOpen. */
+    if (in->Speed >= USBWARP_SPEED_LOW && in->Speed <= USBWARP_SPEED_SUPER)
+        devCtx->Speed = (UCHAR)in->Speed;
+
     /* Notify Guest via Ring message.
      * If the Ring is full, roll back: close device, clear slot. */
     status = UsbWarpSendDeviceAdded(Ctx, devCtx);

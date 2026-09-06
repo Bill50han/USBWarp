@@ -62,6 +62,7 @@ struct warp_bound_device {
     uint8_t  device_guid[16];
     uint16_t vendor_id;
     uint16_t product_id;
+    uint8_t  speed;                  /* enum usbwarp_usb_speed, 0 unknown   */
     WCHAR    instance_path[256];
 
     /* Statistics */
@@ -212,7 +213,7 @@ BOOL DrvClientHeartbeat(struct warp_session *s);
 BOOL DrvClientQueryStatus(struct warp_session *s, USBWARP_QUERY_STATUS_OUT *out);
 BOOL DrvClientEnumDevices(struct warp_session *s, USBWARP_ENUM_DEVICES_OUT *out);
 BOOL DrvClientBindGuid(struct warp_session *s, const uint8_t device_guid[16],
-                       const WCHAR *instance_path,
+                       const WCHAR *instance_path, uint8_t speed,
                        uint32_t *device_index, uint16_t *vendor_id,
                        uint16_t *product_id);
 BOOL DrvClientUnbindGuid(struct warp_session *s, const uint8_t device_guid[16]);

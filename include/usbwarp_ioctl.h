@@ -156,7 +156,8 @@ typedef struct _USBWARP_BIND_DEVICE_IN {
     uint32_t InstancePathLength;         /* bytes including NUL terminator    */
     uint16_t InstancePath[256];          /* UTF-16 device instance path       */
     uint32_t Flags;                      /* reserved, 0                       */
-    uint32_t Reserved[2];
+    uint32_t Speed;                      /* enum usbwarp_usb_speed, 0 = query */
+    uint32_t Reserved;
 } USBWARP_BIND_DEVICE_IN, * PUSBWARP_BIND_DEVICE_IN;
 
 typedef struct _USBWARP_BIND_DEVICE_OUT {

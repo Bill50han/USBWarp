@@ -9,6 +9,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>   /* CTL_CODE — before project headers, so their
+                         * standalone fallbacks don't fire and clash */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -33,6 +35,7 @@ typedef struct _USB_HOST_DEVICE {
     uint8_t  deviceClass;
     uint8_t  deviceSubclass;
     uint8_t  deviceProtocol;
+    uint8_t  speed;                  /* enum usbwarp_usb_speed, 0 unknown */
     bool     bound;                  /* currently bound to Guest          */
     bool     isCompositeChild;       /* skip: child of USB composite      */
     GUID     containerId;            /* real DEVPKEY_Device_ContainerId   */
@@ -88,6 +91,18 @@ static inline const char *SessionStateName(uint32_t state)
 static inline bool GuidsEqual(const GUID *a, const uint8_t b[16])
 {
     return memcmp(a, b, 16) == 0;
+}
+
+/* lsusb-style speed letter for display ('?' = not queried). */
+static inline char SpeedLetter(uint8_t speed)
+{
+    switch (speed) {
+    case USBWARP_SPEED_LOW:   return '1';   /* 1.5 Mbit/s   */
+    case USBWARP_SPEED_FULL:  return 'f';   /* 12 Mbit/s    */
+    case USBWARP_SPEED_HIGH:  return 'h';   /* 480 Mbit/s   */
+    case USBWARP_SPEED_SUPER: return 's';   /* 5 Gbit/s     */
+    default:                  return '?';
+    }
 }
 
 #endif /* USBWARP_CLI_H */
