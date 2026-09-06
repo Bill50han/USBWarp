@@ -196,7 +196,16 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
 
     int freeSlot = -1;
     for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (!s->bound_devices[i].in_use) { freeSlot = (int)i; break; }
+        if ((s->bound_devices[i].in_use || s->bound_devices[i].binding) &&
+            memcmp(s->bound_devices[i].device_guid, req->device_guid, 16) == 0) {
+            LeaveCriticalSection(&s->deviceLock);
+            SendSimple(hPipe, seqId, -1, "device already bound");
+            return;
+        }
+        if (freeSlot < 0 &&
+            !s->bound_devices[i].in_use && !s->bound_devices[i].binding) {
+            freeSlot = (int)i;
+        }
     }
 
     if (freeSlot < 0) {
@@ -208,13 +217,21 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
     /* Tentatively populate the slot (not yet committed). */
     struct warp_bound_device *dev = &s->bound_devices[freeSlot];
     memset(dev, 0, sizeof(*dev));
+    dev->binding = true;
     dev->device_index = (uint32_t)(freeSlot + 1);
     memcpy(dev->device_guid, req->device_guid, 16);
 
     /* Convert device path from UTF-8 to wide string for driver. */
-    MultiByteToWideChar(CP_UTF8, 0, instancePath, (int)instancePathLen,
-                        dev->instance_path, 255);
-    dev->instance_path[255] = L'\0';
+    int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      instancePath, (int)instancePathLen,
+                                      dev->instance_path, 255);
+    if (wideLen <= 0) {
+        memset(dev, 0, sizeof(*dev));
+        LeaveCriticalSection(&s->deviceLock);
+        SendSimple(hPipe, seqId, -1, "invalid UTF-8 instance path");
+        return;
+    }
+    dev->instance_path[wideLen] = L'\0';
 
     /* Convert Win32 device path prefix \\?\ to NT kernel \??\
      * WdfIoTargetOpen needs NT-style path for kernel access. */
@@ -224,10 +241,6 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
         dev->instance_path[3] == L'\\') {
         dev->instance_path[1] = L'?';
     }
-
-    /* Mark in_use LAST, after all fields are set. */
-    dev->in_use = true;
-    s->bound_device_count++;
 
     LeaveCriticalSection(&s->deviceLock);
 
@@ -245,6 +258,12 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
     }
 
     {
+        EnterCriticalSection(&s->deviceLock);
+        dev->binding = false;
+        dev->in_use = true;
+        s->bound_device_count++;
+        LeaveCriticalSection(&s->deviceLock);
+
         char detail[64];
         snprintf(detail, sizeof(detail), "bound to slot %d", freeSlot + 1);
         SendSimple(hPipe, seqId, 0, detail);
@@ -258,8 +277,7 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
 
 rollback:
     EnterCriticalSection(&s->deviceLock);
-    dev->in_use = false;
-    if (s->bound_device_count > 0) s->bound_device_count--;
+    memset(dev, 0, sizeof(*dev));
     LeaveCriticalSection(&s->deviceLock);
     SendSimple(hPipe, seqId, -1, "bind failed (driver rejected)");
 }
@@ -297,14 +315,19 @@ static void HandleUnbindDevice(struct warp_session *s, HANDLE hPipe,
 
     LeaveCriticalSection(&s->deviceLock);
 
-    /* Driver mode: IOCTL handles Ring message + USB device close. */
-    if (s->hDriver && s->driverShmSetup)
-        DrvClientUnbindDevice(s, (uint32_t)foundSlot);
-    else
+    /* Driver mode: IOCTL handles Ring message + USB device close.  Keep the
+     * service mirror unchanged if the kernel refuses the unbind. */
+    if (s->hDriver && s->driverShmSetup) {
+        if (!DrvClientUnbindDevice(s, (uint32_t)foundSlot)) {
+            SendSimple(hPipe, seqId, -1, "unbind failed (driver rejected)");
+            return;
+        }
+    } else {
         ServiceSendDeviceRemoved(s, (uint32_t)foundSlot, 0);
+    }
 
     EnterCriticalSection(&s->deviceLock);
-    s->bound_devices[foundSlot].in_use = false;
+    memset(&s->bound_devices[foundSlot], 0, sizeof(s->bound_devices[foundSlot]));
     if (s->bound_device_count > 0) s->bound_device_count--;
     LeaveCriticalSection(&s->deviceLock);
 

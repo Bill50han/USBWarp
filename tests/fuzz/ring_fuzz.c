@@ -300,6 +300,9 @@ static void fuzz_device_id(void)
         /* As URB_CANCEL. */
         memset(buf, 0, sizeof(buf));
         fill_hdr(h, USBWARP_MSG_URB_CANCEL, 64, bad_ids[i], 500 + i);
+        struct usbwarp_msg_urb_cancel *can =
+            (struct usbwarp_msg_urb_cancel *)buf;
+        can->device_id = bad_ids[i];
 
         snprintf(name, sizeof(name), "CANCEL device_id=%u", bad_ids[i]);
         inject(name, buf, 64);
@@ -699,21 +702,25 @@ static void fuzz_urb_cancel(void)
     /* Cancel non-existent transaction */
     memset(buf, 0, sizeof(buf));
     fill_hdr(h, USBWARP_MSG_URB_CANCEL, 64, 1, 0xDEADBEEF);
+    ((struct usbwarp_msg_urb_cancel *)buf)->device_id = 1;
     inject("cancel txn=0xDEADBEEF", buf, 64);
 
     /* Cancel with device_id=0 */
     memset(buf, 0, sizeof(buf));
     fill_hdr(h, USBWARP_MSG_URB_CANCEL, 64, 0, 1500);
+    ((struct usbwarp_msg_urb_cancel *)buf)->device_id = 0;
     inject("cancel device_id=0", buf, 64);
 
     /* Cancel with txn_id=0 */
     memset(buf, 0, sizeof(buf));
     fill_hdr(h, USBWARP_MSG_URB_CANCEL, 64, 1, 0);
+    ((struct usbwarp_msg_urb_cancel *)buf)->device_id = 1;
     inject("cancel txn_id=0", buf, 64);
 
     /* Cancel same txn_id twice */
     memset(buf, 0, sizeof(buf));
     fill_hdr(h, USBWARP_MSG_URB_CANCEL, 64, 1, 9999);
+    ((struct usbwarp_msg_urb_cancel *)buf)->device_id = 1;
     inject("cancel txn=9999 (1st)", buf, 64);
     inject("cancel txn=9999 (2nd)", buf, 64);
 }

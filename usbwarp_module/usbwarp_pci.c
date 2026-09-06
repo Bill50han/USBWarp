@@ -243,10 +243,11 @@ static void usbwarp_pci_remove(struct pci_dev *pdev)
 
 	dev_info(&pdev->dev, "usbwarp: removing\n");
 
-	w->shutting_down = true;
+	WRITE_ONCE(w->shutting_down, true);
 
 	usbwarp_debugfs_set_hcd(NULL);
 	usbwarp_poll_stop(w);
+	usbwarp_shutdown_all_devices(w, USBWARP_REMOVE_HOST_SHUTDOWN);
 	usb_remove_hcd(hcd);
 	usbwarp_buf_cleanup(w);
 

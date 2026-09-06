@@ -160,7 +160,7 @@ static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 	bool is_out, use_inline;
 	int ret;
 
-	if (w->shutting_down)
+	if (READ_ONCE(w->shutting_down))
 		return -ESHUTDOWN;
 
 	/* Map Linux USB device address → Host-assigned device_id.
@@ -547,6 +547,44 @@ void usbwarp_cancel_device_urbs(struct usbwarp_hcd *w, uint32_t device_id)
 		priv->urb->hcpriv = NULL;
 		kfree(priv);
 	}
+}
+
+void usbwarp_shutdown_all_devices(struct usbwarp_hcd *w, uint32_t reason)
+{
+	unsigned long flags;
+	bool changed = false;
+	int i;
+
+	WRITE_ONCE(w->shutting_down, true);
+
+	for (i = 0; i < USBWARP_MAX_PORTS; i++)
+		usbwarp_cancel_device_urbs(w, i + 1);
+
+	spin_lock_irqsave(&w->dev_lock, flags);
+	for (i = 0; i < USBWARP_MAX_PORTS; i++) {
+		if (!w->devices[i].connected &&
+		    !(w->port_status[i] & USB_PORT_STAT_CONNECTION))
+			continue;
+
+		w->devices[i].connected = false;
+		w->devices[i].usb_addr  = 0;
+		atomic_set(&w->devices[i].pending_urbs, 0);
+		atomic_set(&w->devices[i].buf_in_use, 0);
+
+		w->port_status[i] = USB_PORT_STAT_POWER |
+				     (USB_PORT_STAT_C_CONNECTION << 16);
+		set_bit(i, &w->port_change);
+		changed = true;
+	}
+	w->device_count = 0;
+	spin_unlock_irqrestore(&w->dev_lock, flags);
+
+	if (changed)
+		usb_hcd_poll_rh_status(warp_to_hcd(w));
+
+	dev_info(&w->pdev->dev,
+		 "usbwarp: all devices detached for host shutdown reason=%u\n",
+		 reason);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

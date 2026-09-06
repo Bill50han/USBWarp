@@ -52,6 +52,7 @@ static inline void warp_config_defaults(struct warp_config *c)
 
 struct warp_bound_device {
     bool     in_use;
+    bool     binding;                /* tentative slot, not externally visible */
     uint32_t device_index;           /* driver-assigned, 1-based            */
     uint8_t  device_guid[16];
     uint16_t vendor_id;

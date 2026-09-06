@@ -270,6 +270,7 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
     /* ── Poll thread ────────────────────────────────────────────────────── */
     PETHREAD             PollThread;
     KEVENT               PollStopEvent;
+    KEVENT               GuestShutdownAckEvent;
     LONG                 PollRunning;
 
     /* ── Heartbeat / orphan ─────────────────────────────────────────────── */
@@ -399,6 +400,12 @@ NTSTATUS
 UsbWarpSendDeviceRemoved(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
     _In_ PUSBWARP_DEVICE_CONTEXT DevCtx,
+    _In_ ULONG Reason
+    );
+
+NTSTATUS
+UsbWarpSendHostShutdown(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
     _In_ ULONG Reason
     );
 

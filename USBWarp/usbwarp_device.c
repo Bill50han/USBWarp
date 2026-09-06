@@ -36,11 +36,43 @@ static VOID SendUrbComplete(
     _In_ int32_t ProtoStatus,
     _In_ ULONG ActualLength);
 
+static VOID SendUrbSubmitError(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
+    _In_ const struct usbwarp_msg_urb_submit *Msg,
+    _In_ int32_t ProtoStatus);
+
 static VOID DecrementPending(PUSBWARP_DEVICE_CONTEXT DevCtx)
 {
     LONG newCount = InterlockedDecrement(&DevCtx->PendingCount);
     if (newCount == 0)
         KeSetEvent(&DevCtx->DrainEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID
+SendUrbSubmitError(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
+    _In_ const struct usbwarp_msg_urb_submit *Msg,
+    _In_ int32_t ProtoStatus
+    )
+{
+    struct usbwarp_msg_urb_complete comp;
+
+    RtlZeroMemory(&comp, sizeof(comp));
+
+    comp.hdr.magic            = USBWARP_MSG_MAGIC;
+    comp.hdr.message_type     = USBWARP_MSG_URB_COMPLETE;
+    comp.hdr.protocol_version = USBWARP_PROTOCOL_VERSION;
+    comp.hdr.message_length   = USBWARP_MSG_URB_COMPLETE_BASE_SIZE;
+    comp.hdr.transaction_id   = Msg->hdr.transaction_id;
+    comp.hdr.device_id        = Msg->hdr.device_id;
+
+    comp.device_id     = Msg->hdr.device_id;
+    comp.endpoint      = Msg->endpoint;
+    comp.status        = ProtoStatus;
+    comp.actual_length = 0;
+    comp.data_mode     = USBWARP_DATA_NONE;
+
+    UsbWarpRingProduce(&Ctx->H2gRing, &comp, USBWARP_MSG_URB_COMPLETE_BASE_SIZE);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -492,12 +524,11 @@ UrbProxyCompletion(
 
     devCtx = &ctx->Devices[urbCtx->DeviceIndex - 1];
 
-    /* Defensive check: if device was unbound between URB submit and
-     * completion, skip statistics and breaker updates.  The DrainEvent
-     * mechanism normally guarantees completions finish before InUse is
-     * cleared, but belt-and-suspenders never hurts in kernel code. */
+    /* Defensive check: if device teardown won the race, skip guest-visible
+     * completion and stats, but still remove this URB from the pending list
+     * below so teardown waiters can drain. */
     if (!devCtx->InUse)
-        goto FreeOnly;
+        goto RemovePending;
 
     /* Record breaker status. */
     if (protoStatus == USBWARP_STATUS_SUCCESS)
@@ -515,6 +546,13 @@ UrbProxyCompletion(
 
     SendUrbComplete(ctx, urbCtx, protoStatus, actualLength);
 
+    KeAcquireSpinLock(&devCtx->PendingLock, &oldIrql);
+    RemoveEntryList(&urbCtx->ListEntry);
+    KeReleaseSpinLock(&devCtx->PendingLock, oldIrql);
+    DecrementPending(devCtx);
+    goto FreeOnly;
+
+RemovePending:
     KeAcquireSpinLock(&devCtx->PendingLock, &oldIrql);
     RemoveEntryList(&urbCtx->ListEntry);
     KeReleaseSpinLock(&devCtx->PendingLock, oldIrql);
@@ -547,28 +585,33 @@ UsbWarpProcessUrbSubmit(
     ULONG                    devIdx;
     KIRQL                    oldIrql;
 
+    if (InterlockedCompareExchange(&Ctx->GlobalBreakerOpen, 0, 0)) {
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_SHUTDOWN);
+        return;
+    }
+
     devIdx = Msg->device_id;
     if (devIdx == 0 || devIdx > USBWARP_MAX_DEVICES_LIMIT) {
-        SendUrbComplete(Ctx, NULL, USBWARP_STATUS_ACCESS_DENIED, 0);
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_ACCESS_DENIED);
         return;
     }
 
     devCtx = &Ctx->Devices[devIdx - 1];
     if (!devCtx->InUse || !devCtx->FilterTarget) {
-        SendUrbComplete(Ctx, NULL, USBWARP_STATUS_DISCONNECTED, 0);
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_DISCONNECTED);
         return;
     }
 
     /* Layer 6: Rate limit */
     if (!UsbWarpTokenBucketConsume(&devCtx->TokenBucket)) {
         UsbWarpErrorWindowRecord(&devCtx->Breaker.RateErrors);
-        SendUrbComplete(Ctx, NULL, USBWARP_STATUS_NO_RESOURCE, 0);
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_NO_RESOURCE);
         return;
     }
 
     /* Layer 7: Circuit breaker */
     if (!UsbWarpBreakerAllows(&devCtx->Breaker)) {
-        SendUrbComplete(Ctx, NULL, USBWARP_STATUS_SHUTDOWN, 0);
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_SHUTDOWN);
         return;
     }
 
@@ -581,7 +624,7 @@ UsbWarpProcessUrbSubmit(
 
         /* Block SET_ADDRESS — managed by HCD, not proxied. */
         if ((bmReqType & 0x60) == 0x00 && bRequest == 0x05) {
-            SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+            SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_PROTOCOL_ERROR);
             return;
         }
 
@@ -590,7 +633,7 @@ UsbWarpProcessUrbSubmit(
             KdPrint(("UsbWarp: setup wLength=%u != transfer_length=%u\n",
                      wLength, Msg->transfer_length));
             UsbWarpBreakerRecordProtoError(&devCtx->Breaker);
-            SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+            SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_PROTOCOL_ERROR);
             return;
         }
 
@@ -602,7 +645,7 @@ UsbWarpProcessUrbSubmit(
                 KdPrint(("UsbWarp: setup dir=%u != msg dir=%u\n",
                          setupDir, Msg->direction));
                 UsbWarpBreakerRecordProtoError(&devCtx->Breaker);
-                SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+                SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_PROTOCOL_ERROR);
                 return;
             }
         }
@@ -615,7 +658,7 @@ UsbWarpProcessUrbSubmit(
                                            Msg->transfer_length, &transferVa);
         if (!NT_SUCCESS(status)) {
             UsbWarpBreakerRecordProtoError(&devCtx->Breaker);
-            SendUrbComplete(Ctx, NULL, USBWARP_STATUS_PROTOCOL_ERROR, 0);
+            SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_PROTOCOL_ERROR);
             return;
         }
     }
@@ -625,7 +668,7 @@ UsbWarpProcessUrbSubmit(
                  POOL_FLAG_NON_PAGED, sizeof(USBWARP_URB_CONTEXT),
                  USBWARP_DRIVER_TAG);
     if (!urbCtx) {
-        SendUrbComplete(Ctx, NULL, USBWARP_STATUS_NO_RESOURCE, 0);
+        SendUrbSubmitError(Ctx, Msg, USBWARP_STATUS_NO_RESOURCE);
         return;
     }
 

@@ -187,7 +187,7 @@ BOOL DrvClientBindDevice(struct warp_session *s, uint32_t devIdx)
     if (devIdx >= WARP_MAX_BOUND_DEVICES) return FALSE;
 
     struct warp_bound_device *dev = &s->bound_devices[devIdx];
-    if (!dev->in_use) return FALSE;
+    if (!dev->in_use && !dev->binding) return FALSE;
 
     USBWARP_BIND_DEVICE_IN in;
     memset(&in, 0, sizeof(in));

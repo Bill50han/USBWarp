@@ -349,6 +349,9 @@ UsbWarpValidateMessage(
         if (MsgLen < USBWARP_MSG_URB_SUBMIT_BASE_SIZE)
             return STATUS_DATA_ERROR;
 
+        if (sub->device_id != Hdr->device_id)
+            return STATUS_DATA_ERROR;
+
         /* endpoint: 0–15 */
         if (sub->endpoint > 15) {
             KdPrint(("UsbWarp: L4 endpoint %u > 15\n", sub->endpoint));
@@ -359,8 +362,10 @@ UsbWarpValidateMessage(
         if (sub->direction > 1)
             return STATUS_DATA_ERROR;
 
-        /* transfer_type: known values */
-        if (sub->transfer_type > USBWARP_XFER_INTERRUPT)
+        /* transfer_type: known values.  Value 1 is intentionally reserved. */
+        if (sub->transfer_type != USBWARP_XFER_CONTROL &&
+            sub->transfer_type != USBWARP_XFER_BULK &&
+            sub->transfer_type != USBWARP_XFER_INTERRUPT)
             return STATUS_DATA_ERROR;
 
         /* data_mode: known values */
@@ -401,6 +406,17 @@ UsbWarpValidateMessage(
             sub->transfer_length > USBWARP_INLINE_DATA_SIZE) {
             return STATUS_DATA_ERROR;
         }
+    }
+
+    if (Hdr->message_type == USBWARP_MSG_URB_CANCEL) {
+        const struct usbwarp_msg_urb_cancel *can =
+            (const struct usbwarp_msg_urb_cancel *)Hdr;
+
+        if (MsgLen < sizeof(*can))
+            return STATUS_DATA_ERROR;
+
+        if (can->device_id != Hdr->device_id)
+            return STATUS_DATA_ERROR;
     }
 
     return STATUS_SUCCESS;
@@ -557,8 +573,27 @@ UsbWarpEmergencyShutdown(
 
     KdPrint(("UsbWarp: EMERGENCY SHUTDOWN initiated\n"));
 
-    InterlockedExchange(&Ctx->ShuttingDown, TRUE);
     InterlockedExchange(&Ctx->GlobalBreakerOpen, TRUE);
+
+    if (Ctx->ControlBlock)
+        Ctx->ControlBlock->host_state = USBWARP_STATE_SHUTTING_DOWN;
+
+    if (Ctx->ShmEstablished && Ctx->H2gRing.Hdr) {
+        NTSTATUS notifyStatus;
+
+        notifyStatus = UsbWarpSendHostShutdown(
+                           Ctx, USBWARP_SHUTDOWN_NORMAL);
+        if (NT_SUCCESS(notifyStatus) && Ctx->PollThread) {
+            timeout.QuadPart = -50000000LL;  /* 5 seconds */
+            notifyStatus = KeWaitForSingleObject(
+                               &Ctx->GuestShutdownAckEvent,
+                               Executive, KernelMode, FALSE, &timeout);
+            if (notifyStatus == STATUS_TIMEOUT)
+                KdPrint(("UsbWarp: guest shutdown ACK timed out\n"));
+        }
+    }
+
+    InterlockedExchange(&Ctx->ShuttingDown, TRUE);
 
     /* ── Priority 1: Stop DMA — cancel all pending USB requests ─────────── */
     for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {

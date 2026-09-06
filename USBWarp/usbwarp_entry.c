@@ -149,6 +149,7 @@ UsbWarpDeviceAdd(
 
     KeInitializeSpinLock(&ctx->DeviceLock);
     KeInitializeEvent(&ctx->PollStopEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&ctx->GuestShutdownAckEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&ctx->ServiceLostEvent, NotificationEvent, FALSE);
 
     for (i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {

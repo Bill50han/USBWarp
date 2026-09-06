@@ -297,6 +297,7 @@ extern const struct hc_driver usbwarp_hc_driver;
 
 /* Cancel all pending URBs for a specific device. */
 void usbwarp_cancel_device_urbs(struct usbwarp_hcd *w, uint32_t device_id);
+void usbwarp_shutdown_all_devices(struct usbwarp_hcd *w, uint32_t reason);
 
 /* Assign Linux USB address to a warp device (called from hub_control RESET). */
 void usbwarp_set_usb_addr(struct usbwarp_hcd *w, unsigned int port,

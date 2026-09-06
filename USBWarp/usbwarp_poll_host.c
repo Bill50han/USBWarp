@@ -153,7 +153,6 @@ TryRingRecovery(
         if (NT_SUCCESS(status) &&
             LooksLikeValidHeader(&hdr, used, ring->Hdr->max_message_size)) {
             /* Found a valid-looking header.  Advance ci to this position. */
-            ULONG skippedBytes = probeIndex - ci;
             WriteULongRelease(
                 (volatile ULONG *)&ring->Hdr->consumer_index,
                 probeIndex);
@@ -163,7 +162,7 @@ TryRingRecovery(
 
             KdPrint(("UsbWarp: Ring RECOVERED — skipped %u bytes "
                      "(%u cachelines) to valid message type=%u len=%u\n",
-                     skippedBytes, scanned,
+                     probeIndex - ci, scanned,
                      hdr.message_type, hdr.message_length));
             return;
         }
@@ -284,11 +283,14 @@ UsbWarpPollThreadProc(
             /* Update Control Block host heartbeat. */
             if (ctx->ControlBlock) {
                 ctx->ControlBlock->host_heartbeat_ts = (uint64_t)now.QuadPart;
-                ctx->ControlBlock->host_state        = USBWARP_STATE_RUNNING;
+                ctx->ControlBlock->host_state =
+                    InterlockedCompareExchange(&ctx->GlobalBreakerOpen, 0, 0) ?
+                    USBWARP_STATE_SHUTTING_DOWN : USBWARP_STATE_RUNNING;
             }
 
             /* Check Service heartbeat timeout (orphan detection). */
-            UsbWarpCheckOrphanTimeout(ctx);
+            if (!InterlockedCompareExchange(&ctx->GlobalBreakerOpen, 0, 0))
+                UsbWarpCheckOrphanTimeout(ctx);
 
             lastHeartbeat = now;
         }
@@ -346,17 +348,14 @@ UsbWarpPollStop(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx
     )
 {
-    LARGE_INTEGER timeout;
-
     if (!Ctx->PollThread)
         return;
 
     InterlockedExchange(&Ctx->ShuttingDown, TRUE);
     KeSetEvent(&Ctx->PollStopEvent, IO_NO_INCREMENT, FALSE);
 
-    timeout.QuadPart = -50000000LL;  /* 5 seconds */
     KeWaitForSingleObject(Ctx->PollThread, Executive,
-                          KernelMode, FALSE, &timeout);
+                          KernelMode, FALSE, NULL);
 
     ObDereferenceObject(Ctx->PollThread);
     Ctx->PollThread = NULL;
@@ -417,6 +416,7 @@ DispatchMessage(
 
     case USBWARP_MSG_SHUTDOWN_ACK:
         KdPrint(("UsbWarp: guest acknowledged shutdown\n"));
+        KeSetEvent(&Ctx->GuestShutdownAckEvent, IO_NO_INCREMENT, FALSE);
         break;
 
     default:
@@ -531,6 +531,27 @@ UsbWarpSendDeviceAdded(
     msg.vendor_id = DevCtx->VendorId;
     msg.product_id = DevCtx->ProductId;
     msg.speed     = DevCtx->Speed;
+
+    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
+}
+
+NTSTATUS
+UsbWarpSendHostShutdown(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
+    _In_ ULONG Reason
+    )
+{
+    struct usbwarp_msg_shutdown msg;
+
+    if (!Ctx->ShmEstablished || Ctx->H2gRing.Hdr == NULL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    KeClearEvent(&Ctx->GuestShutdownAckEvent);
+
+    RtlZeroMemory(&msg, sizeof(msg));
+    FillMsgHeader(&msg.hdr, USBWARP_MSG_HOST_SHUTDOWN,
+                  0, 0, sizeof(msg));
+    msg.reason = Reason;
 
     return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
 }

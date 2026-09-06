@@ -144,7 +144,7 @@ static void dispatch_message(struct usbwarp_hcd *w,
 		dev_warn(&w->pdev->dev,
 			 "usbwarp: host shutdown reason=%u\n",
 			 (msg_len >= sizeof(*sd)) ? sd->reason : 0xFFu);
-		w->shutting_down = true;
+		usbwarp_shutdown_all_devices(w, USBWARP_REMOVE_HOST_SHUTDOWN);
 
 		{
 			struct usbwarp_msg_shutdown_ack ack;
@@ -199,7 +199,7 @@ static int usbwarp_poll_fn(void *data)
 
 	dev_info(&w->pdev->dev, "usbwarp: poll thread started\n");
 
-	while (!kthread_should_stop() && !w->shutting_down) {
+	while (!kthread_should_stop() && !READ_ONCE(w->shutting_down)) {
 
 		uint32_t msg_len = 0;
 		int ret;
@@ -256,7 +256,8 @@ static int usbwarp_poll_fn(void *data)
 		{
 			uint64_t now = (uint64_t)ktime_get_ns();
 
-			if (now - last_heartbeat_ns >= heartbeat_interval_ns &&
+			if (!READ_ONCE(w->shutting_down) &&
+			    now - last_heartbeat_ns >= heartbeat_interval_ns &&
 			    !usbwarp_debugfs_g2h_paused()) {
 				usbwarp_send_heartbeat(w);
 
@@ -301,6 +302,7 @@ int usbwarp_poll_start(struct usbwarp_hcd *w)
 void usbwarp_poll_stop(struct usbwarp_hcd *w)
 {
 	if (w->poll_thread) {
+		WRITE_ONCE(w->shutting_down, true);
 		kthread_stop(w->poll_thread);
 		w->poll_thread = NULL;
 	}

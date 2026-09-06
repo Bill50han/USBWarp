@@ -513,9 +513,11 @@ HandleBindDevice(
     if (InterlockedCompareExchange(&Ctx->OrphanState, 0, 0) != ORPHAN_NONE)
         return STATUS_DEVICE_NOT_CONNECTED;
 
-    /* Validate instance path length. */
+    /* Validate instance path length.  Leave room for our terminator and
+     * require a whole number of WCHARs before treating it as UNICODE_STRING. */
     if (in->InstancePathLength == 0 ||
-        in->InstancePathLength > sizeof(in->InstancePath))
+        in->InstancePathLength >= sizeof(in->InstancePath) ||
+        (in->InstancePathLength % sizeof(WCHAR)) != 0)
         return STATUS_INVALID_PARAMETER;
 
     /* Find a free device slot (1-based indexing; slot 0 unused). */

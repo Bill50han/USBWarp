@@ -64,8 +64,10 @@ void usbwarp_buf_free(struct usbwarp_hcd *w, int idx)
 		return;
 	}
 
-	memset_io(usbwarp_buf_addr(w, idx), 0, w->buffer_size);
-	smp_wmb();
+	if (!READ_ONCE(w->shutting_down)) {
+		memset_io(usbwarp_buf_addr(w, idx), 0, w->buffer_size);
+		smp_wmb();
+	}
 
 	set_bit((unsigned long)idx, w->buf_bitmap);
 	atomic_inc(&w->buf_free_count);
