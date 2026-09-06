@@ -211,6 +211,11 @@ typedef struct _USBWARP_HOST_RING {
     volatile UCHAR                      *Data;
     ULONG                                DataSize;
     ULONG                                DataMask;
+
+    /* H2G ring only: serialize producers (URB completion DPCs across
+     * CPUs, IOCTL queue thread, PnP removal callbacks, poll thread).
+     * Valid at DPC level.  The G2H consumer side stays lock-free. */
+    KSPIN_LOCK                           ProduceLock;
 } USBWARP_HOST_RING, *PUSBWARP_HOST_RING;
 
 /* ═══════════════════════════════════════════════════════════════════════════

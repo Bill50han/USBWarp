@@ -41,7 +41,7 @@ UsbWarp replaces network-based USB/IP with a zero-copy MMIO ring protocol, targe
 **Key design choices:**
 
 - **Zero-copy shared memory** — 32 MB Section-backed MMIO mapped into both Guest and Host kernel space. USB data buffers live in shared memory; no `memcpy` on the data path.
-- **SPSC lock-free ring protocol** — Single-producer/single-consumer rings with acquire/release semantics. No locks on the hot path.
+- **SPSC ring protocol, lock-free consumer** — Single-consumer rings with acquire/release index semantics. Producers are serialized by a leaf spinlock (multiple completion DPCs / submission contexts can produce concurrently); the UC-MMIO copy inside a produce dominates its cost by ~100×, so the lock is not on the latency path.
 - **Kernel-to-kernel** — URB proxy runs entirely in kernel mode (UsbWarp.sys ↔ UsbWarpFilter.sys ↔ USB physical stack). No user-mode round trips for data transfer.
 - **HDV-based PCI device** — The shared memory region appears as a PCI BAR in the Guest via Hyper-V Device Virtualization, enabling standard MMIO access from the Linux kernel module.
 

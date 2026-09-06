@@ -34,12 +34,18 @@ UsbWarpRingInit(
     Ring->Data     = Data;
     Ring->DataSize = Hdr->data_size;
     Ring->DataMask = Hdr->data_size_mask;
+    KeInitializeSpinLock(&Ring->ProduceLock);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §2  Produce  (Host writes to H2G ring — completions to Guest)
  *
- *   Single producer.  The poll thread is the only writer.
+ *   Serialized by ProduceLock.  H2G has multiple producers: URB completion
+ *   DPCs (parallel across CPUs), the IOCTL queue thread (bind/unbind),
+ *   PnP removal callbacks, and the poll thread.  Without the lock, two
+ *   producers can read the same producer_index and one message is
+ *   silently lost.  The lock must span data write AND index advance —
+ *   the index store is the publication.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 NTSTATUS
@@ -50,16 +56,23 @@ UsbWarpRingProduce(
     )
 {
     ULONG aligned = USBWARP_ALIGN_CACHELINE(MsgLen);
-    ULONG pi = Ring->Hdr->producer_index;
+    ULONG pi;
     ULONG ci;
     ULONG avail, pos, first;
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&Ring->ProduceLock, &oldIrql);
+
+    pi = Ring->Hdr->producer_index;
 
     /* Read consumer_index with acquire semantics. */
     ci = ReadULongAcquire((volatile ULONG *)&Ring->Hdr->consumer_index);
 
     avail = usbwarp_ring_available(pi, ci, Ring->DataMask);
-    if (avail < aligned)
+    if (avail < aligned) {
+        KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
         return STATUS_INSUFFICIENT_RESOURCES;  /* ring full */
+    }
 
     /* Write message data, handling wrap-around. */
     pos   = pi & Ring->DataMask;
@@ -95,6 +108,8 @@ UsbWarpRingProduce(
 
     /* Store-release producer_index. */
     WriteULongRelease((volatile ULONG *)&Ring->Hdr->producer_index, pi + aligned);
+
+    KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
 
     return STATUS_SUCCESS;
 }

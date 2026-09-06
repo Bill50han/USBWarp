@@ -29,25 +29,39 @@ void usbwarp_ring_init(struct usbwarp_ring *r,
 	r->data      = data;
 	r->data_size = ioread32(&hdr->data_size);
 	r->data_mask = ioread32(&hdr->data_size_mask);
+	spin_lock_init(&r->produce_lock);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §2  Produce  (Guest writes to G2H ring)
+ *
+ *   Serialized by produce_lock: G2H has multiple producers (urb_enqueue
+ *   task contexts, urb_timeout_fn timer softirq, urb_dequeue, poll thread
+ *   control messages).  Without the lock, two producers can read the same
+ *   producer_index and one message is silently lost.  The lock must span
+ *   data write AND index advance — the index store is the publication.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int usbwarp_ring_produce(struct usbwarp_ring *r,
 			 const void *msg, uint32_t len)
 {
 	uint32_t aligned = USBWARP_ALIGN_CACHELINE(len);
-	uint32_t pi      = ioread32(&r->hdr->producer_index);
+	uint32_t pi;
 	uint32_t ci;
 	uint32_t avail, pos, first;
+	unsigned long flags;
+
+	spin_lock_irqsave(&r->produce_lock, flags);
+
+	pi = ioread32(&r->hdr->producer_index);
 
 	ci = smp_load_acquire((const uint32_t __force *)&r->hdr->consumer_index);
 
 	avail = usbwarp_ring_available(pi, ci, r->data_mask);
-	if (avail < aligned)
+	if (avail < aligned) {
+		spin_unlock_irqrestore(&r->produce_lock, flags);
 		return -ENOSPC;
+	}
 
 	pos   = pi & r->data_mask;
 	first = r->data_size - pos;
@@ -79,6 +93,8 @@ int usbwarp_ring_produce(struct usbwarp_ring *r,
 
 	smp_store_release((uint32_t __force *)&r->hdr->producer_index,
 			  pi + aligned);
+
+	spin_unlock_irqrestore(&r->produce_lock, flags);
 
 	return 0;
 }

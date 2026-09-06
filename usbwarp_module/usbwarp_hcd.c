@@ -223,6 +223,12 @@ static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 
 	/* Allocate Data Region buffer for non-inline transfers. */
 	if (xfer_len > 0 && !use_inline) {
+		/* A transfer larger than one buffer slot would silently
+		 * overrun into the neighbouring slot.  Reject cleanly
+		 * until multi-slot contiguous allocation lands. */
+		if (xfer_len > w->buffer_size)
+			return -EMSGSIZE;
+
 		/* Per-device quota check. */
 		if (!usbwarp_device_quota_allows(w, dev_id))
 			return -ENOSPC;

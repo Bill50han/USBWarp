@@ -111,6 +111,15 @@ struct usbwarp_ring {
 	void __iomem                        *data;
 	uint32_t                             data_size;
 	uint32_t                             data_mask;
+
+	/* G2H ring only: serialize producers.  The consumer side stays
+	 * lock-free (single consumer = poll thread).  Producers span task
+	 * context, timer softirq (urb_timeout_fn) and the poll thread itself,
+	 * so the read-modify-write of producer_index must be guarded.  irqsave
+	 * is mandatory: a timer softirq can produce.  The critical section is
+	 * the memcpy_toio — UC-MMIO writes dominate it by ~100×, so the lock
+	 * is not the cost of a produce. */
+	spinlock_t                           produce_lock;
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -361,3 +361,11 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# Linux kernel module build artifacts (usbwarp_module/)
+usbwarp_module/*.o
+usbwarp_module/*.ko
+usbwarp_module/*.mod
+usbwarp_module/*.mod.c
+usbwarp_module/.*.cmd
+usbwarp_module/Module.symvers
+usbwarp_module/modules.order
