@@ -30,6 +30,9 @@
     <ClCompile Include="usbwarp_drv_client.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="winsvc.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="hdv_defs.h">

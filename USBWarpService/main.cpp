@@ -16,15 +16,38 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Thread-safe logging
+ *
+ *   Console mode → stderr.  Service mode → append to
+ *   %ProgramData%\UsbWarp\service.log (stderr is an invalid handle in a
+ *   service session).  Unbuffered so a crash doesn't lose the tail.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 CRITICAL_SECTION *g_logLock = NULL;
+static FILE *g_logSink = NULL;      /* NULL = stderr */
 
-void LogInit(struct warp_session *s)
+void LogInit(struct warp_session *s, bool serviceMode)
 {
     InitializeCriticalSection(&s->logLock);
     s->logLockInit = true;
     g_logLock = &s->logLock;
+
+    if (!serviceMode)
+        return;
+
+    char dir[MAX_PATH];
+    if (GetEnvironmentVariableA("ProgramData", dir, sizeof(dir)) > 0) {
+        char path[MAX_PATH];
+        FILE *f = NULL;
+        snprintf(path, sizeof(path), "%s\\UsbWarp", dir);
+        CreateDirectoryA(path, NULL);
+        snprintf(path, sizeof(path), "%s\\UsbWarp\\service.log", dir);
+        if (fopen_s(&f, path, "a") == 0 && f) {
+            g_logSink = f;
+            setvbuf(g_logSink, NULL, _IONBF, 0);
+        }
+    }
+    /* If the file couldn't be opened we keep stderr — writes there fail
+     * silently in a service session, which is the best we can do. */
 }
 
 void LogCleanup(struct warp_session *s)
@@ -34,23 +57,29 @@ void LogCleanup(struct warp_session *s)
         DeleteCriticalSection(&s->logLock);
         s->logLockInit = false;
     }
+    if (g_logSink) {
+        fclose(g_logSink);
+        g_logSink = NULL;
+    }
 }
 
-static void LogTimestamp(void)
+static void LogTimestamp(FILE *f)
 {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(stderr, "[%02d:%02d:%02d.%03d] ",
+    fprintf(f, "[%02d:%02d:%02d.%03d] ",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 }
 
 static void LogV(const char *level, const char *fmt, va_list ap)
 {
+    FILE *f = g_logSink ? g_logSink : stderr;
+
     if (g_logLock) EnterCriticalSection(g_logLock);
-    LogTimestamp();
-    fprintf(stderr, "%s", level);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    LogTimestamp(f);
+    fprintf(f, "%s", level);
+    vfprintf(f, fmt, ap);
+    fprintf(f, "\n");
     if (g_logLock) LeaveCriticalSection(g_logLock);
 }
 
@@ -76,12 +105,14 @@ static BOOL WINAPI CtrlHandler(DWORD type)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §3  Command-line parsing
+ * §3  Configuration: defaults → registry → command line
+ *
+ *   The registry (written by --install) is what an auto-start service
+ *   reads at boot; command-line args override it in both modes.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static bool ParseArgs(int argc, WCHAR *argv[], struct warp_config *cfg)
+bool ParseArgOverrides(int argc, WCHAR *argv[], struct warp_config *cfg)
 {
-    warp_config_defaults(cfg);
     for (int i = 1; i < argc; i++) {
         if (_wcsicmp(argv[i], L"--id") == 0 && i+1 < argc)
             wcscpy_s(cfg->vm_id, argv[++i]);
@@ -101,7 +132,64 @@ static bool ParseArgs(int argc, WCHAR *argv[], struct warp_config *cfg)
             return false;
         else { LogError("Unknown argument: %ls", argv[i]); return false; }
     }
-    if (cfg->vm_id[0] == L'\0') { LogError("--id <VM-GUID> is required"); return false; }
+    return true;
+}
+
+static bool RegReadDword(HKEY key, const WCHAR *name, uint32_t *out)
+{
+    DWORD type, v, size = sizeof(v);
+    if (RegQueryValueExW(key, name, NULL, &type, (BYTE *)&v, &size) ==
+            ERROR_SUCCESS &&
+        type == REG_DWORD) {
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+static void LoadRegistryConfig(struct warp_config *cfg)
+{
+    HKEY key;
+    uint32_t v;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, USBWARP_SERVICE_REG_KEY,
+                      0, KEY_READ, &key) != ERROR_SUCCESS)
+        return;
+
+    {
+        WCHAR vmId[256];
+        DWORD size = sizeof(vmId);
+        if (RegQueryValueExW(key, L"VmId", NULL, NULL,
+                             (BYTE *)vmId, &size) == ERROR_SUCCESS &&
+            size >= sizeof(WCHAR) && vmId[0])
+            wcscpy_s(cfg->vm_id, vmId);
+    }
+
+    if (RegReadDword(key, L"ShmSizeMb", &v) && v > 0)
+        cfg->shm_size = v * 1024u * 1024u;
+    if (RegReadDword(key, L"RingSizeKb", &v) && v > 0)
+        cfg->ring_data_size = v * 1024u;
+    if (RegReadDword(key, L"BufferSizeKb", &v) && v > 0)
+        cfg->buffer_size = v * 1024u;
+    if (RegReadDword(key, L"MaxDevices", &v) && v > 0)
+        cfg->max_devices = v;
+    if (RegReadDword(key, L"EnableIso", &v))
+        cfg->enable_iso = (v != 0);
+
+    RegCloseKey(key);
+}
+
+static bool LoadConfig(int argc, WCHAR *argv[], struct warp_config *cfg)
+{
+    warp_config_defaults(cfg);
+    LoadRegistryConfig(cfg);
+    if (!ParseArgOverrides(argc, argv, cfg))
+        return false;
+    if (cfg->vm_id[0] == L'\0') {
+        LogError("VM GUID required: pass --id <VM-GUID> or set "
+                 "HKLM\\SOFTWARE\\UsbWarp\\Service\\VmId");
+        return false;
+    }
     return true;
 }
 
@@ -433,7 +521,7 @@ static void CheckGuestHeartbeat(struct warp_session *s)
 
 static void MainLoop(struct warp_session *s)
 {
-    LogInfo("Entering main loop  (Ctrl+C to shutdown)");
+    LogInfo("Entering main loop (stop signal to shutdown)");
 
     UINT64 poll_count       = 0;
     UINT64 last_status_ns   = 0;
@@ -575,72 +663,127 @@ static void MainLoop(struct warp_session *s)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §11  Entry point
+ * §11  Session lifecycle + entry point
+ *
+ *   Dual-mode binary: launched by the SCM it runs as a real Windows
+ *   service (ServiceMain → ServiceRun → SERVICE_STOPPED); run from a
+ *   shell it behaves exactly like the old console build.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-int wmain(int argc, WCHAR *argv[])
+struct warp_session g_sess;
+
+DWORD ServiceRun(struct warp_session *s, bool serviceMode,
+                 int argc, WCHAR *argv[])
 {
-    fprintf(stderr,
-        "\n+----------------------------------------------+\n"
-        "|   UsbWarp Service v0.3  (console mode)       |\n"
-        "+----------------------------------------------+\n\n");
+    DWORD exitCode = ERROR_SUCCESS;
 
-    struct warp_session sess;
-    memset(&sess, 0, sizeof(sess));
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    LogInit(&sess);
-    InitializeCriticalSection(&sess.deviceLock);
-    sess.deviceLockInit = true;
-    InitializeSRWLock(&sess.driverLock);
+    InitializeCriticalSection(&s->deviceLock);
+    s->deviceLockInit = true;
+    InitializeSRWLock(&s->driverLock);
 
-    if (!ParseArgs(argc, argv, &sess.cfg)) {
-        PrintUsage();
+    if (!LoadConfig(argc, argv, &s->cfg)) {
+        if (!serviceMode) PrintUsage();
+        exitCode = ERROR_INVALID_PARAMETER;
         goto cleanup;
     }
 
-    g_session_for_signal = &sess;
-    SetConsoleCtrlHandler(CtrlHandler, TRUE);
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (!serviceMode) {
+        g_session_for_signal = s;
+        SetConsoleCtrlHandler(CtrlHandler, TRUE);
+    }
 
-    sess.start_time_ns = NowNs();
+    s->start_time_ns = NowNs();
 
-    if (!HdvLoadApis(&sess.api))    { LogError("HCS/HDV APIs unavailable"); goto cleanup; }
-    if (!ShmCreate(&sess))          { LogError("SHM creation failed");      goto cleanup; }
-    if (!HdvSessionOpen(&sess))     { LogError("HDV session failed");       goto cleanup; }
+    if (!HdvLoadApis(&s->api)) {
+        LogError("HCS/HDV APIs unavailable");
+        exitCode = ERROR_NOT_SUPPORTED;
+        goto cleanup;
+    }
+    if (!ShmCreate(s)) {
+        LogError("SHM creation failed");
+        exitCode = ERROR_OUTOFMEMORY;
+        goto cleanup;
+    }
+    SvcCheckpoint();
 
-    PipeServerStart(&sess);
-    MainLoop(&sess);
+    /* An auto-start service may boot before the WSL utility VM exists.
+     * Wait for it instead of dying — SCM failure-restart would only
+     * spin.  Stop requests are honored within 100 ms. */
+    while (!HdvSessionOpen(s)) {
+        if (s->shutdown_requested) {
+            exitCode = ERROR_SERVICE_DEPENDENCY_FAIL;
+            goto cleanup;
+        }
+        LogWarn("HDV session failed — retrying in 10s (VM not running yet?)");
+        for (int i = 0; i < 100 && !s->shutdown_requested; i++)
+            Sleep(100);
+    }
+    SvcCheckpoint();
+
+    SvcRunning();
+
+    PipeServerStart(s);
+    MainLoop(s);
 
 cleanup:
     LogInfo("Shutting down ...");
-    PipeServerStop(&sess);
+    PipeServerStop(s);
 
     /* Unbind all devices before closing the driver connection — the
      * kernel's device table is the source of truth, so iterate it rather
      * than any Service-side mirror. */
-    if (sess.hDriver && sess.driverShmSetup) {
-        DrvClientUnbindAll(&sess);
+    if (s->hDriver && s->driverShmSetup) {
+        DrvClientUnbindAll(s);
     } else {
         for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-            if (sess.bound_devices[i].in_use) {
+            if (s->bound_devices[i].in_use) {
                 LogInfo("Cleanup: unbinding slot %u", i + 1);
-                ServiceSendDeviceRemoved(&sess, i, 1 /* emergency */);
-                sess.bound_devices[i].in_use = false;
+                ServiceSendDeviceRemoved(s, i, 1 /* emergency */);
+                s->bound_devices[i].in_use = false;
             }
         }
-        sess.bound_device_count = 0;
+        s->bound_device_count = 0;
     }
 
-    DrvClientClose(&sess);
-    HdvSessionClose(&sess);
-    ShmDestroy(&sess);
-    HdvUnloadApis(&sess.api);
+    DrvClientClose(s);
+    HdvSessionClose(s);
+    ShmDestroy(s);
+    HdvUnloadApis(&s->api);
     CoUninitialize();
 
-    if (sess.deviceLockInit)
-        DeleteCriticalSection(&sess.deviceLock);
+    if (s->deviceLockInit)
+        DeleteCriticalSection(&s->deviceLock);
 
     LogInfo("Clean shutdown complete.");
-    LogCleanup(&sess);
-    return 0;
+    LogCleanup(s);
+    return exitCode;
+}
+
+int wmain(int argc, WCHAR *argv[])
+{
+    /* One-shot management commands (require admin). */
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"--install") == 0)
+            return SvcInstall(argc, argv);
+        if (_wcsicmp(argv[i], L"--uninstall") == 0)
+            return SvcUninstall();
+    }
+
+    /* Service mode when launched by the SCM. */
+    {
+        int r = RunServiceDispatcher();
+        if (r == 0) return 0;         /* ran as a service            */
+        if (r != -1) return r;        /* dispatcher hard failure     */
+        /* -1: not SCM-launched — fall through to console mode.      */
+    }
+
+    fprintf(stderr,
+        "\n+----------------------------------------------+\n"
+        "|   UsbWarp Service v0.4  (console mode)       |\n"
+        "+----------------------------------------------+\n\n");
+
+    LogInit(&g_sess, false);
+    return (int)ServiceRun(&g_sess, false, argc, argv);
 }

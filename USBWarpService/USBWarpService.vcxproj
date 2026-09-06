@@ -24,6 +24,7 @@
     <ClCompile Include="pipe_server.cpp" />
     <ClCompile Include="shm_init.cpp" />
     <ClCompile Include="usbwarp_drv_client.cpp" />
+    <ClCompile Include="winsvc.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\include\usbwarp_ioctl.h" />

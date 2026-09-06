@@ -246,10 +246,49 @@ void ServiceSendDeviceRemoved(struct warp_session *s, uint32_t devIdx,
 void ServiceEmergencyShutdown(struct warp_session *s);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §12  Logging (thread-safe)
+ * §11b  SCM service integration (winsvc.cpp)
+ *
+ *   Dual-mode binary: when launched by the SCM the process runs as a
+ *   real Windows service; run from a shell it behaves exactly like the
+ *   old console build.  Service config persists under
+ *   HKLM\SOFTWARE\UsbWarp\Service (written by --install).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void LogInit(struct warp_session *s);
+#define USBWARP_SERVICE_NAME     L"UsbWarpService"
+#define USBWARP_SERVICE_DESCR    L"UsbWarp - HDV USB passthrough for WSL2"
+#define USBWARP_SERVICE_REG_KEY  L"SOFTWARE\\UsbWarp\\Service"
+
+int   SvcInstall(int argc, WCHAR *argv[]);   /* --install (admin)          */
+int   SvcUninstall(void);                    /* --uninstall (admin)        */
+int   RunServiceDispatcher(void);            /* 0 = ran as service; -1 = not SCM */
+void  SvcCheckpoint(void);                   /* START_PENDING progress; console no-op */
+void  SvcRunning(void);                      /* RUNNING; console no-op     */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §11c  Session lifecycle (main.cpp, shared by both modes)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Static storage — referenced by the Ctrl/SCM handlers, HDV callbacks and
+ * the pipe thread; must outlive them all. */
+extern struct warp_session g_sess;
+
+/* Apply command-line overrides to a config (no vm_id requirement —
+ * registry values may have supplied it). */
+bool  ParseArgOverrides(int argc, WCHAR *argv[], struct warp_config *cfg);
+
+/* Full session run: config → init chain → pipe server → main loop →
+ * teardown.  Returns a Win32 exit code for the SCM. */
+DWORD ServiceRun(struct warp_session *s, bool serviceMode,
+                 int argc, WCHAR *argv[]);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §12  Logging (thread-safe)
+ *
+ *   Console mode logs to stderr; service mode appends to
+ *   %ProgramData%\UsbWarp\service.log (stderr is invalid there).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+void LogInit(struct warp_session *s, bool serviceMode);
 void LogCleanup(struct warp_session *s);
 void LogInfo(const char *fmt, ...);
 void LogWarn(const char *fmt, ...);

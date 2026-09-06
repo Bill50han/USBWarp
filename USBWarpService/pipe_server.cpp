@@ -650,11 +650,17 @@ void PipeServerStop(struct warp_session *s)
     if (!s->pipeThread) return;
     s->pipeRunning = false;
 
-    HANDLE hDummy = CreateFileA(USBWARP_PIPE_NAME,
-        GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hDummy != INVALID_HANDLE_VALUE) CloseHandle(hDummy);
+    /* Cancel the pipe thread's blocking ConnectNamedPipe/ReadFile in one
+     * call — no overlapped rework needed.  The thread observes
+     * shutdown_requested and exits its loops. */
+    CancelSynchronousIo(s->pipeThread);
 
-    WaitForSingleObject(s->pipeThread, 3000);
-    CloseHandle(s->pipeThread);
-    s->pipeThread = NULL;
+    if (WaitForSingleObject(s->pipeThread, 5000) == WAIT_OBJECT_0) {
+        CloseHandle(s->pipeThread);
+        s->pipeThread = NULL;
+    } else {
+        /* Never close a handle a live thread may still be using —
+         * leak it and log.  (The old code closed it unconditionally.) */
+        LogWarn("Pipe thread did not stop within 5s — handle leaked");
+    }
 }

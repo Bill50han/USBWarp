@@ -162,14 +162,28 @@ sudo insmod usbwarp.ko
 
 ### Step 4: Start Service and Bind a Device
 
+The service is dual-mode: run from a shell it behaves like a console app
+(launched by the SCM it runs as a real Windows service).
+
 ```powershell
 # Find your WSL2 VM GUID
 # (Use hcsdiag.exe list)
 
-# Start the service (console mode for now)
+# Console mode (requires an elevated shell — the manifest asks for admin):
 .\USBWarpService.exe --id <WSL2-VM-GUID>
 
-# In another terminal, list USB devices
+# --- or install as an auto-start Windows service (admin) ---
+.\USBWarpService.exe --install --id <WSL2-VM-GUID> [--iso] [options]
+sc start UsbWarpService
+# config persists under HKLM\SOFTWARE\UsbWarp\Service;
+# logs go to %ProgramData%\UsbWarp\service.log
+# remove with: USBWarpService.exe --uninstall
+```
+
+Then bind a device:
+
+```powershell
+# List USB devices
 .\USBWarpController.exe list
 
 # Bind a device by its BUSID
@@ -235,7 +249,7 @@ All testing performed with Raspberry Pi Pico (RP2040) running MicroPython, conne
 - No isochronous transfer support (audio/video devices won't work)
 - No hot-plug detection — unbind before unplugging; if you forget, unbind + rebind recovers
 - Single VM session only
-- Service runs in console mode (no Windows Service / SCM integration)
+- Service runs as LocalSystem — whether `HcsOpenComputeSystem` on a WSL utility VM works under that account needs verification; if not, run it under an account with Hyper-V admin rights
 - Filter driver attaches to all USB class devices (no per-device targeting)
 - Drivers are not signed (test signing required)
 - Full-speed devices only validated; high-speed/super-speed devices untested
@@ -247,7 +261,6 @@ Planned features roughly in priority order:
 - **Hot-plug support** — Detect physical USB device insertion/removal and propagate to Guest automatically via `IRP_MN_SURPRISE_REMOVAL` handling in the filter driver
 - **High-speed / super-speed device testing** — Validate with USB 2.0/3.0 bulk devices (e.g., RTL-SDR, USB storage)
 - **Isochronous transfer support** — Enables USB audio interfaces, webcams, and other streaming devices
-- **SCM service mode** — Run UsbWarpService as a proper Windows service with auto-start
 - **Selective filter attachment** — Only attach UsbWarpFilter to devices that are actively bound, reducing overhead for unrelated USB devices
 - **ETW tracing** — Replace KdPrint with structured Event Tracing for Windows; sysfs stats on Linux side
 - **Batch URB submission** — Coalesce multiple URBs into a single Ring message for reduced overhead
