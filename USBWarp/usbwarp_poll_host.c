@@ -492,6 +492,14 @@ UsbWarpSendNegotiateResp(
     Ctx->NegotiatedCaps    = USBWARP_CAP_INLINE_DATA |
                              USBWARP_CAP_BATCH_SUBMIT |
                              USBWARP_CAP_STATS;
+
+    /* ISO capability comes from the Control Block flag the Service
+     * derives from its --iso config — the same source the Service-only
+     * debug path uses, so both host implementations advertise alike. */
+    if (Ctx->ControlBlock &&
+        (Ctx->ControlBlock->flags & USBWARP_FLAG_ISO_ENABLED))
+        Ctx->NegotiatedCaps |= USBWARP_CAP_ISO_TRANSFER;
+
     /* Intersect with guest capabilities. */
     Ctx->NegotiatedCaps &= NegMsg->capabilities;
     Ctx->Negotiated = TRUE;

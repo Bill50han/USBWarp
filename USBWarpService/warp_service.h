@@ -48,6 +48,11 @@ static inline void warp_config_defaults(struct warp_config *c)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §3  Per-device tracking (Service-side)
+ *
+ *   Only used by the no-driver debug path (Service owns the Ring and
+ *   answers LIST/BIND/UNBIND itself).  In driver mode the kernel is the
+ *   single source of truth — queries go through IOCTL_USBWARP_ENUM_DEVICES
+ *   and this array is not consulted.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 struct warp_bound_device {
@@ -136,6 +141,13 @@ struct warp_session {
     bool                driverRegistered;
     bool                driverShmSetup;
 
+    /* Protects the hDriver lifetime: IOCTL callers take it shared, open/
+     * close take it exclusive.  Prevents CloseHandle from racing an
+     * in-flight DeviceIoControl on the pipe thread.  SRW (not deviceLock)
+     * because a bind can hold the shared lock for seconds and the 2s
+     * heartbeat must never queue behind it (orphan grace is 30s). */
+    SRWLOCK             driverLock;
+
     /* ── Heartbeat timing (#7) ──────────────────────────────────────────── */
     UINT64              last_host_heartbeat_ns;
 
@@ -194,8 +206,17 @@ void DrvClientClose(struct warp_session *s);
 BOOL DrvClientRegister(struct warp_session *s);
 BOOL DrvClientSetupShm(struct warp_session *s);
 BOOL DrvClientHeartbeat(struct warp_session *s);
-BOOL DrvClientBindDevice(struct warp_session *s, uint32_t devIdx);
-BOOL DrvClientUnbindDevice(struct warp_session *s, uint32_t devIdx);
+
+/* GUID-keyed operations — the kernel is the single source of truth for
+ * bound-device state; the Service keeps no mirror in driver mode. */
+BOOL DrvClientQueryStatus(struct warp_session *s, USBWARP_QUERY_STATUS_OUT *out);
+BOOL DrvClientEnumDevices(struct warp_session *s, USBWARP_ENUM_DEVICES_OUT *out);
+BOOL DrvClientBindGuid(struct warp_session *s, const uint8_t device_guid[16],
+                       const WCHAR *instance_path,
+                       uint32_t *device_index, uint16_t *vendor_id,
+                       uint16_t *product_id);
+BOOL DrvClientUnbindGuid(struct warp_session *s, const uint8_t device_guid[16]);
+void DrvClientUnbindAll(struct warp_session *s);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §9  Named Pipe server

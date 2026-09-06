@@ -42,6 +42,9 @@ static NTSTATUS HandleHeartbeat(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
 static NTSTATUS HandleQueryStatus(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
                                   _In_ WDFREQUEST Request,
                                   _In_ size_t OutLen);
+static NTSTATUS HandleEnumDevices(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
+                                  _In_ WDFREQUEST Request,
+                                  _In_ size_t OutLen);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Top-level IOCTL dispatch
@@ -95,6 +98,10 @@ UsbWarpEvtIoDeviceControl(
 
     case IOCTL_USBWARP_QUERY_STATUS:
         status = HandleQueryStatus(ctx, Request, OutputBufferLength);
+        break;
+
+    case IOCTL_USBWARP_ENUM_DEVICES:
+        status = HandleEnumDevices(ctx, Request, OutputBufferLength);
         break;
 
     default:
@@ -487,6 +494,7 @@ HandleBindDevice(
     PUSBWARP_BIND_DEVICE_OUT out = NULL;
     size_t bufLen;
     ULONG slot;
+    KIRQL oldIrql;
     PUSBWARP_DEVICE_CONTEXT devCtx;
     GUID  bindContainerId = { 0 };
     BOOLEAN bindHaveContainerId = FALSE;
@@ -520,14 +528,27 @@ HandleBindDevice(
         (in->InstancePathLength % sizeof(WCHAR)) != 0)
         return STATUS_INVALID_PARAMETER;
 
-    /* Find a free device slot (1-based indexing; slot 0 unused). */
+    /* Find a free device slot (1-based indexing; slot 0 unused) and reject
+     * a duplicate DeviceGuid — the GUID is the unbind key, so it must stay
+     * unique across bound slots.  DeviceLock keeps the scan consistent
+     * with concurrent hot-remove teardown on the PnP callback thread. */
     slot = 0;
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
         if (!Ctx->Devices[i].InUse) {
-            slot = i + 1;  /* device_id = 1-based */
-            break;
+            if (slot == 0)
+                slot = i + 1;  /* device_id = 1-based */
+            continue;
+        }
+        if (RtlCompareMemory(Ctx->Devices[i].DeviceGuid,
+                             in->DeviceGuid, 16) == 16) {
+            KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+            KdPrint(("UsbWarp: DUPLICATE BIND rejected — "
+                     "GUID already bound in slot %u\n", i + 1));
+            return STATUS_ALREADY_REGISTERED;
         }
     }
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     if (slot == 0)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -606,8 +627,13 @@ HandleBindDevice(
     /* ── Initialize device context ───────────────────────────────────── */
     devCtx = &Ctx->Devices[slot - 1];
 
+    /* Publish the slot under DeviceLock so a concurrent ENUM snapshot
+     * never observes a half-initialized entry.  The zeroing is safe: the
+     * slot was free, nothing references it. */
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     RtlZeroMemory(devCtx, sizeof(*devCtx));
     devCtx->InUse       = TRUE;
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     devCtx->DeviceIndex = slot;
     RtlCopyMemory(devCtx->DeviceGuid, in->DeviceGuid, 16);
     InitializeListHead(&devCtx->PendingUrbs);
@@ -635,7 +661,9 @@ HandleBindDevice(
     if (!NT_SUCCESS(status)) {
         KdPrint(("UsbWarp: device open failed 0x%x for slot %u\n",
                  status, slot));
+        KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
         devCtx->InUse = FALSE;
+        KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
         return status;
     }
 
@@ -648,7 +676,9 @@ HandleBindDevice(
         KdPrint(("UsbWarp: DEVICE_ADDED send failed 0x%x — rolling back slot %u\n",
                  status, slot));
         UsbWarpDeviceClose(Ctx, devCtx);
+        KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
         devCtx->InUse = FALSE;
+        KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
         InterlockedDecrement(&Ctx->ActiveDeviceCount);
         return status;
     }
@@ -682,6 +712,7 @@ HandleUnbindDevice(
     NTSTATUS status;
     PUSBWARP_UNBIND_DEVICE_IN in = NULL;
     size_t bufLen;
+    KIRQL oldIrql;
     PUSBWARP_DEVICE_CONTEXT devCtx = NULL;
 
     if (InLen < sizeof(*in))
@@ -698,6 +729,7 @@ HandleUnbindDevice(
         return STATUS_INVALID_DEVICE_STATE;
 
     /* Find device by GUID. */
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
         if (Ctx->Devices[i].InUse &&
             RtlCompareMemory(Ctx->Devices[i].DeviceGuid,
@@ -706,6 +738,7 @@ HandleUnbindDevice(
             break;
         }
     }
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     if (!devCtx)
         return STATUS_DEVICE_DOES_NOT_EXIST;
 
@@ -725,7 +758,9 @@ HandleUnbindDevice(
     /* Close USB device (cancels pending URBs). */
     UsbWarpDeviceClose(Ctx, devCtx);
 
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     devCtx->InUse = FALSE;
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     InterlockedExchange(&devCtx->Removing, 0);
     InterlockedDecrement(&Ctx->ActiveDeviceCount);
 
@@ -855,6 +890,68 @@ HandleQueryStatus(
     out->HealthScore = 100;
     if (out->OrphanMode)        out->HealthScore -= 50;
     if (out->DriverState == USBWARP_STATE_ERROR) out->HealthScore = 0;
+
+    WdfRequestSetInformation(Request, sizeof(*out));
+
+    return STATUS_SUCCESS;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §8b  ENUM_DEVICES
+ *
+ *   Authoritative per-device snapshot.  DeviceLock also guards the
+ *   InUse/ActiveDeviceCount transitions in bind/unbind and the hot-remove
+ *   PnP callback, so the scan cannot observe a half-torn slot.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static NTSTATUS
+HandleEnumDevices(
+    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
+    _In_ WDFREQUEST Request,
+    _In_ size_t OutLen
+    )
+{
+    NTSTATUS status;
+    PUSBWARP_ENUM_DEVICES_OUT out = NULL;
+    size_t bufLen;
+    KIRQL oldIrql;
+    ULONG count = 0;
+
+    if (OutLen < sizeof(*out))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                            (PVOID *)&out, &bufLen);
+    if (!NT_SUCCESS(status)) return status;
+
+    RtlZeroMemory(out, sizeof(*out));
+
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
+    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
+        PUSBWARP_DEVICE_CONTEXT devCtx = &Ctx->Devices[i];
+        PUSBWARP_ENUM_DEVICE_ENTRY entry;
+
+        if (!devCtx->InUse)
+            continue;
+
+        entry            = &out->Devices[count++];
+        entry->DeviceIndex = devCtx->DeviceIndex;
+        RtlCopyMemory(entry->DeviceGuid, devCtx->DeviceGuid, 16);
+        entry->VendorId     = devCtx->VendorId;
+        entry->ProductId   = devCtx->ProductId;
+        entry->Speed       = devCtx->Speed;
+        entry->Removing    = (InterlockedCompareExchange(&devCtx->Removing,
+                                                          0, 0) != 0);
+        entry->BreakerState = (UCHAR)InterlockedCompareExchange(
+                                    &devCtx->Breaker.State, 0, 0);
+        entry->PendingCount = (ULONG)devCtx->PendingCount;
+        entry->TotalUrbs   = (ULONG64)devCtx->TotalUrbs;
+        entry->TotalBytes  = (ULONG64)devCtx->TotalBytes;
+    }
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+
+    out->Version     = USBWARP_IOCTL_STRUCT_VERSION;
+    out->DeviceCount = count;
 
     WdfRequestSetInformation(Request, sizeof(*out));
 

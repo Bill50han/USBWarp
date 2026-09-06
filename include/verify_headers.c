@@ -57,6 +57,13 @@ USBWARP_STATIC_ASSERT(USBWARP_ALIGN_CACHELINE(sizeof(struct usbwarp_msg_circuit_
 /* Pipe header */
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_header) == 16, "");
 
+/* ENUM device entry: 48 bytes, counters naturally aligned */
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_ENUM_DEVICE_ENTRY) == 48, "");
+USBWARP_STATIC_ASSERT(offsetof(USBWARP_ENUM_DEVICE_ENTRY, TotalUrbs)  == 32, "");
+USBWARP_STATIC_ASSERT(offsetof(USBWARP_ENUM_DEVICE_ENTRY, TotalBytes) == 40, "");
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_ENUM_DEVICES_OUT) ==
+               8 + USBWARP_MAX_DEVICES_LIMIT * sizeof(USBWARP_ENUM_DEVICE_ENTRY), "");
+
 /* Power-of-2 check macro */
 USBWARP_STATIC_ASSERT(USBWARP_IS_POWER_OF_2(64),    "");
 USBWARP_STATIC_ASSERT(USBWARP_IS_POWER_OF_2(4096),  "");
@@ -119,6 +126,8 @@ int main(void)
     SHOW(USBWARP_HEARTBEAT_IN);
     SHOW(USBWARP_HEARTBEAT_OUT);
     SHOW(USBWARP_QUERY_STATUS_OUT);
+    SHOW(USBWARP_ENUM_DEVICE_ENTRY);
+    SHOW(USBWARP_ENUM_DEVICES_OUT);
     printf("\n");
 
     printf("Pipe structures:\n");

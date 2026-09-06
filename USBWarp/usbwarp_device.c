@@ -225,8 +225,15 @@ UsbWarpEvtTargetRemoveComplete(WDFIOTARGET Target)
     }
 
     /* Mark slot as free.  Don't call UsbWarpDeviceClose — WDF has
-     * already closed/deleted the IoTarget internals. */
-    devCtx->InUse = FALSE;
+     * already closed/deleted the IoTarget internals.  DeviceLock keeps
+     * the InUse transition consistent with ENUM snapshots (this runs on
+     * a PnP callback thread, outside the sequential IOCTL queue). */
+    {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&ctx->DeviceLock, &oldIrql);
+        devCtx->InUse = FALSE;
+        KeReleaseSpinLock(&ctx->DeviceLock, oldIrql);
+    }
     InterlockedExchange(&devCtx->Removing, 0);
     InterlockedDecrement(&ctx->ActiveDeviceCount);
 

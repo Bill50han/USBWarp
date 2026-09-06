@@ -71,6 +71,9 @@ DEFINE_GUID(GUID_USBWARP_CONTROL_INTERFACE,
 #define IOCTL_USBWARP_QUERY_STATUS \
     CTL_CODE(USBWARP_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_READ_ACCESS)
 
+#define IOCTL_USBWARP_ENUM_DEVICES \
+    CTL_CODE(USBWARP_DEVICE_TYPE, 0x807, METHOD_BUFFERED, FILE_READ_ACCESS)
+
 /* Debug-only fault injection (gated behind DBG build) */
 #define IOCTL_USBWARP_DBG_INJECT_ERROR \
     CTL_CODE(USBWARP_DEVICE_TYPE, 0x900, METHOD_BUFFERED, FILE_WRITE_ACCESS)
@@ -217,6 +220,40 @@ typedef struct _USBWARP_QUERY_STATUS_OUT {
     uint32_t HealthScore;                /* 0–100                             */
     uint32_t Reserved[4];
 } USBWARP_QUERY_STATUS_OUT, * PUSBWARP_QUERY_STATUS_OUT;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §10b  IOCTL_USBWARP_ENUM_DEVICES
+ *
+ *   Authoritative per-device snapshot for the Service.  The kernel is the
+ *   single source of truth for bound-device state; the Service must not
+ *   maintain its own mirror.  Fixed-capacity array (max devices is a
+ *   compile-time constant) — one call, no count-then-fetch round trip.
+ *
+ *   Consistency: taken under the driver's DeviceLock, which also guards
+ *   the InUse/ActiveDeviceCount transitions in bind, unbind and the
+ *   hot-remove PnP callback (the sequential IOCTL queue alone does not
+ *   serialize against the PnP callback thread).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct _USBWARP_ENUM_DEVICE_ENTRY {
+    uint32_t DeviceIndex;                /* 1-based, = protocol device_id */
+    uint8_t  DeviceGuid[16];
+    uint16_t VendorId;
+    uint16_t ProductId;
+    uint8_t  Speed;                      /* enum usbwarp_usb_speed       */
+    uint8_t  Removing;                   /* teardown in progress         */
+    uint8_t  BreakerState;               /* 0=CLOSED 1=OPEN 2=HALF_OPEN  */
+    uint8_t  _pad0;
+    uint32_t PendingCount;
+    uint64_t TotalUrbs;                 /* @32, naturally 8-aligned      */
+    uint64_t TotalBytes;
+} USBWARP_ENUM_DEVICE_ENTRY, * PUSBWARP_ENUM_DEVICE_ENTRY;   /* 48 bytes */
+
+typedef struct _USBWARP_ENUM_DEVICES_OUT {
+    uint32_t Version;                    /* USBWARP_IOCTL_STRUCT_VERSION */
+    uint32_t DeviceCount;                /* valid entries in Devices[]   */
+    USBWARP_ENUM_DEVICE_ENTRY Devices[USBWARP_MAX_DEVICES_LIMIT];
+} USBWARP_ENUM_DEVICES_OUT, * PUSBWARP_ENUM_DEVICES_OUT;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §11  IOCTL_USBWARP_DBG_INJECT_ERROR  (debug builds only)

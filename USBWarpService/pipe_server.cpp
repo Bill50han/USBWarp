@@ -66,7 +66,18 @@ static BOOL SendSimple(HANDLE hPipe, uint32_t seqId, int32_t status,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §2  Command handlers
+ *
+ *   Driver mode: the kernel is the single source of truth — LIST/QUERY_*
+ *   take a fresh ENUM/QUERY snapshot per request, BIND/UNBIND are pure
+ *   GUID-keyed pass-throughs (the kernel performs duplicate detection and
+ *   assigns the DeviceIndex).  The bound_devices[] mirror is consulted
+ *   only in the no-driver debug path.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static bool DriverActive(struct warp_session *s)
+{
+    return s->hDriver && s->driverShmSetup;
+}
 
 static void HandleQueryStatus(struct warp_session *s, HANDLE hPipe,
                               uint32_t seqId)
@@ -74,124 +85,290 @@ static void HandleQueryStatus(struct warp_session *s, HANDLE hPipe,
     struct usbwarp_pipe_status st;
     memset(&st, 0, sizeof(st));
 
-    st.session_state       = s->mmio_mapped ? 2 : (s->hdv_started ? 1 : 0);
-    st.bound_device_count  = s->bound_device_count;
-    st.active_device_count = s->bound_device_count;
-    st.orphan_mode         = 0;
+    st.session_state = s->mmio_mapped ? 2 : (s->hdv_started ? 1 : 0);
+
+    if (DriverActive(s)) {
+        USBWARP_QUERY_STATUS_OUT q;
+        if (DrvClientQueryStatus(s, &q)) {
+            st.bound_device_count       = q.ActiveDeviceCount;
+            st.active_device_count      = q.ActiveDeviceCount;
+            st.orphan_mode              = q.OrphanMode;
+            st.total_urbs_processed     = q.TotalUrbsProcessed;
+            st.total_bytes_transferred  = q.TotalBytesTransferred;
+        } else {
+            LogWarn("QUERY_STATUS: driver query failed");
+        }
+    } else {
+        st.bound_device_count  = s->bound_device_count;
+        st.active_device_count = s->bound_device_count;
+        st.total_urbs_processed    = s->stats.total_urb_submits;
+        st.total_bytes_transferred = s->stats.total_bytes_out +
+                                     s->stats.total_bytes_in;
+    }
 
     UINT64 now = NowNs();
-    st.uptime_seconds          = (now - s->start_time_ns) / 1000000000ULL;
-    st.total_urbs_processed    = s->stats.total_urb_submits;
-    st.total_bytes_transferred = s->stats.total_bytes_out + s->stats.total_bytes_in;
+    st.uptime_seconds = (now - s->start_time_ns) / 1000000000ULL;
 
     SendResponse(hPipe, seqId, 0, &st, sizeof(st));
 }
 
-/* FIX #13: Return collected statistics. */
+/* FIX #13: Return collected statistics (driver counters in driver mode). */
 static void HandleQueryStats(struct warp_session *s, HANDLE hPipe,
+                             const BYTE *payload, uint32_t payloadLen,
                              uint32_t seqId)
 {
     struct usbwarp_pipe_stats_response sr;
     memset(&sr, 0, sizeof(sr));
 
-    sr.urb_submit_count   = s->stats.total_urb_submits;
-    sr.urb_complete_count = s->stats.total_urb_completes;
-    sr.urb_cancel_count   = s->stats.total_urb_cancels;
-    sr.urb_error_count    = s->stats.total_urb_errors;
-    sr.bytes_out          = s->stats.total_bytes_out;
-    sr.bytes_in           = s->stats.total_bytes_in;
+    if (DriverActive(s)) {
+        const struct usbwarp_pipe_stats_request *req =
+            (payloadLen >= sizeof(*req)) ?
+            (const struct usbwarp_pipe_stats_request *)payload : NULL;
 
-    if (s->mmio_mapped && s->g2h_ring && s->h2g_ring) {
-        uint32_t g2h_used = usbwarp_ring_used(
-            s->g2h_ring->producer_index,
-            s->g2h_ring->consumer_index,
-            s->g2h_ring->data_size_mask);
-        sr.ring_usage_percent = s->g2h_ring->data_size ?
-            (uint32_t)((uint64_t)g2h_used * 100 / s->g2h_ring->data_size) : 0;
+        bool anyGuid = false;
+        if (req) {
+            for (int i = 0; i < 16; i++)
+                if (req->device_guid[i]) { anyGuid = true; break; }
+        }
+
+        if (anyGuid) {
+            /* Per-device stats from the authoritative snapshot.  The kernel
+             * tracks a combined byte counter — bytes_in stays 0. */
+            USBWARP_ENUM_DEVICES_OUT en;
+            if (DrvClientEnumDevices(s, &en)) {
+                for (uint32_t i = 0; i < en.DeviceCount; i++) {
+                    if (memcmp(en.Devices[i].DeviceGuid,
+                               req->device_guid, 16) == 0) {
+                        sr.urb_submit_count = en.Devices[i].TotalUrbs;
+                        sr.bytes_out        = en.Devices[i].TotalBytes;
+                        break;
+                    }
+                }
+            }
+        } else {
+            USBWARP_QUERY_STATUS_OUT q;
+            if (DrvClientQueryStatus(s, &q)) {
+                sr.urb_submit_count   = q.TotalUrbsProcessed;
+                sr.bytes_out          = q.TotalBytesTransferred;
+                sr.ring_usage_percent = q.RingG2HUsagePercent;
+            }
+        }
+    } else {
+        sr.urb_submit_count   = s->stats.total_urb_submits;
+        sr.urb_complete_count = s->stats.total_urb_completes;
+        sr.urb_cancel_count   = s->stats.total_urb_cancels;
+        sr.urb_error_count    = s->stats.total_urb_errors;
+        sr.bytes_out          = s->stats.total_bytes_out;
+        sr.bytes_in           = s->stats.total_bytes_in;
+
+        if (s->mmio_mapped && s->g2h_ring && s->h2g_ring) {
+            uint32_t g2h_used = usbwarp_ring_used(
+                s->g2h_ring->producer_index,
+                s->g2h_ring->consumer_index,
+                s->g2h_ring->data_size_mask);
+            sr.ring_usage_percent = s->g2h_ring->data_size ?
+                (uint32_t)((uint64_t)g2h_used * 100 /
+                           s->g2h_ring->data_size) : 0;
+        }
     }
 
     SendResponse(hPipe, seqId, 0, &sr, sizeof(sr));
 }
 
+static void HandleQueryDevice(struct warp_session *s, HANDLE hPipe,
+                              const BYTE *payload, uint32_t payloadLen,
+                              uint32_t seqId)
+{
+    if (payloadLen < sizeof(struct usbwarp_pipe_query_device_request)) {
+        SendSimple(hPipe, seqId, -1, "payload too small");
+        return;
+    }
+
+    const struct usbwarp_pipe_query_device_request *req =
+        (const struct usbwarp_pipe_query_device_request *)payload;
+
+    if (!DriverActive(s)) {
+        SendSimple(hPipe, seqId, -1, "driver not connected");
+        return;
+    }
+
+    USBWARP_ENUM_DEVICES_OUT en;
+    if (!DrvClientEnumDevices(s, &en)) {
+        SendSimple(hPipe, seqId, -1, "driver query failed");
+        return;
+    }
+
+    for (uint32_t i = 0; i < en.DeviceCount; i++) {
+        const USBWARP_ENUM_DEVICE_ENTRY *e = &en.Devices[i];
+
+        if (memcmp(e->DeviceGuid, req->device_guid, 16) != 0)
+            continue;
+
+        struct usbwarp_pipe_query_device_response resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.status                = 0;
+        memcpy(resp.device_guid, e->DeviceGuid, 16);
+        resp.vendor_id             = e->VendorId;
+        resp.product_id            = e->ProductId;
+        resp.speed                 = e->Speed;
+        resp.bound                 = 1;
+        resp.circuit_breaker_state = e->BreakerState;
+        resp.pending_urb_count     = e->PendingCount;
+        resp.total_bytes           = e->TotalBytes;
+        /* avg_latency_us / error_rate_60s_permille: no kernel source
+         * yet — left 0 rather than invented. */
+        SendResponse(hPipe, seqId, 0, &resp, sizeof(resp));
+        return;
+    }
+
+    SendSimple(hPipe, seqId, -1, "device not found");
+}
+
 static void HandleListDevices(struct warp_session *s, HANDLE hPipe,
                               uint32_t seqId)
 {
-    /* Build device list from bound_devices array. */
-    EnterCriticalSection(&s->deviceLock);
+    struct usbwarp_pipe_device_entry entries[WARP_MAX_BOUND_DEVICES];
+    uint32_t count = 0;
 
-    struct usbwarp_pipe_device_list list;
-    list.device_count = s->bound_device_count;
+    memset(entries, 0, sizeof(entries));
 
-    /* For simplicity, send just the count header + entries inline.
-     * Each entry is fixed-size with empty description. */
-    uint32_t payloadLen = sizeof(list);
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (s->bound_devices[i].in_use)
-            payloadLen += sizeof(struct usbwarp_pipe_device_entry);
+    if (DriverActive(s)) {
+        USBWARP_ENUM_DEVICES_OUT en;
+        if (!DrvClientEnumDevices(s, &en)) {
+            SendSimple(hPipe, seqId, -1, "driver query failed");
+            return;
+        }
+        for (uint32_t i = 0; i < en.DeviceCount &&
+                            count < WARP_MAX_BOUND_DEVICES; i++) {
+            memcpy(entries[count].device_guid, en.Devices[i].DeviceGuid, 16);
+            entries[count].vendor_id  = en.Devices[i].VendorId;
+            entries[count].product_id = en.Devices[i].ProductId;
+            entries[count].bound      = 1;
+            count++;
+        }
+    } else {
+        /* No-driver debug path: the Service-owned mirror is the truth. */
+        EnterCriticalSection(&s->deviceLock);
+        for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
+            if (!s->bound_devices[i].in_use) continue;
+            memcpy(entries[count].device_guid,
+                   s->bound_devices[i].device_guid, 16);
+            entries[count].vendor_id  = s->bound_devices[i].vendor_id;
+            entries[count].product_id = s->bound_devices[i].product_id;
+            entries[count].bound      = 1;
+            count++;
+        }
+        LeaveCriticalSection(&s->deviceLock);
     }
 
+    struct usbwarp_pipe_device_list list;
+    list.device_count = count;
+
+    uint32_t payloadLen = sizeof(list) + count * sizeof(entries[0]);
     BYTE *payload = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                        payloadLen);
     if (!payload) {
-        LeaveCriticalSection(&s->deviceLock);
         SendSimple(hPipe, seqId, -1, "out of memory");
         return;
     }
 
     memcpy(payload, &list, sizeof(list));
-    BYTE *cursor = payload + sizeof(list);
+    if (count > 0)
+        memcpy(payload + sizeof(list), entries,
+               count * sizeof(entries[0]));
 
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (!s->bound_devices[i].in_use) continue;
-        struct usbwarp_pipe_device_entry entry;
-        memset(&entry, 0, sizeof(entry));
-        memcpy(entry.device_guid, s->bound_devices[i].device_guid, 16);
-        entry.vendor_id  = s->bound_devices[i].vendor_id;
-        entry.product_id = s->bound_devices[i].product_id;
-        entry.bound      = 1;
-        memcpy(cursor, &entry, sizeof(entry));
-        cursor += sizeof(entry);
-    }
-
-    LeaveCriticalSection(&s->deviceLock);
     SendResponse(hPipe, seqId, 0, payload, payloadLen);
     HeapFree(GetProcessHeap(), 0, payload);
 }
 
-/* P0#2: Atomic bind — allocate slot tentatively, then attempt driver IOCTL
- * and Ring message.  Only finalize on success; rollback on any failure.    */
-static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
-                             const BYTE *payload, uint32_t payloadLen,
-                             uint32_t seqId)
+/* Convert Win32 device path prefix \\?\ to NT kernel \??\ in place.
+ * WdfIoTargetOpen needs the NT-style path for kernel access. */
+static void NormalizeDevicePath(WCHAR *path)
+{
+    if (path[0] == L'\\' && path[1] == L'\\' &&
+        path[2] == L'?'  && path[3] == L'\\')
+        path[1] = L'?';
+}
+
+/* Bind request shared by both modes: extracts and converts the instance
+ * path.  Returns FALSE (and replies) on malformed input. */
+static bool ParseBindRequest(const BYTE *payload, uint32_t payloadLen,
+                             uint32_t seqId, HANDLE hPipe,
+                             const struct usbwarp_pipe_bind_request **reqOut,
+                             WCHAR widePath[256])
 {
     if (payloadLen < sizeof(struct usbwarp_pipe_bind_request)) {
         SendSimple(hPipe, seqId, -1, "payload too small");
-        return;
-    }
-
-    if (!s->mmio_mapped || !s->negotiated) {
-        SendSimple(hPipe, seqId, -1, "session not ready");
-        return;
+        return false;
     }
 
     const struct usbwarp_pipe_bind_request *req =
         (const struct usbwarp_pipe_bind_request *)payload;
 
-    /* Extract instance path from variable-length payload. */
-    const char *instancePath = NULL;
-    uint16_t    instancePathLen = req->instance_path_length;
+    uint16_t instancePathLen = req->instance_path_length;
+    const char *instancePath =
+        (instancePathLen > 0 && payloadLen >= sizeof(*req) + instancePathLen) ?
+        (const char *)(payload + sizeof(*req)) : NULL;
 
-    if (instancePathLen > 0 &&
-        payloadLen >= sizeof(*req) + instancePathLen) {
-        instancePath = (const char *)(payload + sizeof(*req));
+    if (!instancePath) {
+        SendSimple(hPipe, seqId, -1, "missing instance path");
+        return false;
     }
 
-    if (!instancePath || instancePathLen == 0) {
-        SendSimple(hPipe, seqId, -1, "missing instance path");
+    int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      instancePath, (int)instancePathLen,
+                                      widePath, 255);
+    if (wideLen <= 0) {
+        SendSimple(hPipe, seqId, -1, "invalid UTF-8 instance path");
+        return false;
+    }
+    widePath[wideLen] = L'\0';
+    NormalizeDevicePath(widePath);
+
+    *reqOut = req;
+    return true;
+}
+
+/* Driver mode: pure pass-through — the kernel performs duplicate detection
+ * (ContainerId + GUID) and assigns the DeviceIndex.  No service-side slot. */
+static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
+                             const BYTE *payload, uint32_t payloadLen,
+                             uint32_t seqId)
+{
+    if (!s->mmio_mapped || !s->negotiated) {
+        SendSimple(hPipe, seqId, -1, "session not ready");
         return;
     }
 
-    /* Find a free slot (tentative allocation under lock). */
+    const struct usbwarp_pipe_bind_request *req;
+    WCHAR widePath[256];
+
+    if (!ParseBindRequest(payload, payloadLen, seqId, hPipe, &req, widePath))
+        return;
+
+    if (DriverActive(s)) {
+        uint32_t deviceIndex;
+        uint16_t vid, pid;
+
+        if (!DrvClientBindGuid(s, req->device_guid, widePath,
+                               &deviceIndex, &vid, &pid)) {
+            SendSimple(hPipe, seqId, -1, "bind failed (driver rejected)");
+            return;
+        }
+        /* Driver sends DEVICE_ADDED to the Guest itself (P0#1). */
+
+        char detail[64];
+        snprintf(detail, sizeof(detail), "bound to slot %u", deviceIndex);
+        SendSimple(hPipe, seqId, 0, detail);
+
+        LogInfo("Device bound: idx=%u VID=%04x PID=%04x guid=%02x%02x%02x%02x...",
+                deviceIndex, vid, pid,
+                req->device_guid[0], req->device_guid[1],
+                req->device_guid[2], req->device_guid[3]);
+        return;
+    }
+
+    /* Service-only debug path: tentative mirror slot, then Ring message. */
     EnterCriticalSection(&s->deviceLock);
 
     int freeSlot = -1;
@@ -220,70 +397,32 @@ static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
     dev->binding = true;
     dev->device_index = (uint32_t)(freeSlot + 1);
     memcpy(dev->device_guid, req->device_guid, 16);
-
-    /* Convert device path from UTF-8 to wide string for driver. */
-    int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                      instancePath, (int)instancePathLen,
-                                      dev->instance_path, 255);
-    if (wideLen <= 0) {
-        memset(dev, 0, sizeof(*dev));
-        LeaveCriticalSection(&s->deviceLock);
-        SendSimple(hPipe, seqId, -1, "invalid UTF-8 instance path");
-        return;
-    }
-    dev->instance_path[wideLen] = L'\0';
-
-    /* Convert Win32 device path prefix \\?\ to NT kernel \??\
-     * WdfIoTargetOpen needs NT-style path for kernel access. */
-    if (dev->instance_path[0] == L'\\' &&
-        dev->instance_path[1] == L'\\' &&
-        dev->instance_path[2] == L'?' &&
-        dev->instance_path[3] == L'\\') {
-        dev->instance_path[1] = L'?';
-    }
+    wcscpy_s(dev->instance_path, widePath);
 
     LeaveCriticalSection(&s->deviceLock);
 
-    /* Step 1: If Kernel Driver is available, bind via IOCTL. */
-    if (s->hDriver && s->driverShmSetup) {
-        if (!DrvClientBindDevice(s, (uint32_t)freeSlot)) {
-            LogError("Driver BIND_DEVICE failed — rolling back");
-            goto rollback;
-        }
-        /* Driver will send DEVICE_ADDED to Guest via its own Ring produce.
-         * Service must NOT also produce (P0#1). */
-    } else {
-        /* Service-only mode: we own the Ring, send DEVICE_ADDED. */
-        ServiceSendDeviceAdded(s, (uint32_t)freeSlot);
-    }
+    /* We own the Ring in this mode: send DEVICE_ADDED ourselves. */
+    ServiceSendDeviceAdded(s, (uint32_t)freeSlot);
 
-    {
-        EnterCriticalSection(&s->deviceLock);
-        dev->binding = false;
-        dev->in_use = true;
-        s->bound_device_count++;
-        LeaveCriticalSection(&s->deviceLock);
+    EnterCriticalSection(&s->deviceLock);
+    dev->binding = false;
+    dev->in_use = true;
+    s->bound_device_count++;
+    LeaveCriticalSection(&s->deviceLock);
 
-        char detail[64];
-        snprintf(detail, sizeof(detail), "bound to slot %d", freeSlot + 1);
-        SendSimple(hPipe, seqId, 0, detail);
-    }
+    char detail[64];
+    snprintf(detail, sizeof(detail), "bound to slot %d", freeSlot + 1);
+    SendSimple(hPipe, seqId, 0, detail);
 
-    LogInfo("Device bound: slot=%d guid=%02x%02x%02x%02x...",
+    LogInfo("Device bound (service-only): slot=%d guid=%02x%02x%02x%02x...",
             freeSlot + 1,
             req->device_guid[0], req->device_guid[1],
             req->device_guid[2], req->device_guid[3]);
-    return;
-
-rollback:
-    EnterCriticalSection(&s->deviceLock);
-    memset(dev, 0, sizeof(*dev));
-    LeaveCriticalSection(&s->deviceLock);
-    SendSimple(hPipe, seqId, -1, "bind failed (driver rejected)");
 }
 
-/* P0#2: Atomic unbind — driver IOCTL first (it sends DEVICE_REMOVED),
- * then Service sends Ring message only in service-only mode.              */
+/* Driver mode: GUID-keyed pass-through.  A kernel refusal for a device the
+ * authoritative snapshot no longer lists (hot-remove already freed the
+ * slot) is success, not an error. */
 static void HandleUnbindDevice(struct warp_session *s, HANDLE hPipe,
                                const BYTE *payload, uint32_t payloadLen,
                                uint32_t seqId)
@@ -296,6 +435,36 @@ static void HandleUnbindDevice(struct warp_session *s, HANDLE hPipe,
     const struct usbwarp_pipe_bind_request *req =
         (const struct usbwarp_pipe_bind_request *)payload;
 
+    if (DriverActive(s)) {
+        if (!DrvClientUnbindGuid(s, req->device_guid)) {
+            USBWARP_ENUM_DEVICES_OUT en;
+            bool stillBound = false;
+
+            if (DrvClientEnumDevices(s, &en)) {
+                for (uint32_t i = 0; i < en.DeviceCount; i++) {
+                    if (memcmp(en.Devices[i].DeviceGuid,
+                               req->device_guid, 16) == 0) {
+                        stillBound = true;
+                        break;
+                    }
+                }
+            }
+
+            if (stillBound) {
+                SendSimple(hPipe, seqId, -1, "unbind failed (driver rejected)");
+                return;
+            }
+            /* Kernel doesn't hold it anymore (hot-remove freed the slot). */
+            SendSimple(hPipe, seqId, 0, "unbound (already gone)");
+            return;
+        }
+
+        SendSimple(hPipe, seqId, 0, "unbound");
+        LogInfo("Device unbound (driver mode)");
+        return;
+    }
+
+    /* Service-only debug path: mirror lookup + Service-owned Ring message. */
     EnterCriticalSection(&s->deviceLock);
 
     int foundSlot = -1;
@@ -315,16 +484,7 @@ static void HandleUnbindDevice(struct warp_session *s, HANDLE hPipe,
 
     LeaveCriticalSection(&s->deviceLock);
 
-    /* Driver mode: IOCTL handles Ring message + USB device close.  Keep the
-     * service mirror unchanged if the kernel refuses the unbind. */
-    if (s->hDriver && s->driverShmSetup) {
-        if (!DrvClientUnbindDevice(s, (uint32_t)foundSlot)) {
-            SendSimple(hPipe, seqId, -1, "unbind failed (driver rejected)");
-            return;
-        }
-    } else {
-        ServiceSendDeviceRemoved(s, (uint32_t)foundSlot, 0);
-    }
+    ServiceSendDeviceRemoved(s, (uint32_t)foundSlot, 0);
 
     EnterCriticalSection(&s->deviceLock);
     memset(&s->bound_devices[foundSlot], 0, sizeof(s->bound_devices[foundSlot]));
@@ -385,8 +545,11 @@ static void HandleConnection(struct warp_session *s, HANDLE hPipe)
         case USBWARP_PIPE_CMD_QUERY_STATUS:
             HandleQueryStatus(s, hPipe, hdr->sequence_id);
             break;
+        case USBWARP_PIPE_CMD_QUERY_DEVICE:
+            HandleQueryDevice(s, hPipe, payload, payloadLen, hdr->sequence_id);
+            break;
         case USBWARP_PIPE_CMD_QUERY_STATS:
-            HandleQueryStats(s, hPipe, hdr->sequence_id);
+            HandleQueryStats(s, hPipe, payload, payloadLen, hdr->sequence_id);
             break;
         case USBWARP_PIPE_CMD_LIST_DEVICES:
             HandleListDevices(s, hPipe, hdr->sequence_id);

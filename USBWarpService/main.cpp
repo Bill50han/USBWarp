@@ -283,14 +283,13 @@ static void HandleNegotiate(struct warp_session *s,
         resp.negotiated_version = version;
 
         /* FIX #10: Only advertise capabilities we actually support.
-         * Without Kernel Driver: no BATCH_SUBMIT (no URB processing).
-         * With Kernel Driver: full capabilities. */
+         * This path runs only when the Service owns the Ring (no Kernel
+         * Driver) — the driver answers NEGOTIATE itself otherwise.  ISO
+         * comes from the Control Block flag (set from --iso), the same
+         * source the driver mode uses, so both hosts advertise alike. */
         uint32_t our_caps = USBWARP_CAP_INLINE_DATA | USBWARP_CAP_STATS;
-        if (s->hDriver && s->driverShmSetup) {
-            our_caps |= USBWARP_CAP_BATCH_SUBMIT;
-            if (s->cfg.enable_iso)
-                our_caps |= USBWARP_CAP_ISO_TRANSFER;
-        }
+        if (s->cb && (s->cb->flags & USBWARP_FLAG_ISO_ENABLED))
+            our_caps |= USBWARP_CAP_ISO_TRANSFER;
         resp.capabilities     = neg->capabilities & our_caps;
         resp.max_pending_urbs = USBWARP_PENDING_URBS_DEFAULT;
         resp.max_devices      = s->cfg.max_devices;
@@ -361,18 +360,18 @@ void ServiceEmergencyShutdown(struct warp_session *s)
     /* Priority 1: Stop accepting new operations. */
     s->negotiated = false;
 
-    /* Priority 2: Unbind all devices. */
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (s->bound_devices[i].in_use) {
-            /* P0#1: Only write Ring when Service owns it. */
-            if (!s->driverShmSetup)
+    /* Priority 2: Unbind all devices (kernel is the source of truth). */
+    if (s->hDriver && s->driverShmSetup) {
+        DrvClientUnbindAll(s);
+    } else {
+        for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
+            if (s->bound_devices[i].in_use) {
                 ServiceSendDeviceRemoved(s, i, 1 /* emergency */);
-            if (s->hDriver && s->driverShmSetup)
-                DrvClientUnbindDevice(s, i);
-            s->bound_devices[i].in_use = false;
+                s->bound_devices[i].in_use = false;
+            }
         }
+        s->bound_device_count = 0;
     }
-    s->bound_device_count = 0;
 
     /* Priority 3: Update Control Block. */
     if (s->cb) s->cb->host_state = USBWARP_STATE_ERROR;
@@ -592,6 +591,7 @@ int wmain(int argc, WCHAR *argv[])
     LogInit(&sess);
     InitializeCriticalSection(&sess.deviceLock);
     sess.deviceLockInit = true;
+    InitializeSRWLock(&sess.driverLock);
 
     if (!ParseArgs(argc, argv, &sess.cfg)) {
         PrintUsage();
@@ -615,18 +615,21 @@ cleanup:
     LogInfo("Shutting down ...");
     PipeServerStop(&sess);
 
-    /* Unbind all active devices before closing driver connection.
-     * Without this, pending URBs can keep the driver handle busy
-     * and block DrvClientClose. */
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (sess.bound_devices[i].in_use) {
-            LogInfo("Cleanup: unbinding slot %u", i + 1);
-            if (sess.hDriver && sess.driverShmSetup)
-                DrvClientUnbindDevice(&sess, i);
-            sess.bound_devices[i].in_use = false;
+    /* Unbind all devices before closing the driver connection — the
+     * kernel's device table is the source of truth, so iterate it rather
+     * than any Service-side mirror. */
+    if (sess.hDriver && sess.driverShmSetup) {
+        DrvClientUnbindAll(&sess);
+    } else {
+        for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
+            if (sess.bound_devices[i].in_use) {
+                LogInfo("Cleanup: unbinding slot %u", i + 1);
+                ServiceSendDeviceRemoved(&sess, i, 1 /* emergency */);
+                sess.bound_devices[i].in_use = false;
+            }
         }
+        sess.bound_device_count = 0;
     }
-    sess.bound_device_count = 0;
 
     DrvClientClose(&sess);
     HdvSessionClose(&sess);

@@ -317,6 +317,8 @@ UsbWarpValidateMessage(
     case USBWARP_MSG_SHUTDOWN_ACK:
     case USBWARP_MSG_CIRCUIT_BREAKER_TRIP:
     case USBWARP_MSG_CIRCUIT_BREAKER_RESET:
+    case USBWARP_MSG_STATS_REQUEST:
+    case USBWARP_MSG_STATS_RESPONSE:
         break;
     default:
         KdPrint(("UsbWarp: L2 unknown type %u\n", Hdr->message_type));
