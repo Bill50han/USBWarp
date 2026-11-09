@@ -8,6 +8,7 @@
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include "usbwarp_cli.h"
+#include "../include/usbwarp_usb3.h"
 
 #include <setupapi.h>
 #include <initguid.h>   /* must precede devpkey.h to define DEVPKEY GUIDs */
@@ -18,10 +19,6 @@
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
-
-static const GUID GUID_DEVINTERFACE_USB_DEVICE_LOCAL =
-    { 0xA5DCBF10L, 0x6530, 0x11D2,
-      { 0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED } };
 
 static const GUID GUID_DEVINTERFACE_USB_HUB_LOCAL =
     { 0xF18A0E88L, 0xC30C, 0x11D0,
@@ -201,9 +198,36 @@ static uint8_t GetDeviceSpeed(HDEVINFO devInfo, PSP_DEVINFO_DATA devData)
         case USB_HUB_SPEED_LOW:       speed = USBWARP_SPEED_LOW;   break;
         case USB_HUB_SPEED_FULL:      speed = USBWARP_SPEED_FULL;  break;
         case USB_HUB_SPEED_HIGH:      speed = USBWARP_SPEED_HIGH;  break;
-        case USB_HUB_SPEED_SUPER:
-        case USB_HUB_SPEED_SUPERPLUS: speed = USBWARP_SPEED_SUPER; break;
+        case USB_HUB_SPEED_SUPER: speed = USBWARP_SPEED_SUPER; break;
+        case USB_HUB_SPEED_SUPERPLUS: speed = USBWARP_SPEED_SUPER_PLUS; break;
         default:                      speed = 0;                   break;
+        }
+    }
+
+    /* Legacy EX can report a USB3 link as high-speed. EX_V2 distinguishes
+     * operating speed from device capability; never infer it from bcdUSB. */
+    {
+        USB_NODE_CONNECTION_INFORMATION_EX_V2 v2 = { 0 };
+        v2.ConnectionIndex = port;
+        v2.Length = sizeof(v2);
+        v2.SupportedUsbProtocols.Usb300 = 1;
+        if (DeviceIoControl(hHub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
+            &v2, sizeof(v2), &v2, sizeof(v2), &bytes, NULL) && bytes >= sizeof(v2)) {
+            if (v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher)
+                speed = USBWARP_SPEED_SUPER_PLUS;
+            else if (v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher)
+                speed = USBWARP_SPEED_SUPER;
+        }
+    }
+    if (usbwarp_speed_is_super(speed)) {
+        USB_NODE_CONNECTION_SUPERSPEEDPLUS_INFORMATION plus = { 0 };
+        plus.ConnectionIndex = port;
+        plus.Length = sizeof(plus);
+        if (DeviceIoControl(hHub, IOCTL_USB_GET_NODE_CONNECTION_SUPERSPEEDPLUS_INFORMATION,
+            &plus, sizeof(plus), &plus, sizeof(plus), &bytes, NULL) && bytes >= sizeof(plus)) {
+            uint32_t mode = usbwarp_usb3_decode_link(plus.RxSuperSpeedPlus.AsUlong32,
+                plus.RxLaneCount, plus.TxSuperSpeedPlus.AsUlong32, plus.TxLaneCount);
+            if (mode) speed = (uint8_t)mode;
         }
     }
 
@@ -225,10 +249,9 @@ int UsbEnumerate(USB_DEVICE_LIST *list)
 
     list->count = 0;
 
-    devInfo = SetupDiGetClassDevsA(
-        &GUID_DEVINTERFACE_USB_DEVICE_LOCAL,
-        NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    /* Enumerate physical USB devnodes, including unconfigured devices whose
+     * function driver has not enabled any device interface. */
+    devInfo = SetupDiGetClassDevsA(NULL, "USB", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
 
     if (devInfo == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Error: SetupDiGetClassDevs failed (%lu).\n",
@@ -249,38 +272,6 @@ int UsbEnumerate(USB_DEVICE_LIST *list)
                 dev->instanceId, sizeof(dev->instanceId), NULL))
             continue;
 
-        /* Get device interface path (\\?\USB#...#{GUID}) for CreateFile.
-         * This is needed by the driver's WdfIoTargetOpen. */
-        {
-            SP_DEVICE_INTERFACE_DATA ifData;
-            ifData.cbSize = sizeof(ifData);
-
-            if (SetupDiEnumDeviceInterfaces(devInfo, &devData,
-                    &GUID_DEVINTERFACE_USB_DEVICE_LOCAL, 0, &ifData)) {
-                /* Get required buffer size. */
-                DWORD detailSize = 0;
-                SetupDiGetDeviceInterfaceDetailA(devInfo, &ifData,
-                    NULL, 0, &detailSize, NULL);
-
-                if (detailSize > 0 && detailSize < 2048) {
-                    PSP_DEVICE_INTERFACE_DETAIL_DATA_A pDetail =
-                        (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)
-                        HeapAlloc(GetProcessHeap(), 0, detailSize);
-                    if (pDetail) {
-                        pDetail->cbSize =
-                            sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-                        if (SetupDiGetDeviceInterfaceDetailA(
-                                devInfo, &ifData, pDetail,
-                                detailSize, NULL, NULL)) {
-                            strncpy(dev->devicePath, pDetail->DevicePath,
-                                    sizeof(dev->devicePath) - 1);
-                        }
-                        HeapFree(GetProcessHeap(), 0, pDetail);
-                    }
-                }
-            }
-        }
-
         /* Skip root hubs. */
         if (strstr(dev->instanceId, "ROOT_HUB") != NULL)
             continue;
@@ -289,6 +280,21 @@ int UsbEnumerate(USB_DEVICE_LIST *list)
         if (IsCompositeChild(dev->instanceId)) {
             dev->isCompositeChild = true;
             continue;
+        }
+
+        /* Hubs are infrastructure, including non-root hubs with a VID/PID. */
+        {
+            ULONG chars=0;
+            if (CM_Get_Device_Interface_List_SizeA(&chars,
+                    (GUID *)&GUID_DEVINTERFACE_USB_HUB_LOCAL,dev->instanceId,
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT)==CR_SUCCESS && chars>1 && chars<=65536) {
+                char *interfaces=(char *)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,chars);
+                if (!interfaces) continue;
+                BOOL hub=CM_Get_Device_Interface_ListA((GUID *)&GUID_DEVINTERFACE_USB_HUB_LOCAL,
+                    dev->instanceId,interfaces,chars,CM_GET_DEVICE_INTERFACE_LIST_PRESENT)==CR_SUCCESS && interfaces[0];
+                HeapFree(GetProcessHeap(),0,interfaces);
+                if (hub) continue;
+            }
         }
 
         /* Get hardware ID for VID/PID. */

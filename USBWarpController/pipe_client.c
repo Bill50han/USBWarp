@@ -10,6 +10,37 @@
 
 #include "usbwarp_cli.h"
 
+/* Bound the entire request/reply exchange, including a stalled or spoofed
+ * local server. Cancellation must complete before OVERLAPPED/buffers die. */
+#ifndef PIPE_COMMAND_TIMEOUT_MS
+#define PIPE_COMMAND_TIMEOUT_MS 60000u
+#endif
+static BOOL PipeTransfer(HANDLE pipe, void *buffer, DWORD size, DWORD *bytes,
+                         BOOL write, ULONGLONG deadline)
+{
+    OVERLAPPED ov = { 0 };
+    DWORD error;
+    BOOL ok;
+    *bytes = 0;
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) return FALSE;
+    ok = write ? WriteFile(pipe, buffer, size, bytes, &ov) : ReadFile(pipe, buffer, size, bytes, &ov);
+    error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && error == ERROR_IO_PENDING) {
+        ULONGLONG now = GetTickCount64();
+        DWORD remaining = now >= deadline ? 0 : (DWORD)(deadline - now);
+        DWORD wait = WaitForSingleObject(ov.hEvent, remaining);
+        DWORD waitError = wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+        if (wait != WAIT_OBJECT_0) CancelIoEx(pipe, &ov);
+        ok = GetOverlappedResult(pipe, &ov, bytes, TRUE);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+        if (wait != WAIT_OBJECT_0) { ok = FALSE; error = waitError; }
+    }
+    CloseHandle(ov.hEvent);
+    SetLastError(error);
+    return ok;
+}
+
 int PipeConnect(PIPE_CLIENT *pc)
 {
     DWORD mode;
@@ -35,8 +66,8 @@ int PipeConnect(PIPE_CLIENT *pc)
 
     pc->hPipe = CreateFileA(
         USBWARP_PIPE_NAME,
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL);
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+        0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, NULL);
 
     if (pc->hPipe == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Error: Cannot open service pipe (%lu).\n",
@@ -48,9 +79,9 @@ int PipeConnect(PIPE_CLIENT *pc)
     mode = PIPE_READMODE_MESSAGE;
     ok = SetNamedPipeHandleState(pc->hPipe, &mode, NULL, NULL);
     if (!ok) {
-        fprintf(stderr, "Warning: SetNamedPipeHandleState failed (%lu). "
-                "Communication may be unreliable.\n", GetLastError());
-        /* Continue — byte mode may still work for small messages. */
+        fprintf(stderr, "Error: SetNamedPipeHandleState failed (%lu).\n", GetLastError());
+        PipeDisconnect(pc);
+        return -1;
     }
 
     return 0;
@@ -75,8 +106,14 @@ int PipeSendCommand(PIPE_CLIENT *pc,
     BOOL   ok;
     BYTE  *sendBuf;
     uint32_t totalSend;
+    ULONGLONG deadline;
 
+    if (!respLen) return -1;
     *respLen = 0;
+    if (!pc || pc->hPipe == INVALID_HANDLE_VALUE || !pc->hPipe ||
+        payloadLen > PIPE_BUF_SIZE - sizeof(hdr) || (payloadLen && !payload) ||
+        !respBuf || respBufSize < sizeof(hdr) + sizeof(struct usbwarp_pipe_response))
+        return -1;
 
     /* Build request. */
     hdr.magic          = USBWARP_PIPE_MAGIC;
@@ -97,44 +134,53 @@ int PipeSendCommand(PIPE_CLIENT *pc,
     if (payloadLen > 0 && payload)
         memcpy(sendBuf + sizeof(hdr), payload, payloadLen);
 
-    ok = WriteFile(pc->hPipe, sendBuf, totalSend, &written, NULL);
+    deadline = GetTickCount64() + PIPE_COMMAND_TIMEOUT_MS;
+    ok = PipeTransfer(pc->hPipe, sendBuf, totalSend, &written, TRUE, deadline);
     HeapFree(GetProcessHeap(), 0, sendBuf);
 
-    if (!ok) {
+    if (!ok || written != totalSend) {
         fprintf(stderr, "Error: pipe write failed (%lu).\n", GetLastError());
+        PipeDisconnect(pc);
         return -1;
     }
 
     /* Read response. */
-    ok = ReadFile(pc->hPipe, respBuf, respBufSize, &bytesRead, NULL);
+    ok = PipeTransfer(pc->hPipe, respBuf, respBufSize, &bytesRead, FALSE, deadline);
     if (!ok) {
         DWORD err = GetLastError();
         if (err == ERROR_MORE_DATA) {
-            /* FIX #5: Response truncated.  We have partial data in
-             * respBuf.  Warn the user but return what we got — the
-             * caller can still parse the header and status. */
-            fprintf(stderr, "Warning: response truncated (%lu bytes read, "
-                    "more data available).\n", bytesRead);
-            *respLen = bytesRead;
-            return 0;
+            fprintf(stderr, "Error: response exceeds the receive buffer.\n");
+            PipeDisconnect(pc);
+            return -1;
         }
         fprintf(stderr, "Error: pipe read failed (%lu).\n", err);
+        PipeDisconnect(pc);
         return -1;
     }
 
-    *respLen = bytesRead;
-
     /* Validate response header. */
-    if (bytesRead < sizeof(struct usbwarp_pipe_header)) {
+    if (bytesRead < sizeof(struct usbwarp_pipe_header) + sizeof(struct usbwarp_pipe_response)) {
         fprintf(stderr, "Error: response too short (%lu bytes).\n", bytesRead);
+        PipeDisconnect(pc);
         return -1;
     }
 
     struct usbwarp_pipe_header *respHdr = (struct usbwarp_pipe_header *)respBuf;
-    if (respHdr->magic != USBWARP_PIPE_MAGIC) {
-        fprintf(stderr, "Error: bad response magic 0x%x.\n", respHdr->magic);
+    if (respHdr->magic != USBWARP_PIPE_MAGIC || respHdr->command != USBWARP_PIPE_CMD_RESPONSE ||
+        respHdr->sequence_id != hdr.sequence_id || respHdr->payload_length != bytesRead - sizeof(hdr)) {
+        fprintf(stderr, "Error: invalid response envelope.\n");
+        PipeDisconnect(pc);
         return -1;
     }
+
+    const struct usbwarp_pipe_response *response =
+        (const struct usbwarp_pipe_response *)((const BYTE *)respBuf + sizeof(hdr));
+    if (response->detail_length != respHdr->payload_length - sizeof(*response)) {
+        fprintf(stderr, "Error: invalid response payload length.\n");
+        PipeDisconnect(pc);
+        return -1;
+    }
+    *respLen = bytesRead;
 
     return 0;
 }

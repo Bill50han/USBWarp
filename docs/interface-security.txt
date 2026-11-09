@@ -1,0 +1,105 @@
+USBWarp 交互接口安全检查与修复（2026-11-09）
+
+范围
+
+检查 Controller/Service 命名管道、Service/主驱动 IOCTL、捕获驱动接口、
+HDV PCI/MMIO 回调、Windows/Linux 共享内存布局与消息环、设备绑定/取消时序。
+这是一次源代码审查、针对性回归及实验 VM 验证，不是完整安全认证或形式证明。
+
+边界模型：普通本地用户可以查询管道状态，绑定/归还需要管理员或 SYSTEM；
+控制驱动仅允许系统/管理员打开，并绑定注册文件对象。捕获驱动仅接受内核
+请求和同一文件对象租约。共享区内容视为可变、不可信；已授权 guest 本来就
+能操作分配给它的 USB 设备，不在转发层增加磁盘等设备专用命令过滤。
+
+修复
+
+1. 命名管道 Owner Rights 权限过宽
+   原 OW=GA 会给对象所有者额外的服务器实例创建和 ACL 修改权。对象 owner
+   为服务账户用户 SID 时，该账户的受限/非提升令牌不能只靠 AU 的较小权限
+   掩码限制。改为 OW=RC，保留显式 Owner Rights ACE 以抑制隐含 WRITE_DAC；
+   SY/BA 保留管理权，AU 保留明确的客户端读写位，不含创建管道实例权限。
+   受限令牌实测复现旧授权，新 ACL 拒绝增建实例、WRITE_DAC、WRITE_OWNER，
+   正常客户端通信仍可用。该结论有 owner 条件，不等同于跨账户 SYSTEM 提权。
+
+2. Controller 对停滞服务端没有读写等待预算
+   原同步 ReadFile/WriteFile 可长期挂住控制器。改用 overlapped I/O，对一次
+   请求/响应给出 60 秒等待预算；取消后等完成再释放缓冲和 OVERLAPPED。
+   传输失败、异常帧关闭连接，避免继续使用失去帧同步的通道。
+   保留 SECURITY_IDENTIFICATION。真实假服务端测试确认它只能得到身份识别
+   级令牌，并确认不回复时客户端取消退出；测试以 100 ms 替代生产 60 秒。
+
+3. Windows 环长度对齐回绕和索引缺少校验
+   原消费者先 ALIGN_CACHELINE 再限制长度，接近 UINT32_MAX 的长度可回绕，
+   返回溢出而消费位置不前进。现先限制协议上限，再对齐和复制。
+   两端检查索引的 cacheline 对齐及原始 uint32 距离，避免用 mask 把越界
+   距离解释成旧数据。复制后比较头部快照，拒绝复制途中变化的头部。
+   Windows 恢复扫描采用私有协议上限，不再信任共享 max_message_size。
+   无法恢复的索引破坏将会话标记为错误、停止接收；映射仍等正常 DMA 排空
+   流程再释放，不因坏输入立即释放仍可能被物理设备使用的内存。
+
+4. 共享布局校验后重读及 Linux BAR 边界不足
+   Windows RingInit 原先重新读取共享 data_size/mask；现在使用已经验证的
+   IOCTL 配置大小并自行派生 mask。正常服务在 guest 映射之前完成初始化，
+   因此该初始化竞态的直接条件是可并发写共享区的创建方，不能无条件称为
+   正常 guest 可达的逃逸漏洞。
+   Linux 现在在形成指针前检查 BAR 大小、协议版本、总大小、两个环的位置/
+   大小、数据区、缓冲大小和数量。只使用这份经过校验的本地布局和派生 mask。
+   新 usbwarp_layout.h 是本地校验结构，不改变共享协议 ABI。
+
+5. PCI/MMIO 回退分支输入检查不完整
+   原仅 MSI-X BAR 的分支检查范围，其余读取会直接按 length 清零 value。
+   现在统一检查 BAR 是否存在、value 非空、长度非零及 offset/length 范围，
+   用减法避免加法溢出。配置空间原有对齐/大小与只读字段保护保持不变。
+   HDV 本身提供回调缓冲；这是回调边界加固，没有声称证明 guest 可任意伪造
+   HDV 提供的指针或缓冲容量。
+
+已核对并保留的保护
+
+  - 管道拒绝远程客户端、首实例独占、有限连接数/帧大小和服务端 I/O 等待。
+  - 绑定/归还通过客户端令牌检查管理员/SYSTEM；普通查询仍允许。
+  - 主控制设备 SDDL 为 SY/BA，注册 PID 对照真实请求方，后续操作绑定文件。
+  - section/event 句柄按 UserMode 和正确对象类型验证，保留对象引用。
+  - Filter 的 Create/IOCTL 均拒绝 UserMode；KernelVa 不由普通客户端直接使用。
+  - 转发缓冲范围在私有映射边界内再次校验，ISO 数量/偏移/总长有界。
+  - SubmitRundown、pending drain 和租约退休保护提交/取消/解绑交错。
+  - USB 配置描述符遍历检查长度，输入路径按物理设备身份重新解析。
+
+验证
+
+  - ASan/UBSan 下运行生产 Windows 环（平台 stand-ins）和 Linux 环。
+    覆盖长度回绕、越界/未对齐索引、共享几何篡改、复制头部变化、布局字段
+    越界；原 40000 条并发消息、索引自然回绕、ISO/根 Hub/传输回归通过。
+  - Windows Controller 边界/超时测试 74 项通过。
+  - 真实受限令牌 ACL 检查、停滞命名管道取消与 identification token 检查通过。
+  - Console/IPC/会话隔离 fixture 通过，包含非管理员 mutation 拒绝。
+  - PCI/HDV 生命周期和新增 MMIO 边界共 306 项通过。
+  - Win11Debug 实际驱动会话检查 83 项通过：非法布局/句柄、低权限打开、坏
+    长度恢复、索引破坏会话退休、退出清理；这些畸形输入测试没有绑定 USB。
+  - 随后正常 U300 只读测试 3 轮、在途解绑 1 次、SHA-256 和资源排空通过。
+    没有为此次安全测试增加 U 盘写入。
+
+构建
+
+Windows driver/service/controller Release 构建通过。Linux 在 Ubuntu-22.04
+使用原 kernel tree，KBUILD_MODPOST_WARN=1、KCFLAGS=-Werror 编译通过。
+Module.symvers/BTF 缺失警告仍按既有环境处理，实际模块加载未使用 force。
+
+边界与后续
+
+管道仍提供本地普通用户查询，连接上限和超时不是完整的按用户公平调度/
+资源配额；本轮不宣称消除所有可用性攻击。未做全部硬件类别、全部并发
+调度和完整故障注入穷举。现有保护及回归通过不能证明不存在其它漏洞。
+
+工作区保留修复与构建产物。测试后 Windows 临时部署/新增信任还原，U 盘
+恢复健康 D:；新的 Linux 安全修复模块保留，默认仍为自适应轮询。
+
+证据：x64/ReviewChecks/InterfaceSecurity/ 下的 linux-build-test.txt、
+windows-tests.txt、hdv-security-result.txt、vm-security-tests.txt、events.jsonl、
+read-smoke.txt、tested-hashes.json、cleanup.json 和 final-state.json。
+
+参考
+https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/7a53f60e-e730-4dfe-bbe9-b21b62eb790b
+https://learn.microsoft.com/en-us/windows/win32/devnotes/nt-create-named-pipe-file
+https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-accesscheck
+https://learn.microsoft.com/en-us/windows/win32/fileio/cancelioex-func

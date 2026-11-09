@@ -27,13 +27,16 @@ VOID
 UsbWarpRingInit(
     _Out_ PUSBWARP_HOST_RING Ring,
     _In_  volatile struct usbwarp_ring_header *Hdr,
-    _In_  volatile UCHAR *Data
+    _In_  volatile UCHAR *Data,
+    _In_  ULONG DataSize
     )
 {
     Ring->Hdr      = Hdr;
     Ring->Data     = Data;
-    Ring->DataSize = Hdr->data_size;
-    Ring->DataMask = Hdr->data_size_mask;
+    /* DataSize is the validated IOCTL value, not a second shared-memory read. */
+    Ring->DataSize = DataSize;
+    Ring->DataMask = DataSize - 1;
+    Ring->NotifyContext = NULL;
     KeInitializeSpinLock(&Ring->ProduceLock);
 }
 
@@ -55,24 +58,42 @@ UsbWarpRingProduce(
     _In_ ULONG              MsgLen
     )
 {
-    ULONG aligned = USBWARP_ALIGN_CACHELINE(MsgLen);
+    ULONG aligned;
     ULONG pi;
     ULONG ci;
     ULONG avail, pos, first;
     KIRQL oldIrql;
 
+    if (!Msg || MsgLen < sizeof(struct usbwarp_msg_header) ||
+        MsgLen > USBWARP_MAX_MESSAGE_SIZE || MsgLen > Ring->DataMask)
+        return STATUS_INVALID_PARAMETER;
+    aligned = USBWARP_ALIGN_CACHELINE(MsgLen);
     KeAcquireSpinLock(&Ring->ProduceLock, &oldIrql);
 
     pi = Ring->Hdr->producer_index;
 
     /* Read consumer_index with acquire semantics. */
     ci = ReadULongAcquire((volatile ULONG *)&Ring->Hdr->consumer_index);
+    if (!usbwarp_ring_state_valid(pi, ci, Ring->DataMask)) {
+        KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
+        return STATUS_DATA_ERROR;
+    }
 
     avail = usbwarp_ring_available(pi, ci, Ring->DataMask);
     if (avail < aligned) {
-        KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
-        return STATUS_INSUFFICIENT_RESOURCES;  /* ring full */
+        Ring->Hdr->producer_flags |= USBWARP_RING_FLAG_NEED_SPACE;
+        KeMemoryBarrier();
+        ci = ReadULongAcquire((volatile ULONG *)&Ring->Hdr->consumer_index);
+        if (!usbwarp_ring_state_valid(pi, ci, Ring->DataMask)) {
+            KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
+            return STATUS_DATA_ERROR;
+        }
+        if (usbwarp_ring_available(pi, ci, Ring->DataMask) < aligned) {
+            KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
+    Ring->Hdr->producer_flags &= ~USBWARP_RING_FLAG_NEED_SPACE;
 
     /* Write message data, handling wrap-around. */
     pos   = pi & Ring->DataMask;
@@ -111,6 +132,7 @@ UsbWarpRingProduce(
 
     KeReleaseSpinLock(&Ring->ProduceLock, oldIrql);
 
+    if (Ring->NotifyContext) UsbWarpIrqProduced(Ring->NotifyContext);
     return STATUS_SUCCESS;
 }
 
@@ -142,6 +164,7 @@ UsbWarpRingConsume(
 
     /* Load producer_index with acquire semantics. */
     pi = ReadULongAcquire((volatile ULONG *)&Ring->Hdr->producer_index);
+    if (!usbwarp_ring_state_valid(pi, ci, Ring->DataMask)) return STATUS_DATA_ERROR;
 
     used = usbwarp_ring_used(pi, ci, Ring->DataMask);
     if (used < sizeof(struct usbwarp_msg_header))
@@ -167,7 +190,8 @@ UsbWarpRingConsume(
         return STATUS_DATA_ERROR;
 
     msgLen = hdrCopy.message_length;
-    if (msgLen < sizeof(struct usbwarp_msg_header))
+    if (msgLen < sizeof(struct usbwarp_msg_header) ||
+        msgLen > USBWARP_MAX_MESSAGE_SIZE || msgLen > Ring->DataMask)
         return STATUS_DATA_ERROR;
 
     aligned = USBWARP_ALIGN_CACHELINE(msgLen);
@@ -195,6 +219,8 @@ UsbWarpRingConsume(
 
     /* Read barrier (pairs with producer's write barrier). */
     KeMemoryBarrier();
+    if (RtlCompareMemory(MsgOut, &hdrCopy, sizeof(hdrCopy)) != sizeof(hdrCopy))
+        return STATUS_DATA_ERROR;
 
     /* Advance consumer_index. */
     WriteULongRelease((volatile ULONG *)&Ring->Hdr->consumer_index, ci + aligned);

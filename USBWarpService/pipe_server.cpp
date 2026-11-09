@@ -1,667 +1,312 @@
-/*
- * pipe_server.cpp — UsbWarp Named Pipe server.
- *
- * Copyright (c) 2026 UsbWarp Project
- *
- * FIX #7:  SendResponse uses heap buffer with size check (was fixed-stack).
- * FIX #8:  ReadFile loop for large messages.
- * FIX #5:  Bind/unbind send Ring messages (DEVICE_ADDED/REMOVED).
- * FIX #13: QUERY_STATS returns collected statistics.
- */
-
+// SPDX-License-Identifier: GPL-2.0-only
+/* Local control plane. Queries use kernel snapshots; only administrators may
+ * change bindings. No service-owned device table or transport-ring access. */
 #include "warp_service.h"
 #include <stdio.h>
-#include <string.h>
 #include <sddl.h>
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §1  Response helpers (#7 fix: heap buffer, size check)
- * ═══════════════════════════════════════════════════════════════════════════ */
+namespace {
+constexpr DWORD MaxFrame = 65536;
+constexpr DWORD ClientTimeout = 30000;
 
-static BOOL SendResponse(HANDLE hPipe, uint32_t seqId,
-                         int32_t status, const void *payload,
-                         uint32_t payloadLen)
+BOOL Transfer(warp_session *s, HANDLE pipe, void *buffer, DWORD size, DWORD *bytes, bool write)
 {
-    struct usbwarp_pipe_header hdr;
-    hdr.magic          = USBWARP_PIPE_MAGIC;
-    hdr.command        = USBWARP_PIPE_CMD_RESPONSE;
-    hdr.payload_length = (uint32_t)sizeof(struct usbwarp_pipe_response) + payloadLen;
-    hdr.sequence_id    = seqId;
-
-    struct usbwarp_pipe_response resp;
-    resp.status        = status;
-    resp.detail_length = payloadLen;
-
-    uint32_t totalLen = sizeof(hdr) + sizeof(resp) + payloadLen;
-
-    /* FIX #7: Use heap for large payloads instead of fixed-size stack buffer. */
-    BYTE stackBuf[1024];
-    BYTE *buf = stackBuf;
-    bool heapAllocated = false;
-
-    if (totalLen > sizeof(stackBuf)) {
-        buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, totalLen);
-        if (!buf) return FALSE;
-        heapAllocated = true;
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) return FALSE;
+    BOOL ok = write ? WriteFile(pipe, buffer, size, bytes, &ov) : ReadFile(pipe, buffer, size, bytes, &ov);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && error == ERROR_IO_PENDING) {
+        HANDLE events[] = {ov.hEvent, s->stopEvent};
+        DWORD wait = WaitForMultipleObjects(2, events, FALSE, ClientTimeout);
+        if (wait != WAIT_OBJECT_0) CancelIoEx(pipe, &ov);
+        ok = GetOverlappedResult(pipe, &ov, bytes, TRUE);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+        if (wait != WAIT_OBJECT_0 && ok) { ok = FALSE; error = ERROR_OPERATION_ABORTED; }
     }
+    CloseHandle(ov.hEvent);
+    SetLastError(error);
+    return ok && !StopRequested(s);
+}
 
-    memcpy(buf, &hdr, sizeof(hdr));
-    memcpy(buf + sizeof(hdr), &resp, sizeof(resp));
-    if (payloadLen > 0 && payload)
-        memcpy(buf + sizeof(hdr) + sizeof(resp), payload, payloadLen);
-
-    DWORD written;
-    BOOL ok = WriteFile(hPipe, buf, totalLen, &written, NULL);
-
-    if (heapAllocated) HeapFree(GetProcessHeap(), 0, buf);
+BOOL Respond(warp_session *s, HANDLE pipe, uint32_t seq, int32_t status, const void *payload, uint32_t size)
+{
+    if (size > MaxFrame - sizeof(usbwarp_pipe_header) - sizeof(usbwarp_pipe_response)) return FALSE;
+    DWORD total = (DWORD)(sizeof(usbwarp_pipe_header) + sizeof(usbwarp_pipe_response)) + size;
+    BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total);
+    if (!data) return FALSE;
+    usbwarp_pipe_header header{USBWARP_PIPE_MAGIC, USBWARP_PIPE_CMD_RESPONSE,
+        (uint32_t)sizeof(usbwarp_pipe_response) + size, seq};
+    usbwarp_pipe_response response{status, size};
+    memcpy(data, &header, sizeof(header));
+    memcpy(data + sizeof(header), &response, sizeof(response));
+    if (size) memcpy(data + sizeof(header) + sizeof(response), payload, size);
+    DWORD written = 0;
+    BOOL ok = Transfer(s, pipe, data, total, &written, true) && written == total;
+    HeapFree(GetProcessHeap(), 0, data);
     return ok;
 }
-
-static BOOL SendSimple(HANDLE hPipe, uint32_t seqId, int32_t status,
-                       const char *detail)
+BOOL Error(warp_session *s, HANDLE pipe, uint32_t seq, DWORD code, const char *message)
 {
-    uint32_t detailLen = detail ? (uint32_t)strlen(detail) : 0;
-    return SendResponse(hPipe, seqId, status, detail, detailLen);
+    char text[256];
+    snprintf(text, sizeof(text), "%s (error %lu)", message, code);
+    return Respond(s, pipe, seq, -(int32_t)(code ? code : ERROR_GEN_FAILURE), text, (uint32_t)strlen(text));
+}
+BOOL Simple(warp_session *s, HANDLE pipe, uint32_t seq, const char *message)
+{
+    return Respond(s, pipe, seq, 0, message, (uint32_t)strlen(message));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §2  Command handlers
- *
- *   Driver mode: the kernel is the single source of truth — LIST/QUERY_*
- *   take a fresh ENUM/QUERY snapshot per request, BIND/UNBIND are pure
- *   GUID-keyed pass-throughs (the kernel performs duplicate detection and
- *   assigns the DeviceIndex).  The bound_devices[] mirror is consulted
- *   only in the no-driver debug path.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static bool DriverActive(struct warp_session *s)
+bool Administrator(warp_session *s, HANDLE pipe)
 {
-    return s->hDriver && s->driverShmSetup;
+    if (!ImpersonateNamedPipeClient(pipe)) return false;
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID administrators = nullptr, system = nullptr;
+    BOOL admin = FALSE, localSystem = FALSE;
+    if (AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0,0,0,0,0,0, &administrators)) {
+        CheckTokenMembership(nullptr, administrators, &admin);
+        FreeSid(administrators);
+    }
+    if (AllocateAndInitializeSid(&authority, 1, SECURITY_LOCAL_SYSTEM_RID,
+            0,0,0,0,0,0,0, &system)) {
+        CheckTokenMembership(nullptr, system, &localSystem);
+        FreeSid(system);
+    }
+    if (!RevertToSelf()) { RequestStop(s, ERROR_ACCESS_DENIED); return false; }
+    return admin || localSystem;
 }
 
-static void HandleQueryStatus(struct warp_session *s, HANDLE hPipe,
-                              uint32_t seqId)
+BOOL Status(warp_session *s, HANDLE pipe, uint32_t seq)
 {
-    struct usbwarp_pipe_status st;
-    memset(&st, 0, sizeof(st));
+    usbwarp_pipe_status status{};
+    status.session_state = s->stage.load();
+    status.uptime_seconds = (NowNs() - s->start_time_ns) / 1000000000ULL;
+    if (status.session_state == USBWARP_SESSION_RUNNING || status.session_state == USBWARP_SESSION_WAIT_GUEST) {
+        USBWARP_QUERY_STATUS_OUT kernel{};
+        if (!DrvClientQueryStatus(s, &kernel)) return Error(s, pipe, seq, GetLastError(), "driver status unavailable");
+        status.bound_device_count = status.active_device_count = kernel.ActiveDeviceCount;
+        status.orphan_mode = kernel.OrphanMode;
+        status.total_urbs_processed = kernel.TotalUrbsProcessed;
+        status.total_bytes_transferred = kernel.TotalBytesTransferred;
+        if (kernel.DriverState == USBWARP_STATE_ERROR) status.session_state = USBWARP_SESSION_ERROR;
+    }
+    return Respond(s, pipe, seq, 0, &status, sizeof(status));
+}
 
-    st.session_state = s->mmio_mapped ? 2 : (s->hdv_started ? 1 : 0);
+BOOL Dispatch(warp_session *s, HANDLE pipe, const usbwarp_pipe_header &header, const BYTE *payload)
+{
+    uint32_t size = header.payload_length, seq = header.sequence_id;
+    bool mutation = header.command == USBWARP_PIPE_CMD_BIND_DEVICE || header.command == USBWARP_PIPE_CMD_UNBIND_DEVICE;
+    if (mutation && !Administrator(s, pipe)) return Error(s, pipe, seq, ERROR_ACCESS_DENIED, "administrator privileges required");
+    if (header.command == USBWARP_PIPE_CMD_QUERY_STATUS) {
+        if (size) return Error(s, pipe, seq, ERROR_INVALID_DATA, "unexpected payload");
+        return Status(s, pipe, seq);
+    }
+    if (s->stage.load() != USBWARP_SESSION_RUNNING || !DrvClientActive(s))
+        return Error(s, pipe, seq, ERROR_NOT_READY, "USB session is not ready");
 
-    if (DriverActive(s)) {
-        USBWARP_QUERY_STATUS_OUT q;
-        if (DrvClientQueryStatus(s, &q)) {
-            st.bound_device_count       = q.ActiveDeviceCount;
-            st.active_device_count      = q.ActiveDeviceCount;
-            st.orphan_mode              = q.OrphanMode;
-            st.total_urbs_processed     = q.TotalUrbsProcessed;
-            st.total_bytes_transferred  = q.TotalBytesTransferred;
+    switch (header.command) {
+    case USBWARP_PIPE_CMD_LIST_DEVICES: {
+        if (size) return Error(s, pipe, seq, ERROR_INVALID_DATA, "unexpected payload");
+        USBWARP_ENUM_DEVICES_OUT devices{};
+        if (!DrvClientEnumDevices(s, &devices)) return Error(s, pipe, seq, GetLastError(), "driver enumeration failed");
+        struct { usbwarp_pipe_device_list list; usbwarp_pipe_device_entry entries[USBWARP_MAX_DEVICES_LIMIT]; } result{};
+        result.list.device_count = devices.DeviceCount;
+        for (uint32_t i = 0; i < devices.DeviceCount; ++i) {
+            auto &entry = result.entries[i];
+            memcpy(entry.device_guid, devices.Devices[i].DeviceGuid, 16);
+            entry.vendor_id = devices.Devices[i].VendorId;
+            entry.product_id = devices.Devices[i].ProductId;
+            entry.speed = devices.Devices[i].Speed;
+            entry.bound = 1;
+        }
+        return Respond(s, pipe, seq, 0, &result,
+            (uint32_t)sizeof(result.list) + devices.DeviceCount * (uint32_t)sizeof(result.entries[0]));
+    }
+    case USBWARP_PIPE_CMD_QUERY_DEVICE:
+    case USBWARP_PIPE_CMD_QUERY_STATS: {
+        // Older Controllers send an empty global-stats request.
+        if (size != 16 && !(header.command == USBWARP_PIPE_CMD_QUERY_STATS && !size))
+            return Error(s, pipe, seq, ERROR_INVALID_DATA, "expected device GUID");
+        bool global = true;
+        for (unsigned i = 0; i < size; ++i) if (payload[i]) global = false;
+        USBWARP_ENUM_DEVICES_OUT devices{};
+        const USBWARP_ENUM_DEVICE_ENTRY *device = nullptr;
+        if (!global || header.command == USBWARP_PIPE_CMD_QUERY_DEVICE) {
+            if (!DrvClientEnumDevices(s, &devices)) return Error(s, pipe, seq, GetLastError(), "driver enumeration failed");
+            for (uint32_t i = 0; i < devices.DeviceCount; ++i)
+                if (!memcmp(devices.Devices[i].DeviceGuid, payload, 16)) { device = &devices.Devices[i]; break; }
+            if (!device) return Error(s, pipe, seq, ERROR_NOT_FOUND, "device not found");
+        }
+        if (header.command == USBWARP_PIPE_CMD_QUERY_DEVICE) {
+            usbwarp_pipe_query_device_response result{};
+            memcpy(result.device_guid, device->DeviceGuid, 16);
+            result.vendor_id = device->VendorId; result.product_id = device->ProductId;
+            result.speed = device->Speed; result.bound = 1;
+            result.pending_urb_count = device->PendingCount;
+            result.total_bytes = device->TotalBytes; result.circuit_breaker_state = device->BreakerState;
+            return Respond(s, pipe, seq, 0, &result, sizeof(result));
+        }
+        usbwarp_pipe_stats_response result{};
+        if (device) {
+            result.urb_submit_count = device->TotalUrbs;
+            result.bytes_out = device->TotalBytes; // protocol legacy combined-byte field
         } else {
-            LogWarn("QUERY_STATUS: driver query failed");
+            USBWARP_QUERY_STATUS_OUT kernel{};
+            if (!DrvClientQueryStatus(s, &kernel)) return Error(s, pipe, seq, GetLastError(), "driver statistics unavailable");
+            result.urb_submit_count = kernel.TotalUrbsProcessed;
+            result.bytes_out = kernel.TotalBytesTransferred;
+            result.ring_usage_percent = kernel.RingG2HUsagePercent;
         }
-    } else {
-        st.bound_device_count  = s->bound_device_count;
-        st.active_device_count = s->bound_device_count;
-        st.total_urbs_processed    = s->stats.total_urb_submits;
-        st.total_bytes_transferred = s->stats.total_bytes_out +
-                                     s->stats.total_bytes_in;
+        return Respond(s, pipe, seq, 0, &result, sizeof(result));
     }
-
-    UINT64 now = NowNs();
-    st.uptime_seconds = (now - s->start_time_ns) / 1000000000ULL;
-
-    SendResponse(hPipe, seqId, 0, &st, sizeof(st));
+    case USBWARP_PIPE_CMD_BIND_DEVICE: {
+        if (size < sizeof(usbwarp_pipe_bind_request)) return Error(s, pipe, seq, ERROR_INVALID_DATA, "bind header missing");
+        usbwarp_pipe_bind_request request;
+        memcpy(&request, payload, sizeof(request));
+        if (!request.instance_path_length || request.instance_path_length != size - sizeof(request) ||
+            memchr(payload + sizeof(request), 0, request.instance_path_length) || request.speed > USBWARP_SPEED_MAX)
+            return Error(s, pipe, seq, ERROR_INVALID_DATA, "invalid device path");
+        WCHAR path[256];
+        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            (const char *)(payload + sizeof(request)), request.instance_path_length, path, 255);
+        if (n <= 0) return Error(s, pipe, seq, ERROR_INVALID_DATA, "invalid UTF-8 path");
+        path[n] = 0;
+        // A driverless USB devnode may have no active device interface. The
+        // capture layer resolves and validates instance/ContainerId/hub/port;
+        // only its NEW capture interface is ever passed to the kernel driver.
+        if (!_wcsnicmp(path, L"\\\\?\\USB#", 8)) path[1]=L'?';
+        else if (_wcsnicmp(path, L"USB\\VID_", 8))
+            return Error(s, pipe, seq, ERROR_INVALID_NAME, "expected a physical USB instance or interface path");
+        uint32_t index; uint16_t vid, pid;
+        if (!DeviceBind(s, request.device_guid, path, request.speed, &index, &vid, &pid))
+            return Error(s, pipe, seq, GetLastError(), "could not capture/bind device; see service log for PnP/install details");
+        char detail[64]; snprintf(detail, sizeof(detail), "bound to slot %u", index);
+        return Simple(s, pipe, seq, detail);
+    }
+    case USBWARP_PIPE_CMD_UNBIND_DEVICE: {
+        if (size != sizeof(usbwarp_pipe_bind_request)) return Error(s, pipe, seq, ERROR_INVALID_DATA, "invalid unbind request");
+        usbwarp_pipe_bind_request request; memcpy(&request, payload, sizeof(request));
+        if (DeviceUnbind(s, request.device_guid)) return Simple(s, pipe, seq, "unbound; original Windows device state restored");
+        return Error(s, pipe, seq, GetLastError(), "unbind or Windows storage restoration failed");
+    }
+    default: return Error(s, pipe, seq, ERROR_INVALID_FUNCTION, "unknown command");
+    }
 }
 
-/* FIX #13: Return collected statistics (driver counters in driver mode). */
-static void HandleQueryStats(struct warp_session *s, HANDLE hPipe,
-                             const BYTE *payload, uint32_t payloadLen,
-                             uint32_t seqId)
+DWORD WINAPI ClientWorker(void *context)
 {
-    struct usbwarp_pipe_stats_response sr;
-    memset(&sr, 0, sizeof(sr));
-
-    if (DriverActive(s)) {
-        const struct usbwarp_pipe_stats_request *req =
-            (payloadLen >= sizeof(*req)) ?
-            (const struct usbwarp_pipe_stats_request *)payload : NULL;
-
-        bool anyGuid = false;
-        if (req) {
-            for (int i = 0; i < 16; i++)
-                if (req->device_guid[i]) { anyGuid = true; break; }
+    auto client = (warp_pipe_client *)context;
+    warp_session *s = client->session;
+    BYTE *buffer = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MaxFrame);
+    if (buffer) {
+        while (!StopRequested(s)) {
+            DWORD read = 0;
+            if (!Transfer(s, client->pipe, buffer, MaxFrame, &read, false)) break;
+            // ERROR_MORE_DATA closes this connection; partial messages are never dispatched.
+            if (read < sizeof(usbwarp_pipe_header)) break;
+            usbwarp_pipe_header header; memcpy(&header, buffer, sizeof(header));
+            if (header.magic != USBWARP_PIPE_MAGIC || header.payload_length != read - sizeof(header)) break;
+            if (!Dispatch(s, client->pipe, header, buffer + sizeof(header))) break;
         }
-
-        if (anyGuid) {
-            /* Per-device stats from the authoritative snapshot.  The kernel
-             * tracks a combined byte counter — bytes_in stays 0. */
-            USBWARP_ENUM_DEVICES_OUT en;
-            if (DrvClientEnumDevices(s, &en)) {
-                for (uint32_t i = 0; i < en.DeviceCount; i++) {
-                    if (memcmp(en.Devices[i].DeviceGuid,
-                               req->device_guid, 16) == 0) {
-                        sr.urb_submit_count = en.Devices[i].TotalUrbs;
-                        sr.bytes_out        = en.Devices[i].TotalBytes;
-                        break;
-                    }
-                }
-            }
-        } else {
-            USBWARP_QUERY_STATUS_OUT q;
-            if (DrvClientQueryStatus(s, &q)) {
-                sr.urb_submit_count   = q.TotalUrbsProcessed;
-                sr.bytes_out          = q.TotalBytesTransferred;
-                sr.ring_usage_percent = q.RingG2HUsagePercent;
-            }
-        }
-    } else {
-        sr.urb_submit_count   = s->stats.total_urb_submits;
-        sr.urb_complete_count = s->stats.total_urb_completes;
-        sr.urb_cancel_count   = s->stats.total_urb_cancels;
-        sr.urb_error_count    = s->stats.total_urb_errors;
-        sr.bytes_out          = s->stats.total_bytes_out;
-        sr.bytes_in           = s->stats.total_bytes_in;
-
-        if (s->mmio_mapped && s->g2h_ring && s->h2g_ring) {
-            uint32_t g2h_used = usbwarp_ring_used(
-                s->g2h_ring->producer_index,
-                s->g2h_ring->consumer_index,
-                s->g2h_ring->data_size_mask);
-            sr.ring_usage_percent = s->g2h_ring->data_size ?
-                (uint32_t)((uint64_t)g2h_used * 100 /
-                           s->g2h_ring->data_size) : 0;
-        }
+        HeapFree(GetProcessHeap(), 0, buffer);
     }
-
-    SendResponse(hPipe, seqId, 0, &sr, sizeof(sr));
-}
-
-static void HandleQueryDevice(struct warp_session *s, HANDLE hPipe,
-                              const BYTE *payload, uint32_t payloadLen,
-                              uint32_t seqId)
-{
-    if (payloadLen < sizeof(struct usbwarp_pipe_query_device_request)) {
-        SendSimple(hPipe, seqId, -1, "payload too small");
-        return;
-    }
-
-    const struct usbwarp_pipe_query_device_request *req =
-        (const struct usbwarp_pipe_query_device_request *)payload;
-
-    if (!DriverActive(s)) {
-        SendSimple(hPipe, seqId, -1, "driver not connected");
-        return;
-    }
-
-    USBWARP_ENUM_DEVICES_OUT en;
-    if (!DrvClientEnumDevices(s, &en)) {
-        SendSimple(hPipe, seqId, -1, "driver query failed");
-        return;
-    }
-
-    for (uint32_t i = 0; i < en.DeviceCount; i++) {
-        const USBWARP_ENUM_DEVICE_ENTRY *e = &en.Devices[i];
-
-        if (memcmp(e->DeviceGuid, req->device_guid, 16) != 0)
-            continue;
-
-        struct usbwarp_pipe_query_device_response resp;
-        memset(&resp, 0, sizeof(resp));
-        resp.status                = 0;
-        memcpy(resp.device_guid, e->DeviceGuid, 16);
-        resp.vendor_id             = e->VendorId;
-        resp.product_id            = e->ProductId;
-        resp.speed                 = e->Speed;
-        resp.bound                 = 1;
-        resp.circuit_breaker_state = e->BreakerState;
-        resp.pending_urb_count     = e->PendingCount;
-        resp.total_bytes           = e->TotalBytes;
-        /* avg_latency_us / error_rate_60s_permille: no kernel source
-         * yet — left 0 rather than invented. */
-        SendResponse(hPipe, seqId, 0, &resp, sizeof(resp));
-        return;
-    }
-
-    SendSimple(hPipe, seqId, -1, "device not found");
-}
-
-static void HandleListDevices(struct warp_session *s, HANDLE hPipe,
-                              uint32_t seqId)
-{
-    struct usbwarp_pipe_device_entry entries[WARP_MAX_BOUND_DEVICES];
-    uint32_t count = 0;
-
-    memset(entries, 0, sizeof(entries));
-
-    if (DriverActive(s)) {
-        USBWARP_ENUM_DEVICES_OUT en;
-        if (!DrvClientEnumDevices(s, &en)) {
-            SendSimple(hPipe, seqId, -1, "driver query failed");
-            return;
-        }
-        for (uint32_t i = 0; i < en.DeviceCount &&
-                            count < WARP_MAX_BOUND_DEVICES; i++) {
-            memcpy(entries[count].device_guid, en.Devices[i].DeviceGuid, 16);
-            entries[count].vendor_id  = en.Devices[i].VendorId;
-            entries[count].product_id = en.Devices[i].ProductId;
-            entries[count].bound      = 1;
-            count++;
-        }
-    } else {
-        /* No-driver debug path: the Service-owned mirror is the truth. */
-        EnterCriticalSection(&s->deviceLock);
-        for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-            if (!s->bound_devices[i].in_use) continue;
-            memcpy(entries[count].device_guid,
-                   s->bound_devices[i].device_guid, 16);
-            entries[count].vendor_id  = s->bound_devices[i].vendor_id;
-            entries[count].product_id = s->bound_devices[i].product_id;
-            entries[count].bound      = 1;
-            count++;
-        }
-        LeaveCriticalSection(&s->deviceLock);
-    }
-
-    struct usbwarp_pipe_device_list list;
-    list.device_count = count;
-
-    uint32_t payloadLen = sizeof(list) + count * sizeof(entries[0]);
-    BYTE *payload = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                       payloadLen);
-    if (!payload) {
-        SendSimple(hPipe, seqId, -1, "out of memory");
-        return;
-    }
-
-    memcpy(payload, &list, sizeof(list));
-    if (count > 0)
-        memcpy(payload + sizeof(list), entries,
-               count * sizeof(entries[0]));
-
-    SendResponse(hPipe, seqId, 0, payload, payloadLen);
-    HeapFree(GetProcessHeap(), 0, payload);
-}
-
-/* Convert Win32 device path prefix \\?\ to NT kernel \??\ in place.
- * WdfIoTargetOpen needs the NT-style path for kernel access. */
-static void NormalizeDevicePath(WCHAR *path)
-{
-    if (path[0] == L'\\' && path[1] == L'\\' &&
-        path[2] == L'?'  && path[3] == L'\\')
-        path[1] = L'?';
-}
-
-/* Bind request shared by both modes: extracts and converts the instance
- * path.  Returns FALSE (and replies) on malformed input. */
-static bool ParseBindRequest(const BYTE *payload, uint32_t payloadLen,
-                             uint32_t seqId, HANDLE hPipe,
-                             const struct usbwarp_pipe_bind_request **reqOut,
-                             WCHAR widePath[256])
-{
-    if (payloadLen < sizeof(struct usbwarp_pipe_bind_request)) {
-        SendSimple(hPipe, seqId, -1, "payload too small");
-        return false;
-    }
-
-    const struct usbwarp_pipe_bind_request *req =
-        (const struct usbwarp_pipe_bind_request *)payload;
-
-    uint16_t instancePathLen = req->instance_path_length;
-    const char *instancePath =
-        (instancePathLen > 0 && payloadLen >= sizeof(*req) + instancePathLen) ?
-        (const char *)(payload + sizeof(*req)) : NULL;
-
-    if (!instancePath) {
-        SendSimple(hPipe, seqId, -1, "missing instance path");
-        return false;
-    }
-
-    int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                      instancePath, (int)instancePathLen,
-                                      widePath, 255);
-    if (wideLen <= 0) {
-        SendSimple(hPipe, seqId, -1, "invalid UTF-8 instance path");
-        return false;
-    }
-    widePath[wideLen] = L'\0';
-    NormalizeDevicePath(widePath);
-
-    *reqOut = req;
-    return true;
-}
-
-/* Driver mode: pure pass-through — the kernel performs duplicate detection
- * (ContainerId + GUID) and assigns the DeviceIndex.  No service-side slot. */
-static void HandleBindDevice(struct warp_session *s, HANDLE hPipe,
-                             const BYTE *payload, uint32_t payloadLen,
-                             uint32_t seqId)
-{
-    if (!s->mmio_mapped || !s->negotiated) {
-        SendSimple(hPipe, seqId, -1, "session not ready");
-        return;
-    }
-
-    const struct usbwarp_pipe_bind_request *req;
-    WCHAR widePath[256];
-
-    if (!ParseBindRequest(payload, payloadLen, seqId, hPipe, &req, widePath))
-        return;
-
-    if (DriverActive(s)) {
-        uint32_t deviceIndex;
-        uint16_t vid, pid;
-
-        if (!DrvClientBindGuid(s, req->device_guid, widePath, req->speed,
-                               &deviceIndex, &vid, &pid)) {
-            SendSimple(hPipe, seqId, -1, "bind failed (driver rejected)");
-            return;
-        }
-        /* Driver sends DEVICE_ADDED to the Guest itself (P0#1). */
-
-        char detail[64];
-        snprintf(detail, sizeof(detail), "bound to slot %u", deviceIndex);
-        SendSimple(hPipe, seqId, 0, detail);
-
-        LogInfo("Device bound: idx=%u VID=%04x PID=%04x guid=%02x%02x%02x%02x...",
-                deviceIndex, vid, pid,
-                req->device_guid[0], req->device_guid[1],
-                req->device_guid[2], req->device_guid[3]);
-        return;
-    }
-
-    /* Service-only debug path: tentative mirror slot, then Ring message. */
-    EnterCriticalSection(&s->deviceLock);
-
-    int freeSlot = -1;
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if ((s->bound_devices[i].in_use || s->bound_devices[i].binding) &&
-            memcmp(s->bound_devices[i].device_guid, req->device_guid, 16) == 0) {
-            LeaveCriticalSection(&s->deviceLock);
-            SendSimple(hPipe, seqId, -1, "device already bound");
-            return;
-        }
-        if (freeSlot < 0 &&
-            !s->bound_devices[i].in_use && !s->bound_devices[i].binding) {
-            freeSlot = (int)i;
-        }
-    }
-
-    if (freeSlot < 0) {
-        LeaveCriticalSection(&s->deviceLock);
-        SendSimple(hPipe, seqId, -1, "no free device slots");
-        return;
-    }
-
-    /* Tentatively populate the slot (not yet committed). */
-    struct warp_bound_device *dev = &s->bound_devices[freeSlot];
-    memset(dev, 0, sizeof(*dev));
-    dev->binding = true;
-    dev->device_index = (uint32_t)(freeSlot + 1);
-    memcpy(dev->device_guid, req->device_guid, 16);
-    dev->speed = req->speed;
-    wcscpy_s(dev->instance_path, widePath);
-
-    LeaveCriticalSection(&s->deviceLock);
-
-    /* We own the Ring in this mode: send DEVICE_ADDED ourselves. */
-    ServiceSendDeviceAdded(s, (uint32_t)freeSlot);
-
-    EnterCriticalSection(&s->deviceLock);
-    dev->binding = false;
-    dev->in_use = true;
-    s->bound_device_count++;
-    LeaveCriticalSection(&s->deviceLock);
-
-    char detail[64];
-    snprintf(detail, sizeof(detail), "bound to slot %d", freeSlot + 1);
-    SendSimple(hPipe, seqId, 0, detail);
-
-    LogInfo("Device bound (service-only): slot=%d guid=%02x%02x%02x%02x...",
-            freeSlot + 1,
-            req->device_guid[0], req->device_guid[1],
-            req->device_guid[2], req->device_guid[3]);
-}
-
-/* Driver mode: GUID-keyed pass-through.  A kernel refusal for a device the
- * authoritative snapshot no longer lists (hot-remove already freed the
- * slot) is success, not an error. */
-static void HandleUnbindDevice(struct warp_session *s, HANDLE hPipe,
-                               const BYTE *payload, uint32_t payloadLen,
-                               uint32_t seqId)
-{
-    if (payloadLen < sizeof(struct usbwarp_pipe_bind_request)) {
-        SendSimple(hPipe, seqId, -1, "payload too small");
-        return;
-    }
-
-    const struct usbwarp_pipe_bind_request *req =
-        (const struct usbwarp_pipe_bind_request *)payload;
-
-    if (DriverActive(s)) {
-        if (!DrvClientUnbindGuid(s, req->device_guid)) {
-            USBWARP_ENUM_DEVICES_OUT en;
-            bool stillBound = false;
-
-            if (DrvClientEnumDevices(s, &en)) {
-                for (uint32_t i = 0; i < en.DeviceCount; i++) {
-                    if (memcmp(en.Devices[i].DeviceGuid,
-                               req->device_guid, 16) == 0) {
-                        stillBound = true;
-                        break;
-                    }
-                }
-            }
-
-            if (stillBound) {
-                SendSimple(hPipe, seqId, -1, "unbind failed (driver rejected)");
-                return;
-            }
-            /* Kernel doesn't hold it anymore (hot-remove freed the slot). */
-            SendSimple(hPipe, seqId, 0, "unbound (already gone)");
-            return;
-        }
-
-        SendSimple(hPipe, seqId, 0, "unbound");
-        LogInfo("Device unbound (driver mode)");
-        return;
-    }
-
-    /* Service-only debug path: mirror lookup + Service-owned Ring message. */
-    EnterCriticalSection(&s->deviceLock);
-
-    int foundSlot = -1;
-    for (uint32_t i = 0; i < WARP_MAX_BOUND_DEVICES; i++) {
-        if (s->bound_devices[i].in_use &&
-            memcmp(s->bound_devices[i].device_guid, req->device_guid, 16) == 0) {
-            foundSlot = (int)i;
-            break;
-        }
-    }
-
-    if (foundSlot < 0) {
-        LeaveCriticalSection(&s->deviceLock);
-        SendSimple(hPipe, seqId, -1, "device not found");
-        return;
-    }
-
-    LeaveCriticalSection(&s->deviceLock);
-
-    ServiceSendDeviceRemoved(s, (uint32_t)foundSlot, 0);
-
-    EnterCriticalSection(&s->deviceLock);
-    memset(&s->bound_devices[foundSlot], 0, sizeof(s->bound_devices[foundSlot]));
-    if (s->bound_device_count > 0) s->bound_device_count--;
-    LeaveCriticalSection(&s->deviceLock);
-
-    SendSimple(hPipe, seqId, 0, "unbound");
-    LogInfo("Device unbound: slot=%d", foundSlot + 1);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §3  Connection handler (#8 fix: handle large messages)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* FIX #8: Use larger buffer and handle MESSAGE pipe semantics properly. */
-#define PIPE_READ_BUF_SIZE  65536
-
-static void HandleConnection(struct warp_session *s, HANDLE hPipe)
-{
-    BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, PIPE_READ_BUF_SIZE);
-    if (!buf) return;
-
-    while (!s->shutdown_requested) {
-        DWORD bytesRead = 0;
-        BOOL ok = ReadFile(hPipe, buf, PIPE_READ_BUF_SIZE, &bytesRead, NULL);
-
-        if (!ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_MORE_DATA) {
-                /* FIX #8: Message was truncated.  In message mode, the
-                 * excess data is lost.  Send error response. */
-                LogWarn("Pipe: message too large (>%u bytes)", PIPE_READ_BUF_SIZE);
-            }
-            if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA)
-                break;
-            if (err != ERROR_MORE_DATA)
-                break;
-        }
-
-        if (bytesRead < sizeof(struct usbwarp_pipe_header))
-            continue;
-
-        struct usbwarp_pipe_header *hdr = (struct usbwarp_pipe_header *)buf;
-        if (hdr->magic != USBWARP_PIPE_MAGIC) {
-            LogWarn("Pipe: bad magic 0x%x", hdr->magic);
-            continue;
-        }
-
-        uint32_t payloadLen = hdr->payload_length;
-        const BYTE *payload = buf + sizeof(*hdr);
-
-        if (sizeof(*hdr) + payloadLen > bytesRead) {
-            SendSimple(hPipe, hdr->sequence_id, -1, "truncated");
-            continue;
-        }
-
-        switch (hdr->command) {
-        case USBWARP_PIPE_CMD_QUERY_STATUS:
-            HandleQueryStatus(s, hPipe, hdr->sequence_id);
-            break;
-        case USBWARP_PIPE_CMD_QUERY_DEVICE:
-            HandleQueryDevice(s, hPipe, payload, payloadLen, hdr->sequence_id);
-            break;
-        case USBWARP_PIPE_CMD_QUERY_STATS:
-            HandleQueryStats(s, hPipe, payload, payloadLen, hdr->sequence_id);
-            break;
-        case USBWARP_PIPE_CMD_LIST_DEVICES:
-            HandleListDevices(s, hPipe, hdr->sequence_id);
-            break;
-        case USBWARP_PIPE_CMD_BIND_DEVICE:
-            HandleBindDevice(s, hPipe, payload, payloadLen, hdr->sequence_id);
-            break;
-        case USBWARP_PIPE_CMD_UNBIND_DEVICE:
-            HandleUnbindDevice(s, hPipe, payload, payloadLen, hdr->sequence_id);
-            break;
-        default:
-            SendSimple(hPipe, hdr->sequence_id, -1, "unknown command");
-            break;
-        }
-    }
-
-    HeapFree(GetProcessHeap(), 0, buf);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §4  Pipe server thread
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static DWORD WINAPI PipeServerThread(LPVOID param)
-{
-    struct warp_session *s = (struct warp_session *)param;
-    SECURITY_ATTRIBUTES sa;
-    PSECURITY_DESCRIPTOR pSD = NULL;
-
-    LogInfo("Named Pipe server started: %s", USBWARP_PIPE_NAME);
-
-    /* Create a security descriptor that allows any authenticated user
-     * to read/write the pipe.  Without this, if Service runs elevated
-     * and Controller runs as normal user (or vice versa), CreateFile
-     * returns ERROR_ACCESS_DENIED (5). */
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
-            "D:(A;;GRGW;;;AU)",  /* Allow Authenticated Users read+write */
-            SDDL_REVISION_1, &pSD, NULL)) {
-        LogWarn("Failed to create pipe security descriptor (%lu) — "
-                "using default (may cause access denied)", GetLastError());
-    }
-
-    sa.nLength              = sizeof(sa);
-    sa.lpSecurityDescriptor = pSD;
-    sa.bInheritHandle       = FALSE;
-
-    while (!s->shutdown_requested) {
-        HANDLE hPipe = CreateNamedPipeA(
-            USBWARP_PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            1, PIPE_READ_BUF_SIZE, PIPE_READ_BUF_SIZE, 1000,
-            pSD ? &sa : NULL);
-
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            LogError("CreateNamedPipe failed: %lu", GetLastError());
-            Sleep(1000);
-            continue;
-        }
-
-        BOOL connected = ConnectNamedPipe(hPipe, NULL) ||
-                         (GetLastError() == ERROR_PIPE_CONNECTED);
-
-        if (connected && !s->shutdown_requested) {
-            LogInfo("Pipe: client connected");
-            HandleConnection(s, hPipe);
-            LogInfo("Pipe: client disconnected");
-            FlushFileBuffers(hPipe);
-            DisconnectNamedPipe(hPipe);
-        }
-        CloseHandle(hPipe);
-    }
-
-    LogInfo("Named Pipe server stopped");
-
-    if (pSD) LocalFree(pSD);
+    // FlushFileBuffers would wait for the client to read and can prevent shutdown.
+    DisconnectNamedPipe(client->pipe);
+    CloseHandle(client->pipe);
+    client->pipe = INVALID_HANDLE_VALUE;
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §5  Public API
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL PipeServerStart(struct warp_session *s)
+HANDLE CreatePipe(warp_session *s, bool first)
 {
-    s->pipeRunning = true;
-    s->pipeThread = CreateThread(NULL, 0, PipeServerThread, s, 0, NULL);
-    if (!s->pipeThread) {
-        LogError("Pipe server thread failed: %lu", GetLastError());
-        s->pipeRunning = false;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    // AU may exchange commands but cannot create another server instance.
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        USBWARP_PIPE_SDDL, SDDL_REVISION_1, &descriptor, nullptr))
+        return INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+    HANDLE pipe = CreateNamedPipeW(s->pipeName,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        WARP_PIPE_CLIENTS + 1, MaxFrame, MaxFrame, 1000, &attributes);
+    DWORD error = GetLastError(); LocalFree(descriptor); SetLastError(error);
+    return pipe;
+}
+
+bool Connect(warp_session *s, HANDLE pipe)
+{
+    OVERLAPPED ov{}; ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) return false;
+    BOOL connected = ConnectNamedPipe(pipe, &ov);
+    DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+    if (!connected && error == ERROR_PIPE_CONNECTED) connected = TRUE;
+    else if (!connected && error == ERROR_IO_PENDING) {
+        HANDLE events[] = {ov.hEvent, s->stopEvent};
+        DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (wait != WAIT_OBJECT_0) CancelIoEx(pipe, &ov);
+        DWORD transferred;
+        connected = GetOverlappedResult(pipe, &ov, &transferred, TRUE);
+    }
+    CloseHandle(ov.hEvent);
+    return connected && !StopRequested(s);
+}
+
+DWORD WINAPI AcceptWorker(void *context)
+{
+    auto s = (warp_session *)context;
+    HANDLE listener = s->pipeListener;
+    while (!StopRequested(s)) {
+        if (!Connect(s, listener)) {
+            if (!StopRequested(s)) RequestStop(s, ERROR_PIPE_NOT_CONNECTED);
+            break;
+        }
+        warp_pipe_client *slot = nullptr;
+        for (auto &client : s->clients) {
+            if (client.thread && WaitForSingleObject(client.thread, 0) == WAIT_OBJECT_0) {
+                CloseHandle(client.thread); client.thread = nullptr;
+            }
+            if (!client.thread && !slot) slot = &client;
+        }
+        if (!slot) { DisconnectNamedPipe(listener); continue; }
+        HANDLE next = CreatePipe(s, false); // preserve ownership of the pipe name continuously
+        if (next == INVALID_HANDLE_VALUE) { RequestStop(s, GetLastError()); break; }
+        slot->session = s; slot->pipe = listener;
+        slot->thread = CreateThread(nullptr, 0, ClientWorker, slot, 0, nullptr);
+        if (!slot->thread) {
+            DWORD error = GetLastError(); CloseHandle(next); RequestStop(s, error); break;
+        }
+        listener = next;
+    }
+    DisconnectNamedPipe(listener);
+    CloseHandle(listener);
+    s->pipeListener = INVALID_HANDLE_VALUE;
+    return 0;
+}
+}
+
+BOOL PipeServerStart(warp_session *s)
+{
+    if (!s->pipeName[0] && !MultiByteToWideChar(CP_UTF8, 0, USBWARP_PIPE_NAME, -1, s->pipeName, _countof(s->pipeName)))
         return FALSE;
+    s->pipeListener = CreatePipe(s, true);
+    if (s->pipeListener == INVALID_HANDLE_VALUE) return FALSE;
+    s->pipeThread = CreateThread(nullptr, 0, AcceptWorker, s, 0, nullptr);
+    if (!s->pipeThread) {
+        DWORD error = GetLastError(); CloseHandle(s->pipeListener); s->pipeListener = INVALID_HANDLE_VALUE;
+        SetLastError(error); return FALSE;
     }
     return TRUE;
 }
-
-void PipeServerStop(struct warp_session *s)
+void PipeServerStop(warp_session *s)
 {
     if (!s->pipeThread) return;
-    s->pipeRunning = false;
-
-    /* Cancel the pipe thread's blocking ConnectNamedPipe/ReadFile in one
-     * call — no overlapped rework needed.  The thread observes
-     * shutdown_requested and exits its loops. */
-    CancelSynchronousIo(s->pipeThread);
-
-    if (WaitForSingleObject(s->pipeThread, 5000) == WAIT_OBJECT_0) {
-        CloseHandle(s->pipeThread);
-        s->pipeThread = NULL;
-    } else {
-        /* Never close a handle a live thread may still be using —
-         * leak it and log.  (The old code closed it unconditionally.) */
-        LogWarn("Pipe thread did not stop within 5s — handle leaked");
+    RequestStop(s);
+    JoinServiceThread(s, s->pipeThread);
+    CloseHandle(s->pipeThread); s->pipeThread = nullptr;
+    for (auto &client : s->clients) if (client.thread) {
+        JoinServiceThread(s, client.thread);
+        CloseHandle(client.thread); client.thread = nullptr;
     }
 }

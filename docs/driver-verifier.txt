@@ -1,0 +1,82 @@
+USBWarp Driver Verifier 首轮记录（2026-11-09）
+
+范围与配置
+
+仅在 Win11Debug（Windows 11 build 26200，8 GiB）检查 USBWarp.sys 和
+UsbWarpFilter.sys；KD 通过用户现有 Win11DebugKD 转发连接。初始设置和
+运行状态均无被验证驱动，WDF 专用 VerifierOn 注册表值未设置。
+
+本轮使用：
+  verifier /standard /driver USBWarp.sys UsbWarpFilter.sys
+  verifier /bootmode oneboot
+
+重启后以 verifier /query 和 KD 核实运行状态，实际标志为 0x001209bb。
+标准检查包含特殊池、IRQL、池跟踪、I/O、死锁、DMA、安全、其他检查及 DDI；
+此系统同时启用 WDF 规则类 34。使用 /standard 自动包含 WDF，未手工设置
+内部标志，也未选择所有系统驱动。
+
+Windows 11 支持部分规则 /dif /now，但 WDF、死锁和 DMA 等检查仍需重启，
+因此本轮采用完整标准配置和一次启动模式。Verifier 配置命令返回 2 表示
+需要重启，不代表设置失败；初次包装脚本误把非零当失败，随后查询确认并
+将启动范围限定为 oneboot。没有绕过任何实际 Verifier 违规。
+
+测试构建
+
+Windows 主驱动使用项目现有 Release 构建，配套临时测试签名和 PDB。
+虚拟机内 UsbWarpFilter.sys 与工作区 x64/Debug/UsbWarpFilter.sys SHA-256
+完全相同：6ADCFD83FA37DD350BF125220481632958C71CD3E85C1665A1A8F095B123F0C6。
+Linux 保持已验证的默认自适应轮询模块：
+  h2g_irq=0 poll_us=0 rx_busy_us=0 rx_repoll_us=0
+
+实际执行
+
+目标仍为 ASUS adol U300，序列号 FC131A137FFE8，容量 62914560000 字节。
+测试数据访问只读，并核对 Windows 原生读取的独立随机区域指纹和原首
+64 MiB SHA-256。
+
+  - Verifier 下完成共享内存建立和 WSL 会话初始化。
+  - 5 次捕获/归还，每次读取校验与共享缓冲排空检查通过。
+  - 3 轮 4 KiB QD4 随机读取，共 15430 次操作。
+  - 2 次读取中解除绑定，读进程按预期结束，设备恢复到 Windows。
+  - 读取中停止服务约 4576.9 ms，包含设备恢复时间。
+  - 两个驱动在 Verifier 活动期间完成卸载。
+
+结果与限制
+
+未观察到 Verifier bugcheck、WDF 违规断点、数据错误或卸载失败。
+verifier /query 记录 USBWarp.sys 加载/卸载 1/1，UsbWarpFilter.sys 18/18；
+捕获和端口复位可能使 Filter 一轮内多次加载，因此这不是 18 次人工测试轮次。
+
+池统计：453112 次分配尝试/成功，特殊池成功计数也是 453112；失败分配和
+无标签分配均为 0。另有 36 次 untracked pool allocations 计数，保留该
+观察，未将其解释成泄漏数量。KD !verifier 3 在卸载后显示当前分页池和
+非分页池跟踪分配均为 0，两个目标均处于 Unloaded。
+
+这些是本轮覆盖路径通过的证据，不能推导整个驱动绝无内存泄漏或全部设备
+类别都通过。Verifier 主要检查 Windows 内核驱动，不覆盖 Linux 模块或
+服务用户态堆；此前服务私有内存的小幅增长不能由这轮结果单独解释。
+
+未开启随机/系统性低资源模拟、强制挂起 I/O、额外 MDL 不变性、同步延迟
+模糊或代码完整性专项。这些可以作为后续独立阶段，避免把不同故障注入
+混在一起归因。Verifier 下的读取速率不用于和正常模式比较性能。
+
+结束处理
+
+使用 verifier /reset 和 /bootmode persistent 恢复原禁用配置，并再次重启
+使运行时退出验证。随后恢复原 Windows 二进制/路径、服务配置和新增测试
+信任；默认轮询的 Linux 模块保留。最终状态以对应 cleanup.json 和
+verifier-final.txt 为准。测试模式和 BCD 没有修改。
+
+证据
+
+x64/ReviewChecks/DriverVerifier/：
+  baseline/verifier.txt、configured.txt、configuration-state.txt、after-boot.txt；
+  events.jsonl、workload-output.txt、verifier-bound-1.txt、verifier-bound-5.txt；
+  verifier-before-unload.txt、verifier-after-unload.txt、kd-after-unload.txt；
+  tested-state.json、reset-before-boot.txt、cleanup.json、verifier-final.txt。
+
+一手资料
+
+https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/driver-verifier
+https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/verifier-command-line
+https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/using-kmdf-verifier

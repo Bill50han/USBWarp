@@ -17,9 +17,6 @@
 #pragma alloc_text(PAGE, UsbWarpEvtIoDeviceControl)
 #endif
 
-/* Defined in usbwarp_safety.c — global pointer for process notify callback. */
-extern PUSBWARP_GLOBAL_CONTEXT g_NotifyContext;
-
 /* Forward declarations for IOCTL handlers. */
 static NTSTATUS HandleRegisterService(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
                                       _In_ WDFREQUEST Request,
@@ -50,8 +47,34 @@ static NTSTATUS HandleEnumDevices(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
  * §1  Top-level IOCTL dispatch
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+BOOLEAN UsbWarpRequestOwnsSession(PUSBWARP_GLOBAL_CONTEXT Ctx, WDFREQUEST Request)
+{
+    WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+    BOOLEAN owns;
+    KIRQL irql;
+    KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+    owns = file && Ctx->ServiceRegistered && !Ctx->ServiceDisconnected &&
+           Ctx->ServiceFile == WdfFileObjectWdmGetFileObject(file);
+    KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+    return owns;
+}
+
+VOID UsbWarpEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLen,
+                               size_t InLen, ULONG Code)
+{
+    PUSBWARP_GLOBAL_CONTEXT ctx = UsbWarpGetContext(WdfIoQueueGetDevice(Queue));
+    NTSTATUS status;
+    if (Code == IOCTL_USBWARP_HEARTBEAT) {
+        status = HandleHeartbeat(ctx, Request, InLen, OutLen);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    status = WdfRequestForwardToIoQueue(Request, ctx->ManagementQueue);
+    if (!NT_SUCCESS(status)) WdfRequestComplete(Request, status);
+}
+
 VOID
-UsbWarpEvtIoDeviceControl(
+UsbWarpEvtManagementControl(
     _In_ WDFQUEUE   Queue,
     _In_ WDFREQUEST Request,
     _In_ size_t     OutputBufferLength,
@@ -65,6 +88,18 @@ UsbWarpEvtIoDeviceControl(
     PAGED_CODE();
 
     ctx = UsbWarpGetContext(WdfIoQueueGetDevice(Queue));
+    /* A stale cleanup callback must finish before a new generation is published. */
+    if (IoControlCode == IOCTL_USBWARP_REGISTER_SERVICE)
+        WdfWorkItemFlush(ctx->SessionCleanupWork);
+    KeWaitForSingleObject(&ctx->SessionMutex, Executive, KernelMode, FALSE, NULL);
+    if (WdfRequestIsCanceled(Request)) {
+        status = STATUS_CANCELLED;
+        goto complete;
+    }
+    if (IoControlCode != IOCTL_USBWARP_REGISTER_SERVICE && !UsbWarpRequestOwnsSession(ctx, Request)) {
+        status = STATUS_ACCESS_DENIED;
+        goto complete;
+    }
 
     switch (IoControlCode) {
 
@@ -76,6 +111,10 @@ UsbWarpEvtIoDeviceControl(
     case IOCTL_USBWARP_SETUP_SHM:
         status = HandleSetupShm(ctx, Request,
                                 InputBufferLength, OutputBufferLength);
+        break;
+
+    case IOCTL_USBWARP_CONFIGURE_IRQ:
+        status = UsbWarpIrqConfigure(ctx, Request);
         break;
 
     case IOCTL_USBWARP_TEARDOWN_SHM:
@@ -110,6 +149,8 @@ UsbWarpEvtIoDeviceControl(
         break;
     }
 
+complete:
+    KeReleaseMutex(&ctx->SessionMutex, FALSE);
     WdfRequestComplete(Request, status);
 }
 
@@ -164,22 +205,40 @@ HandleRegisterService(
         if (Ctx->ServiceRegistered)
             return STATUS_ALREADY_REGISTERED;
 
-        /* Record registration. */
-        Ctx->ServiceProcessId      = savedPid;
-        Ctx->HeartbeatIntervalMs   = savedHeartbeat;
-        Ctx->ServiceRegistered     = TRUE;
-        KeQuerySystemTime(&Ctx->LastServiceHeartbeat);
-
-        /* Register process termination notify. */
-        InterlockedExchangePointer((PVOID *)&g_NotifyContext, Ctx);
-        status = PsSetCreateProcessNotifyRoutineEx(
-                     UsbWarpProcessNotifyCallback, FALSE);
-        if (NT_SUCCESS(status)) {
-            Ctx->ProcessNotifyRegistered = (PVOID)(ULONG_PTR)1;
-        } else {
-            KdPrint(("UsbWarp: PsSetCreateProcessNotifyRoutineEx failed 0x%x "
-                     "(orphan detection relies on heartbeat)\n", status));
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        PEPROCESS process;
+        KIRQL irql;
+        if (!file || savedPid != IoGetRequestorProcessId(WdfRequestWdmGetIrp(Request)))
+            return STATUS_ACCESS_DENIED;
+        status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)savedPid, &process);
+        if (!NT_SUCCESS(status)) return status;
+        PFILE_OBJECT owner = WdfFileObjectWdmGetFileObject(file);
+        ObReferenceObject(owner); // keeps the control device/driver alive until cleanup
+        InterlockedExchange(&Ctx->EmergencyMode, FALSE);
+        InterlockedExchange(&Ctx->ShuttingDown, FALSE);
+        InterlockedExchange(&Ctx->GlobalBreakerOpen, FALSE);
+        InterlockedExchange(&Ctx->OrphanState, ORPHAN_NONE);
+        InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_INIT);
+        Ctx->Negotiated = FALSE;
+        Ctx->NegotiatedCaps = 0;
+        Ctx->NegotiatedVersion = 0;
+        KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+        /* CLEANUP may race REGISTER before the session has been published. */
+        if (UsbWarpGetFileContext(file)->CleanedUp || WdfRequestIsCanceled(Request)) {
+            KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+            ObDereferenceObject(process);
+            ObDereferenceObject(owner);
+            return STATUS_FILE_CLOSED;
         }
+        Ctx->ServiceFile = owner;
+        Ctx->ServiceProcess = process;
+        Ctx->ServiceProcessId = savedPid;
+        Ctx->HeartbeatIntervalMs = savedHeartbeat;
+        Ctx->ServiceDisconnected = FALSE;
+        ++Ctx->SessionGeneration;
+        Ctx->ServiceRegistered = TRUE;
+        Ctx->LastServiceHeartbeat.QuadPart = (LONGLONG)KeQueryInterruptTime();
+        KeReleaseSpinLock(&Ctx->ServiceLock, irql);
 
         /* Fill output (OVERWRITES input buffer for METHOD_BUFFERED). */
         RtlZeroMemory(out, sizeof(*out));
@@ -188,6 +247,8 @@ HandleRegisterService(
                                  USBWARP_PROTOCOL_VERSION_MAJOR,
                                  USBWARP_PROTOCOL_VERSION_MINOR);
         out->MaxDevices    = USBWARP_MAX_DEVICES_LIMIT;
+        out->Capabilities = USBWARP_DRIVER_CAP_G2H_DOORBELL;
+        if (UsbWarpIrqSupported()) out->Capabilities |= USBWARP_DRIVER_CAP_H2G_IRQ;
 
         WdfRequestSetInformation(Request, sizeof(*out));
 
@@ -256,12 +317,15 @@ HandleSetupShm(
         return STATUS_INVALID_PARAMETER;
 
     /* Power-of-two checks */
-    if (in->RingSizePerDirection == 0 ||
-        (in->RingSizePerDirection & (in->RingSizePerDirection - 1)) != 0)
+    if (!USBWARP_IS_POWER_OF_2(in->ExpectedSize) ||
+        !USBWARP_IS_POWER_OF_2(in->RingSizePerDirection) ||
+        in->RingSizePerDirection < USBWARP_RING_DATA_SIZE_MIN ||
+        in->RingSizePerDirection > USBWARP_RING_DATA_SIZE_MAX)
         return STATUS_INVALID_PARAMETER;
 
-    if (in->BufferSize == 0 ||
-        (in->BufferSize & (in->BufferSize - 1)) != 0)
+    if (!USBWARP_IS_POWER_OF_2(in->BufferSize) ||
+        in->BufferSize < USBWARP_BUFFER_SIZE_MIN ||
+        in->BufferSize > USBWARP_BUFFER_SIZE_MAX)
         return STATUS_INVALID_PARAMETER;
 
     /* Step 4: state precondition */
@@ -277,15 +341,22 @@ HandleSetupShm(
      * can only pass Section handles it legitimately possesses.  A malicious
      * Service cannot reference arbitrary kernel objects.
      */
+    if (in->MaxDevices > USBWARP_MAX_DEVICES_LIMIT) return STATUS_INVALID_PARAMETER;
+    Ctx->MaxDevices = in->MaxDevices ? in->MaxDevices : USBWARP_MAX_DEVICES_LIMIT;
     hSection = (HANDLE)(ULONG_PTR)in->SectionHandle;
 
-    status = ObReferenceObjectByHandle(
+    {
+        KAPC_STATE attach;
+        KeStackAttachProcess((PRKPROCESS)Ctx->ServiceProcess, &attach);
+        status = ObReferenceObjectByHandle(
                  hSection,
                  SECTION_MAP_READ | SECTION_MAP_WRITE,
                  *MmSectionObjectType,
                  UserMode,            /* ← critical for security */
                  &sectionObj,
                  NULL);
+        KeUnstackDetachProcess(&attach);
+    }
     if (!NT_SUCCESS(status)) {
         KdPrint(("UsbWarp: ObReferenceObjectByHandle failed 0x%x\n", status));
         return status;
@@ -301,7 +372,7 @@ HandleSetupShm(
     }
 
     /* Verify expected size vs actual mapping size. */
-    if (viewSize < (SIZE_T)in->ExpectedSize) {
+    if (viewSize != (SIZE_T)in->ExpectedSize) {
         KdPrint(("UsbWarp: Section size mismatch: mapped=%llu expected=%llu\n",
                  (ULONGLONG)viewSize, (ULONGLONG)in->ExpectedSize));
         MmUnmapViewInSystemSpace(shmBase);
@@ -331,19 +402,22 @@ HandleSetupShm(
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 KdPrint(("UsbWarp: MmProbeAndLockPages failed 0x%x\n",
                          GetExceptionCode()));
+                status = GetExceptionCode();
                 IoFreeMdl(mdl);
-                /* Non-fatal — system may still work if pages stay resident,
-                 * but BSOD is possible under memory pressure. */
+                goto setup_shm_fail;
             }
         } else {
             KdPrint(("UsbWarp: IoAllocateMdl failed for SHM lock\n"));
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto setup_shm_fail;
         }
     }
 
     /* ── Verify Control Block magic ─────────────────────────────────────── */
     cb = (volatile struct usbwarp_control_block *)shmBase;
 
-    if (cb->magic != USBWARP_CONTROL_BLOCK_MAGIC) {
+    if (cb->magic != USBWARP_CONTROL_BLOCK_MAGIC || cb->shm_total_size != in->ExpectedSize ||
+        cb->protocol_version_major != USBWARP_PROTOCOL_VERSION_MAJOR) {
         KdPrint(("UsbWarp: Control Block magic mismatch: 0x%x\n", cb->magic));
         goto setup_shm_fail;
     }
@@ -361,15 +435,18 @@ HandleSetupShm(
     bufCnt = cb->buffer_count;
 
     /* Boundary checks: all offsets must fall within the mapping. */
-    if (g2hOff + g2hSz > viewSize || h2gOff + h2gSz > viewSize ||
-        drOff + drSz > viewSize) {
+    if ((ULONG64)g2hOff + g2hSz > viewSize || (ULONG64)h2gOff + h2gSz > viewSize ||
+        (ULONG64)drOff + drSz > viewSize) {
         KdPrint(("UsbWarp: SHM layout extends beyond mapping\n"));
         status = STATUS_INVALID_PARAMETER;
         goto setup_shm_fail;
     }
 
-    if (g2hSz < USBWARP_RING_HEADER_SIZE || h2gSz < USBWARP_RING_HEADER_SIZE ||
-        bufCnt == 0 || bufSz == 0) {
+    if (g2hOff != USBWARP_CONTROL_BLOCK_SIZE ||
+        g2hSz != USBWARP_RING_HEADER_SIZE + in->RingSizePerDirection || h2gSz != g2hSz ||
+        h2gOff != g2hOff + g2hSz || drOff != USBWARP_ALIGN_PAGE(h2gOff + h2gSz) ||
+        drSz != in->ExpectedSize - drOff || bufSz != in->BufferSize ||
+        bufCnt != drSz / bufSz || bufCnt < USBWARP_BUFFER_QUOTA_MIN) {
         KdPrint(("UsbWarp: invalid SHM layout parameters\n"));
         status = STATUS_INVALID_PARAMETER;
         goto setup_shm_fail;
@@ -380,25 +457,53 @@ HandleSetupShm(
     Ctx->BufferSize     = bufSz;
     Ctx->BufferCount    = bufCnt;
 
+    /* Validate the initialized headers before any worker may consume them. */
+    for (ULONG direction = 0; direction < 2; ++direction) {
+        volatile struct usbwarp_ring_header *ring =
+            (volatile struct usbwarp_ring_header *)((PUCHAR)shmBase + (direction ? h2gOff : g2hOff));
+        if (ring->data_size != in->RingSizePerDirection ||
+            ring->data_size_mask != in->RingSizePerDirection - 1 ||
+            ring->max_message_size != USBWARP_MAX_MESSAGE_SIZE ||
+            ring->producer_index || ring->consumer_index) {
+            status = STATUS_INVALID_PARAMETER;
+            goto setup_shm_fail;
+        }
+    }
+
     /* ── Initialise ring wrappers ───────────────────────────────────────── */
     UsbWarpRingInit(&Ctx->G2hRing,
                     (volatile struct usbwarp_ring_header *)
                         ((PUCHAR)shmBase + g2hOff),
                     (volatile UCHAR *)shmBase + g2hOff +
-                        USBWARP_RING_HEADER_SIZE);
+                        USBWARP_RING_HEADER_SIZE, in->RingSizePerDirection);
 
     UsbWarpRingInit(&Ctx->H2gRing,
                     (volatile struct usbwarp_ring_header *)
                         ((PUCHAR)shmBase + h2gOff),
                     (volatile UCHAR *)shmBase + h2gOff +
-                        USBWARP_RING_HEADER_SIZE);
+                        USBWARP_RING_HEADER_SIZE, in->RingSizePerDirection);
+
+    if (!!in->DoorbellEventHandle != !!(cb->flags & USBWARP_FLAG_G2H_DOORBELL)) {
+        status = STATUS_INVALID_PARAMETER;
+        goto setup_shm_fail;
+    }
+    if (in->DoorbellEventHandle) {
+        KAPC_STATE attach;
+        KeStackAttachProcess((PRKPROCESS)Ctx->ServiceProcess, &attach);
+        status = ObReferenceObjectByHandle((HANDLE)(ULONG_PTR)in->DoorbellEventHandle,
+            SYNCHRONIZE, *ExEventObjectType, UserMode, (PVOID *)&Ctx->G2hDoorbell, NULL);
+        KeUnstackDetachProcess(&attach);
+        if (!NT_SUCCESS(status)) goto setup_shm_fail;
+    }
 
     /* ── Update Control Block host state ────────────────────────────────── */
-    cb->host_state = USBWARP_STATE_INIT;
+    cb->host_state = USBWARP_STATE_READY;
 
     Ctx->ShmEstablished = TRUE;
+    InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_READY);
 
     /* ── Start poll thread ──────────────────────────────────────────────── */
+    UsbWarpIrqInitialize(Ctx);
     status = UsbWarpPollStart(Ctx);
     if (!NT_SUCCESS(status)) {
         KdPrint(("UsbWarp: poll start failed 0x%x\n", status));
@@ -406,8 +511,6 @@ HandleSetupShm(
         Ctx->ShmEstablished = FALSE;
         goto setup_shm_fail;
     }
-
-    cb->host_state = USBWARP_STATE_RUNNING;
 
     /* ── Fill output ────────────────────────────────────────────────────── */
     RtlZeroMemory(out, sizeof(*out));
@@ -424,6 +527,8 @@ HandleSetupShm(
     return STATUS_SUCCESS;
 
 setup_shm_fail:
+    UsbWarpIrqDestroy(Ctx);
+    if (Ctx->G2hDoorbell) { ObDereferenceObject(Ctx->G2hDoorbell); Ctx->G2hDoorbell = NULL; }
     if (Ctx->ShmMdl) {
         MmUnlockPages(Ctx->ShmMdl);
         IoFreeMdl(Ctx->ShmMdl);
@@ -438,7 +543,13 @@ setup_shm_fail:
         Ctx->SectionObject = NULL;
     }
     Ctx->ControlBlock   = NULL;
+    Ctx->DataRegion = NULL;
+    Ctx->DataRegionSize = 0;
+    Ctx->ShmSize = 0;
+    Ctx->G2hRing.Hdr = Ctx->H2gRing.Hdr = NULL;
+    Ctx->G2hRing.Data = Ctx->H2gRing.Data = NULL;
     Ctx->ShmEstablished = FALSE;
+    InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_INIT);
     return NT_SUCCESS(status) ? STATUS_DATA_ERROR : status;
 }
 
@@ -466,9 +577,6 @@ HandleTeardownShm(
 
     if (in->Version != USBWARP_IOCTL_STRUCT_VERSION)
         return STATUS_REVISION_MISMATCH;
-
-    if (!Ctx->ShmEstablished)
-        return STATUS_INVALID_DEVICE_STATE;
 
     /* Perform full shutdown. */
     UsbWarpEmergencyShutdown(Ctx);
@@ -514,7 +622,7 @@ HandleBindDevice(
         return STATUS_REVISION_MISMATCH;
 
     /* State: SHM must be established. */
-    if (!Ctx->ShmEstablished)
+    if (!Ctx->ShmEstablished || !Ctx->Negotiated || Ctx->GlobalBreakerOpen || Ctx->ShuttingDown)
         return STATUS_INVALID_DEVICE_STATE;
 
     /* Orphan mode: refuse new binds. */
@@ -534,7 +642,7 @@ HandleBindDevice(
      * with concurrent hot-remove teardown on the PnP callback thread. */
     slot = 0;
     KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
-    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
+    for (ULONG i = 0; i < Ctx->MaxDevices; i++) {
         if (!Ctx->Devices[i].InUse) {
             if (slot == 0)
                 slot = i + 1;  /* device_id = 1-based */
@@ -632,12 +740,13 @@ HandleBindDevice(
      * slot was free, nothing references it. */
     KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     RtlZeroMemory(devCtx, sizeof(*devCtx));
-    devCtx->InUse       = TRUE;
-    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     devCtx->DeviceIndex = slot;
+    do { devCtx->Epoch = (ULONG)InterlockedIncrement(&Ctx->DeviceEpochCounter); } while (!devCtx->Epoch);
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
     RtlCopyMemory(devCtx->DeviceGuid, in->DeviceGuid, 16);
     InitializeListHead(&devCtx->PendingUrbs);
     KeInitializeSpinLock(&devCtx->PendingLock);
+    ExInitializeRundownProtection(&devCtx->SubmitRundown);
 
     /* Store instance path. */
     RtlCopyMemory(devCtx->InstancePathBuf, in->InstancePath,
@@ -646,7 +755,7 @@ HandleBindDevice(
     devCtx->InstancePathBuf[in->InstancePathLength / sizeof(WCHAR)] = L'\0';
 
     /* Initialise rate limiter and circuit breaker. */
-    UsbWarpTokenBucketInit(&devCtx->TokenBucket, 200, 100);
+    UsbWarpTokenBucketInit(&devCtx->TokenBucket, 16000, 16000);
     UsbWarpBreakerInit(&devCtx->Breaker);
 
     /* Store Container ID from pre-open query. */
@@ -667,18 +776,52 @@ HandleBindDevice(
         return status;
     }
 
-    InterlockedIncrement(&Ctx->ActiveDeviceCount);
+    if (WdfRequestIsCanceled(Request) || Ctx->GlobalBreakerOpen || Ctx->ShuttingDown) {
+        UsbWarpDeviceClose(Ctx, devCtx);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
 
     /* Speed from the controller's hub query beats the bulk-maxpacket
      * heuristic: it is correct for devices without bulk endpoints
      * (UVC/UAC) and knows about low-speed.  0 (not queried) keeps the
      * heuristic result from UsbWarpDeviceOpen. */
-    if (in->Speed >= USBWARP_SPEED_LOW && in->Speed <= USBWARP_SPEED_SUPER)
+    if (!devCtx->SpeedQueried && in->Speed >= USBWARP_SPEED_LOW && in->Speed <= USBWARP_SPEED_MAX)
         devCtx->Speed = (UCHAR)in->Speed;
 
-    /* Notify Guest via Ring message.
-     * If the Ring is full, roll back: close device, clear slot. */
+    /* Device IDs are independent of root-hub ports. Enforce the negotiated
+     * bus type and root-port capacity before publishing the binding. */
+    {
+        BOOLEAN ss = usbwarp_speed_is_super(devCtx->Speed) ? TRUE : FALSE;
+        ULONG used = 0;
+        if (ss && !(Ctx->NegotiatedCaps & USBWARP_CAP_USB3)) {
+            UsbWarpDeviceClose(Ctx, devCtx);
+            return STATUS_NOT_SUPPORTED;
+        }
+        KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
+        for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
+            if (Ctx->Devices[i].InUse && !!usbwarp_speed_is_super(Ctx->Devices[i].Speed) == !!ss)
+                ++used;
+        KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+        if (used >= (ss ? USBWARP_USB3_PORTS : USBWARP_USB2_PORTS)) {
+            UsbWarpDeviceClose(Ctx, devCtx);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    /* Publish and enqueue DEVICE_ADDED under the same lock as PnP removal,
+     * keeping ADDED before REMOVED even if unplug happens during bind. */
+    KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
+    if (devCtx->Removing || Ctx->GlobalBreakerOpen || Ctx->ShuttingDown) {
+        KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+        UsbWarpDeviceClose(Ctx, devCtx);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    devCtx->InUse = TRUE;
+    InterlockedIncrement(&Ctx->ActiveDeviceCount);
     status = UsbWarpSendDeviceAdded(Ctx, devCtx);
+    if (!NT_SUCCESS(status)) devCtx->Removing = 1;
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+
     if (!NT_SUCCESS(status)) {
         KdPrint(("UsbWarp: DEVICE_ADDED send failed 0x%x — rolling back slot %u\n",
                  status, slot));
@@ -738,10 +881,11 @@ HandleUnbindDevice(
     /* Find device by GUID. */
     KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
     for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
-        if (Ctx->Devices[i].InUse &&
+        if (Ctx->Devices[i].InUse && !Ctx->Devices[i].Removing &&
             RtlCompareMemory(Ctx->Devices[i].DeviceGuid,
                              in->DeviceGuid, 16) == 16) {
             devCtx = &Ctx->Devices[i];
+            devCtx->Removing = 1;
             break;
         }
     }
@@ -749,11 +893,10 @@ HandleUnbindDevice(
     if (!devCtx)
         return STATUS_DEVICE_DOES_NOT_EXIST;
 
-    /* Atomically claim cleanup — prevents race with hot-remove callback. */
-    if (InterlockedCompareExchange(&devCtx->Removing, 1, 0) != 0)
-        return STATUS_DEVICE_DOES_NOT_EXIST;  /* hot-remove already handling it */
+    /* Stop physical I/O before the guest can recycle shared buffers. */
+    UsbWarpDeviceClose(Ctx, devCtx);
 
-    /* Notify Guest BEFORE closing device.  If Ring is full, log warning
+    /* Notify Guest after closing device.  If Ring is full, log warning
      * but proceed with close — we cannot leave a device open after the
      * user explicitly requested unbind. */
     status = UsbWarpSendDeviceRemoved(Ctx, devCtx, 0 /* user-requested */);
@@ -762,14 +905,14 @@ HandleUnbindDevice(
                  "(proceeding with close)\n", status, devCtx->DeviceIndex));
     }
 
-    /* Close USB device (cancels pending URBs). */
-    UsbWarpDeviceClose(Ctx, devCtx);
 
     KeAcquireSpinLock(&Ctx->DeviceLock, &oldIrql);
-    devCtx->InUse = FALSE;
-    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
+    if (devCtx->InUse) {
+        devCtx->InUse = FALSE;
+        InterlockedDecrement(&Ctx->ActiveDeviceCount);
+    }
     InterlockedExchange(&devCtx->Removing, 0);
-    InterlockedDecrement(&Ctx->ActiveDeviceCount);
+    KeReleaseSpinLock(&Ctx->DeviceLock, oldIrql);
 
     KdPrint(("UsbWarp: device unbound slot=%u\n", devCtx->DeviceIndex));
     return STATUS_SUCCESS;
@@ -807,29 +950,28 @@ HandleHeartbeat(
     if (in->Version != USBWARP_IOCTL_STRUCT_VERSION)
         return STATUS_REVISION_MISMATCH;
 
-    if (!Ctx->ServiceRegistered)
-        return STATUS_INVALID_DEVICE_STATE;
-
-    /* Update last heartbeat timestamp. */
-    KeQuerySystemTime(&Ctx->LastServiceHeartbeat);
-
-    /* If we were in orphan grace period, recover. */
-    if (InterlockedCompareExchange(&Ctx->OrphanState,
-                                   ORPHAN_NONE, ORPHAN_GRACE) == ORPHAN_GRACE) {
-        KdPrint(("UsbWarp: recovered from orphan grace period\n"));
-    }
-
-    /* Count total pending URBs. */
-    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
-        if (Ctx->Devices[i].InUse)
-            totalPending += Ctx->Devices[i].PendingCount;
+    {
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        KIRQL irql;
+        KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+        if (!file || !Ctx->ServiceRegistered || Ctx->ServiceDisconnected ||
+            Ctx->ServiceFile != WdfFileObjectWdmGetFileObject(file)) {
+            KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+            return STATUS_ACCESS_DENIED;
+        }
+        Ctx->LastServiceHeartbeat.QuadPart = (LONGLONG)KeQueryInterruptTime();
+        InterlockedCompareExchange(&Ctx->OrphanState, ORPHAN_NONE, ORPHAN_GRACE);
+        KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+        KeAcquireSpinLock(&Ctx->DeviceLock, &irql);
+        for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
+            if (Ctx->Devices[i].InUse) totalPending += Ctx->Devices[i].PendingCount;
+        KeReleaseSpinLock(&Ctx->DeviceLock, irql);
     }
 
     /* Fill output. */
     RtlZeroMemory(out, sizeof(*out));
     out->Version         = USBWARP_IOCTL_STRUCT_VERSION;
-    out->DriverState     = Ctx->ShmEstablished ?
-                               USBWARP_STATE_RUNNING : USBWARP_STATE_INIT;
+    out->DriverState = (ULONG)InterlockedCompareExchange(&Ctx->PublishedState, 0, 0);
     out->PendingUrbCount = (ULONG)totalPending;
 
     if (InterlockedCompareExchange(&Ctx->GlobalBreakerOpen, 0, 0))
@@ -865,7 +1007,7 @@ HandleQueryStatus(
 
     RtlZeroMemory(out, sizeof(*out));
     out->Version           = USBWARP_IOCTL_STRUCT_VERSION;
-    out->DriverState       = USBWARP_STATE_INIT;
+    out->DriverState = (ULONG)InterlockedCompareExchange(&Ctx->PublishedState, 0, 0);
     out->ShmEstablished    = Ctx->ShmEstablished ? 1 : 0;
     out->ServiceRegistered = Ctx->ServiceRegistered ? 1 : 0;
     out->OrphanMode        = (InterlockedCompareExchange(&Ctx->OrphanState,
@@ -885,7 +1027,6 @@ HandleQueryStatus(
                                      &Ctx->TotalBytesTransferred, 0, 0);
 
     if (Ctx->ShmEstablished) {
-        out->DriverState         = USBWARP_STATE_RUNNING;
         out->RingG2HUsagePercent = UsbWarpRingUsagePercent(&Ctx->G2hRing);
         out->RingH2GUsagePercent = UsbWarpRingUsagePercent(&Ctx->H2gRing);
     }

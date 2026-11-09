@@ -30,6 +30,9 @@
     <ClCompile Include="usbwarp_entry.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="usbwarp_irq_host.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="usbwarp_ioctl.c">
       <Filter>Source Files</Filter>
     </ClCompile>

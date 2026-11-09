@@ -116,6 +116,16 @@ LooksLikeValidHeader(
     return TRUE;
 }
 
+static VOID RetireCorruptRing(PUSBWARP_GLOBAL_CONTEXT Ctx)
+{
+    /* Stop admission, but retain mappings until normal teardown drains DMA. */
+    InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_ERROR);
+    if (Ctx->ControlBlock) Ctx->ControlBlock->host_state = USBWARP_STATE_ERROR;
+    InterlockedExchange(&Ctx->ShuttingDown, TRUE);
+    KeSetEvent(&Ctx->PollStopEvent, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&Ctx->PollWakeEvent, IO_NO_INCREMENT, FALSE);
+}
+
 static VOID
 TryRingRecovery(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx
@@ -132,6 +142,10 @@ TryRingRecovery(
     struct usbwarp_msg_header hdr;
     NTSTATUS status;
 
+    if (!usbwarp_ring_state_valid(pi, ci, ring->DataMask)) {
+        RetireCorruptRing(Ctx);
+        return;
+    }
     if (used == 0)
         return;  /* nothing to recover */
 
@@ -151,7 +165,7 @@ TryRingRecovery(
 
         status = UsbWarpRingPeekHeaderAt(ring, probeIndex, &hdr);
         if (NT_SUCCESS(status) &&
-            LooksLikeValidHeader(&hdr, used, ring->Hdr->max_message_size)) {
+            LooksLikeValidHeader(&hdr, used, USBWARP_MAX_MESSAGE_SIZE)) {
             /* Found a valid-looking header.  Advance ci to this position. */
             WriteULongRelease(
                 (volatile ULONG *)&ring->Hdr->consumer_index,
@@ -186,6 +200,77 @@ TryRingRecovery(
  * §1  Poll thread main function
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Completion DPCs never wait for ring space and never discard a reply.
+ * The poll thread drains this bounded-by-inflight queue and backpressures G2H. */
+VOID UsbWarpQueueCompletion(PUSBWARP_GLOBAL_CONTEXT Ctx, PUSBWARP_COMPLETION Completion)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&Ctx->CompletionLock, &irql);
+    if (Ctx->ShuttingDown) {
+        KeReleaseSpinLock(&Ctx->CompletionLock, irql);
+        ExFreePoolWithTag(Completion, USBWARP_DRIVER_TAG);
+        return;
+    }
+    InsertTailList(&Ctx->Completions, &Completion->Link);
+    InterlockedIncrement(&Ctx->CompletionCount);
+    KeReleaseSpinLock(&Ctx->CompletionLock, irql);
+    KeSetEvent(&Ctx->PollWakeEvent, IO_NO_INCREMENT, FALSE);
+}
+
+BOOLEAN UsbWarpFlushCompletions(PUSBWARP_GLOBAL_CONTEXT Ctx, BOOLEAN Discard)
+{
+    BOOLEAN sent = FALSE;
+    ULONG burst = 0;
+    for (;;) {
+        PUSBWARP_COMPLETION reply;
+        KIRQL irql;
+        KeAcquireSpinLock(&Ctx->CompletionLock, &irql);
+        if (IsListEmpty(&Ctx->Completions)) {
+            KeReleaseSpinLock(&Ctx->CompletionLock, irql);
+            break;
+        }
+        reply = CONTAINING_RECORD(Ctx->Completions.Flink, USBWARP_COMPLETION, Link);
+        if (!Discard) {
+            NTSTATUS status = UsbWarpRingProduce(&Ctx->H2gRing, reply->Data, reply->Length);
+            if (!NT_SUCCESS(status)) {
+                if (status == STATUS_DATA_ERROR) RetireCorruptRing(Ctx);
+                KeReleaseSpinLock(&Ctx->CompletionLock, irql);
+                break;
+            }
+        }
+        RemoveEntryList(&reply->Link);
+        InterlockedDecrement(&Ctx->CompletionCount);
+        KeReleaseSpinLock(&Ctx->CompletionLock, irql);
+        ExFreePoolWithTag(reply, USBWARP_DRIVER_TAG);
+        sent = TRUE;
+        if (!Discard && ++burst == 32) break;
+    }
+    return sent;
+}
+
+static NTSTATUS QueueControlMessage(PUSBWARP_GLOBAL_CONTEXT Ctx, const VOID *Message, ULONG Length)
+{
+    PUSBWARP_COMPLETION reply;
+    if (Ctx->ShuttingDown) return STATUS_INVALID_DEVICE_STATE;
+    reply = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        FIELD_OFFSET(USBWARP_COMPLETION, Data) + Length, USBWARP_DRIVER_TAG);
+    if (!reply) return STATUS_INSUFFICIENT_RESOURCES;
+    reply->Length = Length;
+    RtlCopyMemory(reply->Data, Message, Length);
+    UsbWarpQueueCompletion(Ctx, reply);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS PollWait(PUSBWARP_GLOBAL_CONTEXT Ctx, PLARGE_INTEGER Timeout)
+{
+    if (Ctx->G2hDoorbell) {
+        PVOID events[] = { &Ctx->PollWakeEvent, Ctx->G2hDoorbell };
+        return KeWaitForMultipleObjects(2, events, WaitAny, Executive, KernelMode,
+            FALSE, Timeout, NULL);
+    }
+    return KeWaitForSingleObject(&Ctx->PollWakeEvent, Executive, KernelMode, FALSE, Timeout);
+}
+
 static VOID
 UsbWarpPollThreadProc(
     _In_ PVOID Context
@@ -202,28 +287,38 @@ UsbWarpPollThreadProc(
 
     KdPrint(("UsbWarp: poll thread started\n"));
 
-    msgBuf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                      USBWARP_POLL_MSG_BUF_SIZE,
-                                      USBWARP_DRIVER_TAG);
-    if (!msgBuf) {
-        KdPrint(("UsbWarp: poll thread: cannot alloc msg buffer\n"));
-        PsTerminateSystemThread(STATUS_INSUFFICIENT_RESOURCES);
-        return;
-    }
+    /* Allocate before creating the thread so SETUP_SHM can report failure. */
+    msgBuf = ctx->PollMessageBuffer;
 
-    heartbeatInterval.QuadPart = -10000LL * 1000;  /* 1 second in 100ns */
-    KeQuerySystemTime(&lastHeartbeat);
+    heartbeatInterval.QuadPart = 10000LL * 1000;  /* 1 second in 100ns */
+    lastHeartbeat.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
     InterlockedExchange(&ctx->PollRunning, TRUE);
 
-    while (!InterlockedCompareExchange(&ctx->ShuttingDown, 0, 0)) {
+    while (!InterlockedCompareExchange(&ctx->ShuttingDown, 0, 0) &&
+           !KeReadStateEvent(&ctx->PollStopEvent)) {
 
         ULONG   msgLen = 0;
         NTSTATUS consumeStatus;
-        BOOLEAN  gotMsg = FALSE;
+        BOOLEAN  gotMsg = UsbWarpFlushCompletions(ctx, FALSE);
+
+        /* Keep an admission-error response available even under pool pressure.
+         * Without it, consuming a request could lose its completion forever. */
+        if (!ctx->ErrorReply) {
+            ctx->ErrorReply = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                FIELD_OFFSET(USBWARP_COMPLETION, Data) + sizeof(struct usbwarp_msg_urb_complete),
+                USBWARP_DRIVER_TAG);
+            if (!ctx->ErrorReply) {
+                waitTimeout.QuadPart = -10000;
+                PollWait(ctx, &waitTimeout);
+                continue;
+            }
+        }
 
         /* ── Try to consume one G2H message ─────────────────────────────── */
-        consumeStatus = UsbWarpRingConsume(
+        consumeStatus = STATUS_NO_MORE_ENTRIES;
+        if (InterlockedCompareExchange(&ctx->CompletionCount, 0, 0) < USBWARP_PENDING_URBS_MAX)
+            consumeStatus = UsbWarpRingConsume(
                             &ctx->G2hRing, msgBuf,
                             USBWARP_POLL_MSG_BUF_SIZE, &msgLen);
 
@@ -252,40 +347,53 @@ UsbWarpPollThreadProc(
             gotMsg = TRUE;  /* don't enter idle — retry immediately */
         }
 
+        UsbWarpIrqPoll(ctx);
+
         /* ── Adaptive poll timing ───────────────────────────────────────── */
         if (gotMsg) {
             idleCount = 0;
+        } else if (ctx->G2hDoorbell && (ctx->NegotiatedCaps & USBWARP_CAP_G2H_DOORBELL)) {
+            // Both guest submissions and USB completions signal kernel events.
+            // The timeout only services liveness; no tick-rounded data delay.
+            waitTimeout.QuadPart = ((ctx->Irq.State > USBWARP_IRQ_OFF &&
+                ctx->Irq.State < USBWARP_IRQ_READY) ||
+                InterlockedCompareExchange(&ctx->CompletionCount, 0, 0)) ? -10000 : -10000000;
+            PollWait(ctx, &waitTimeout);
         } else {
             idleCount++;
 
             if (idleCount < 100) {
                 YieldProcessor();
-            } else if (idleCount < 1000) {
+            } else if (idleCount < 1000 || InterlockedCompareExchange(&ctx->IsoPending, 0, 0)) {
                 /* Light sleep: 10 µs */
                 waitTimeout.QuadPart = -100;  /* 10 µs in 100ns units */
-                KeWaitForSingleObject(&ctx->PollStopEvent, Executive,
-                                      KernelMode, FALSE, &waitTimeout);
+                PollWait(ctx, &waitTimeout);
             } else {
                 /* Idle sleep: 1 ms */
                 waitTimeout.QuadPart = -10000;  /* 1 ms */
-                waitStatus = KeWaitForSingleObject(
-                                 &ctx->PollStopEvent, Executive,
-                                 KernelMode, FALSE, &waitTimeout);
-                if (waitStatus == STATUS_SUCCESS)
+                waitStatus = PollWait(ctx, &waitTimeout);
+                if (waitStatus == STATUS_SUCCESS && KeReadStateEvent(&ctx->PollStopEvent))
                     break;  /* stop event signalled */
             }
         }
 
         /* ── Periodic host heartbeat ────────────────────────────────────── */
-        KeQuerySystemTime(&now);
+        now.QuadPart = (LONGLONG)KeQueryInterruptTime();
         if ((now.QuadPart - lastHeartbeat.QuadPart) >= heartbeatInterval.QuadPart) {
 
             /* Update Control Block host heartbeat. */
             if (ctx->ControlBlock) {
-                ctx->ControlBlock->host_heartbeat_ts = (uint64_t)now.QuadPart;
+                ctx->ControlBlock->host_heartbeat_ts = (uint64_t)now.QuadPart * 100;
                 ctx->ControlBlock->host_state =
-                    InterlockedCompareExchange(&ctx->GlobalBreakerOpen, 0, 0) ?
-                    USBWARP_STATE_SHUTTING_DOWN : USBWARP_STATE_RUNNING;
+                    (ULONG)InterlockedCompareExchange(&ctx->PublishedState, 0, 0);
+                if (ctx->Negotiated && !ctx->EmergencyMode) {
+                    ULONG guest = ReadULongAcquire((volatile ULONG *)&ctx->ControlBlock->guest_state);
+                    if (guest == USBWARP_STATE_ERROR || guest == USBWARP_STATE_STOPPED) {
+                        ctx->Negotiated = FALSE;
+                        InterlockedExchange(&ctx->GlobalBreakerOpen, TRUE);
+                        InterlockedExchange(&ctx->PublishedState, USBWARP_STATE_ERROR);
+                    }
+                }
             }
 
             /* Check Service heartbeat timeout (orphan detection). */
@@ -297,6 +405,11 @@ UsbWarpPollThreadProc(
     }
 
     ExFreePoolWithTag(msgBuf, USBWARP_DRIVER_TAG);
+    ctx->PollMessageBuffer = NULL;
+    if (ctx->ErrorReply) {
+        ExFreePoolWithTag(ctx->ErrorReply, USBWARP_DRIVER_TAG);
+        ctx->ErrorReply = NULL;
+    }
     InterlockedExchange(&ctx->PollRunning, FALSE);
 
     KdPrint(("UsbWarp: poll thread stopped\n"));
@@ -316,7 +429,12 @@ UsbWarpPollStart(
     HANDLE   threadHandle;
     OBJECT_ATTRIBUTES oa;
 
+    Ctx->PollMessageBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        USBWARP_POLL_MSG_BUF_SIZE, USBWARP_DRIVER_TAG);
+    if (!Ctx->PollMessageBuffer) return STATUS_INSUFFICIENT_RESOURCES;
+
     KeClearEvent(&Ctx->PollStopEvent);
+    KeClearEvent(&Ctx->PollWakeEvent);
     InterlockedExchange(&Ctx->ShuttingDown, FALSE);
 
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
@@ -324,13 +442,23 @@ UsbWarpPollStart(
     status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
                                   &oa, NULL, NULL,
                                   UsbWarpPollThreadProc, Ctx);
-    if (!NT_SUCCESS(status))
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(Ctx->PollMessageBuffer, USBWARP_DRIVER_TAG);
+        Ctx->PollMessageBuffer = NULL;
         return status;
+    }
 
     /* Get PETHREAD reference for later KeWaitForSingleObject. */
     status = ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS,
                                        *PsThreadType, KernelMode,
                                        (PVOID *)&Ctx->PollThread, NULL);
+    if (!NT_SUCCESS(status)) {
+        /* Thread creation succeeded. It must exit before setup can unmap SHM. */
+        InterlockedExchange(&Ctx->ShuttingDown, TRUE);
+        KeSetEvent(&Ctx->PollStopEvent, IO_NO_INCREMENT, FALSE);
+        KeSetEvent(&Ctx->PollWakeEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+    }
     ZwClose(threadHandle);
 
     /* P1#6: Elevate poll thread priority for low-latency USB devices.
@@ -353,12 +481,14 @@ UsbWarpPollStop(
 
     InterlockedExchange(&Ctx->ShuttingDown, TRUE);
     KeSetEvent(&Ctx->PollStopEvent, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&Ctx->PollWakeEvent, IO_NO_INCREMENT, FALSE);
 
     KeWaitForSingleObject(Ctx->PollThread, Executive,
                           KernelMode, FALSE, NULL);
 
     ObDereferenceObject(Ctx->PollThread);
     Ctx->PollThread = NULL;
+    UsbWarpFlushCompletions(Ctx, TRUE);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -392,6 +522,42 @@ DispatchMessage(
         if (MsgLen < USBWARP_MSG_URB_SUBMIT_BASE_SIZE)
             break;
         UsbWarpProcessUrbSubmit(Ctx, sub);
+        break;
+    }
+
+    case USBWARP_MSG_STREAMS_REQUEST:
+        UsbWarpProcessStreams(Ctx, (const struct usbwarp_msg_streams_request *)MsgBuf);
+        break;
+
+    case USBWARP_MSG_ISO_SUBMIT:
+        UsbWarpProcessIsoSubmit(Ctx, (const struct usbwarp_msg_iso_submit *)MsgBuf);
+        break;
+
+    case USBWARP_MSG_GUEST_SHUTDOWN: {
+        struct usbwarp_msg_shutdown_ack ack;
+        if (MsgLen < sizeof(struct usbwarp_msg_shutdown)) break;
+        InterlockedExchange(&Ctx->GlobalBreakerOpen, TRUE);
+        InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_STOPPED);
+        /* All submit paths run on this poll thread, so none can publish new
+         * USB I/O while it drains targets. Reference each target before
+         * dropping DeviceLock, allowing concurrent unbind to close safely. */
+        for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i) {
+            WDFIOTARGET target = NULL;
+            KIRQL irql;
+            KeAcquireSpinLock(&Ctx->DeviceLock, &irql);
+            if (Ctx->Devices[i].InUse && Ctx->Devices[i].FilterTarget) {
+                target = Ctx->Devices[i].FilterTarget;
+                WdfObjectReference(target);
+            }
+            KeReleaseSpinLock(&Ctx->DeviceLock, irql);
+            if (target) {
+                UsbWarpPurgeTarget(target);
+                WdfObjectDereference(target);
+            }
+        }
+        RtlZeroMemory(&ack, sizeof(ack));
+        FillMsgHeader(&ack.hdr, USBWARP_MSG_SHUTDOWN_ACK, 0, 0, sizeof(ack));
+        QueueControlMessage(Ctx, &ack, sizeof(ack));
         break;
     }
 
@@ -470,7 +636,7 @@ UsbWarpSendNegotiateResp(
         resp.negotiated_version  = Ctx->NegotiatedVersion;
         resp.capabilities        = Ctx->NegotiatedCaps;
         resp.max_pending_urbs    = USBWARP_PENDING_URBS_DEFAULT;
-        resp.max_devices         = USBWARP_MAX_DEVICES_LIMIT;
+        resp.max_devices         = Ctx->MaxDevices;
         RingProduceRetry(&Ctx->H2gRing, &resp, sizeof(resp), 10);
         return;
     }
@@ -491,18 +657,21 @@ UsbWarpSendNegotiateResp(
     Ctx->NegotiatedVersion = version;
     Ctx->NegotiatedCaps    = USBWARP_CAP_INLINE_DATA |
                              USBWARP_CAP_BATCH_SUBMIT |
-                             USBWARP_CAP_STATS;
+                             USBWARP_CAP_STATS | USBWARP_CAP_USB3 | USBWARP_CAP_STREAMS | USBWARP_CAP_DEVICE_EPOCH;
 
     /* ISO capability comes from the Control Block flag the Service
      * derives from its --iso config — the same source the Service-only
      * debug path uses, so both host implementations advertise alike. */
     if (Ctx->ControlBlock &&
         (Ctx->ControlBlock->flags & USBWARP_FLAG_ISO_ENABLED))
-        Ctx->NegotiatedCaps |= USBWARP_CAP_ISO_TRANSFER;
+        Ctx->NegotiatedCaps |= USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED;
 
     /* Intersect with guest capabilities. */
+    if (Ctx->G2hDoorbell && (Ctx->ControlBlock->flags & USBWARP_FLAG_G2H_DOORBELL))
+        Ctx->NegotiatedCaps |= USBWARP_CAP_G2H_DOORBELL;
     Ctx->NegotiatedCaps &= NegMsg->capabilities;
     Ctx->Negotiated = TRUE;
+    InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_RUNNING);
 
     FillMsgHeader(&resp.hdr, USBWARP_MSG_NEGOTIATE_RESP, 0, 0,
                   sizeof(resp));
@@ -510,7 +679,7 @@ UsbWarpSendNegotiateResp(
     resp.negotiated_version  = version;
     resp.capabilities        = Ctx->NegotiatedCaps;
     resp.max_pending_urbs    = USBWARP_PENDING_URBS_DEFAULT;
-    resp.max_devices         = USBWARP_MAX_DEVICES_LIMIT;
+    resp.max_devices         = Ctx->MaxDevices;
 
     RingProduceRetry(&Ctx->H2gRing, &resp, sizeof(resp), 50);
 
@@ -536,11 +705,12 @@ UsbWarpSendDeviceAdded(
     FillMsgHeader(&msg.hdr, USBWARP_MSG_DEVICE_ADDED,
                   DevCtx->DeviceIndex, 0, sizeof(msg));
     msg.device_id = DevCtx->DeviceIndex;
+    if (Ctx->NegotiatedCaps & USBWARP_CAP_DEVICE_EPOCH) msg.hdr.flags = DevCtx->Epoch;
     msg.vendor_id = DevCtx->VendorId;
     msg.product_id = DevCtx->ProductId;
     msg.speed     = DevCtx->Speed;
 
-    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
+    return QueueControlMessage(Ctx, &msg, sizeof(msg));
 }
 
 NTSTATUS
@@ -561,7 +731,7 @@ UsbWarpSendHostShutdown(
                   0, 0, sizeof(msg));
     msg.reason = Reason;
 
-    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
+    return QueueControlMessage(Ctx, &msg, sizeof(msg));
 }
 
 NTSTATUS
@@ -577,7 +747,8 @@ UsbWarpSendDeviceRemoved(
     FillMsgHeader(&msg.hdr, USBWARP_MSG_DEVICE_REMOVED,
                   DevCtx->DeviceIndex, 0, sizeof(msg));
     msg.device_id = DevCtx->DeviceIndex;
+    if (Ctx->NegotiatedCaps & USBWARP_CAP_DEVICE_EPOCH) msg.hdr.flags = DevCtx->Epoch;
     msg.reason    = Reason;
 
-    return RingProduceRetry(&Ctx->H2gRing, &msg, sizeof(msg), 20);
+    return QueueControlMessage(Ctx, &msg, sizeof(msg));
 }

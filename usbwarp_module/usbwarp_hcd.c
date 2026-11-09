@@ -1,999 +1,775 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * usbwarp_hcd.c — Virtual USB Host Controller implementation.
- *
- * Copyright (c) 2026 UsbWarp Project
- *
- * Key design points:
- *   - device_id mapping: Host assigns device_id via MSG_DEVICE_ADDED.
- *     Linux USB Core assigns usb_addr via SET_ADDRESS during enumeration.
- *     We maintain a mapping table in usbwarp_device[].usb_addr so that
- *     urb_enqueue can look up the correct device_id.
- *
- *   - Root hub: USB Core expects bit 0 = hub change, bit N = port N
- *     (1-based).  Port index in our arrays is 0-based.
- */
-
+/* Virtual USB HCD. urb_lock serializes publication, unlink and completion.
+ * Transfer deadlines belong to the USB client; the worker retries unlinks. */
 #include "usbwarp_guest.h"
 #include <linux/usb/ch9.h>
 #include <linux/usb/ch11.h>
 #include <linux/slab.h>
 #include <linux/io.h>
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §1  Helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
+#include <asm/unaligned.h>
 
 static uint32_t next_txn_id(struct usbwarp_hcd *w)
 {
-	uint32_t id;
-
-	do {
-		id = (uint32_t)atomic_inc_return(&w->txn_counter);
-	} while (id == USBWARP_TXN_ID_NONE);
-
+	u32 id;
+	do { id = (u32)atomic_inc_return(&w->txn_counter); } while (!id);
 	return id;
 }
 
-static void fill_msg_header(struct usbwarp_msg_header *h,
-			    uint16_t type, uint32_t dev_id,
-			    uint32_t txn_id, uint32_t total_len)
+static void fill_msg_header(struct usbwarp_msg_header *h, u16 type,
+			    u32 dev_id, u32 txn_id, u32 len)
 {
-	h->magic            = USBWARP_MSG_MAGIC;
-	h->message_type     = type;
+	memset(h, 0, sizeof(*h));
+	h->magic = USBWARP_MSG_MAGIC;
+	h->message_type = type;
 	h->protocol_version = USBWARP_PROTOCOL_VERSION;
-	h->message_length   = total_len;
-	h->transaction_id   = txn_id;
-	h->device_id        = dev_id;
-	h->flags            = 0;
-	h->timestamp        = (uint64_t)ktime_get_ns();
+	h->message_length = len;
+	h->device_id = dev_id;
+	h->transaction_id = txn_id;
+	h->timestamp = ktime_get_ns();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §2  URB pending table
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static void urb_table_add(struct usbwarp_hcd *w, struct usbwarp_urb_priv *priv)
+static int usbwarp_check_iso(struct usbwarp_hcd *w, struct urb *urb,
+			    u32 speed, u32 *packed_length)
 {
-	unsigned long flags;
+	u32 i, length = 0;
+	if ((w->negotiated_caps & (USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED)) !=
+	    (USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED))
+		return -EOPNOTSUPP;
+	/* Cross-VM frame clocks aren't synchronized. Never silently reinterpret
+	 * an explicit frame schedule as ASAP. */
+	if (!(urb->transfer_flags & URB_ISO_ASAP))
+		return -EOPNOTSUPP;
+	if (!usbwarp_iso_packet_count_valid(urb->number_of_packets, speed, urb->interval))
+		return -EINVAL;
+	for (i = 0; i < urb->number_of_packets; ++i) {
+		u32 off = urb->iso_frame_desc[i].offset;
+		u32 len = urb->iso_frame_desc[i].length;
+		if (off > urb->transfer_buffer_length ||
+		    len > urb->transfer_buffer_length - off ||
+		    len > USBWARP_MAX_TRANSFER_SIZE - length)
+			return -EINVAL;
+		length += len;
+	}
+	*packed_length = length;
+	return 0;
+}
 
+static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
+{
+	struct usbwarp_hcd *w = hcd_to_warp(hcd);
+	struct usbwarp_urb_priv *p;
+	struct usbwarp_device *dev;
+	struct usbwarp_msg_urb_submit submit = { 0 };
+	struct usbwarp_msg_iso_submit *iso = NULL;
+	void *message = &submit;
+	unsigned long flags;
+	u32 id, generation, epoch, speed, length, slots = 0, msg_len, i, off = 0;
+	bool is_iso = usb_pipeisoc(urb->pipe), out = usb_pipeout(urb->pipe), inl;
+	int ret, buf = -1;
+
+	if (READ_ONCE(w->shutting_down) || READ_ONCE(w->quiescing))
+		return -ESHUTDOWN;
+	if (urb->transfer_buffer_length < 0 ||
+	    urb->transfer_buffer_length > USBWARP_MAX_TRANSFER_SIZE ||
+	    (urb->transfer_buffer_length && !urb->transfer_buffer && !urb->num_sgs))
+		return -EINVAL;
+	if (!urb->dev->parent)
+		return -ENODEV;
+	/* One root-hub port per exported physical device. */
+	spin_lock_irqsave(&w->dev_lock, flags);
+	id = usbwarp_find_devid_by_port(hcd, urb->dev->portnum);
+	if (id && usb_pipedevice(urb->pipe))
+		w->devices[id - 1].usb_addr = usb_pipedevice(urb->pipe);
+	spin_unlock_irqrestore(&w->dev_lock, flags);
+	if (!id)
+		return -ENODEV;
+	dev = &w->devices[id - 1];
 	spin_lock_irqsave(&w->urb_lock, flags);
-	hash_add(w->urb_table, &priv->hash_node, priv->transaction_id);
-	atomic_inc(&w->total_pending);
+	generation = dev->generation;
+	epoch = dev->epoch;
+	speed = dev->speed;
+	if (dev->udev != urb->dev) {
+		spin_unlock_irqrestore(&w->urb_lock, flags);
+		return -ENODEV;
+	}
 	spin_unlock_irqrestore(&w->urb_lock, flags);
+	if (urb->stream_id && (!(w->negotiated_caps & USBWARP_CAP_STREAMS) ||
+	    !usb_pipebulk(urb->pipe) || urb->stream_id > USBWARP_MAX_STREAMS ||
+	    urb->stream_id > urb->ep->streams))
+		return -EINVAL;
+	length = urb->transfer_buffer_length;
+	if (is_iso) {
+		ret = usbwarp_check_iso(w, urb, speed, &length);
+		if (ret)
+			return ret;
+	}
+	inl = !is_iso && length && length <= USBWARP_INLINE_DATA_SIZE &&
+	      (w->negotiated_caps & USBWARP_CAP_INLINE_DATA);
+	if (!inl && (length || is_iso)) {
+		slots = DIV_ROUND_UP(max(length, 1u), w->buffer_size);
+		buf = usbwarp_buf_alloc_contig(w, slots);
+		if (buf < 0)
+			return buf;
+	}
+	p = kzalloc(sizeof(*p), mem_flags);
+	if (!p) { ret = -ENOMEM; goto free_buffer; }
+	p->urb = urb;
+	p->device_id = id;
+	p->epoch = epoch;
+	p->transaction_id = next_txn_id(w);
+	p->buffer_index = buf;
+	p->slot_count = slots;
+	p->number_of_packets = is_iso ? urb->number_of_packets : 0;
+	p->state = URB_STATE_ACTIVE;
+	/* Like a native HCD, leave asynchronous requests pending until completion
+	 * or client unlink. HID/serial/network receives may legitimately wait
+	 * indefinitely; liveness and DMA-safe teardown are handled separately. */
+
+	if (is_iso) {
+		struct usbwarp_iso_packet_desc *packets;
+		msg_len = usbwarp_iso_message_size(urb->number_of_packets);
+		iso = kzalloc(msg_len, mem_flags);
+		if (!iso) { ret = -ENOMEM; goto free_priv; }
+		message = iso;
+		fill_msg_header(&iso->hdr, USBWARP_MSG_ISO_SUBMIT, id, p->transaction_id, msg_len);
+        ((struct usbwarp_msg_header *)message)->flags = epoch;
+		iso->device_id = id;
+		iso->endpoint = usb_pipeendpoint(urb->pipe);
+		iso->direction = !out;
+		iso->number_of_packets = urb->number_of_packets;
+		iso->total_length = length;
+		iso->buffer_offset = usbwarp_buf_offset(w, buf);
+		iso->interval = urb->interval;
+		packets = usbwarp_iso_packets(iso);
+		for (i = 0; i < iso->number_of_packets; ++i) {
+			u32 n = urb->iso_frame_desc[i].length;
+			packets[i].offset = off;
+			packets[i].length = n;
+			if (out && n && usbwarp_copy_urb_data(urb, urb->iso_frame_desc[i].offset, NULL,
+                    usbwarp_buf_addr(w, buf) + off, n, false) != n) {
+                ret = -EINVAL; goto free_priv;
+            }
+			off += n;
+		}
+	} else {
+		msg_len = USBWARP_MSG_URB_SUBMIT_BASE_SIZE + (inl && out ? length : 0);
+		fill_msg_header(&submit.hdr, USBWARP_MSG_URB_SUBMIT, id, p->transaction_id, msg_len);
+        ((struct usbwarp_msg_header *)message)->flags = epoch;
+		submit.device_id = id;
+		submit.endpoint = usb_pipeendpoint(urb->pipe);
+		submit.direction = !out;
+		submit.transfer_length = length;
+		submit.transfer_flags = urb->transfer_flags;
+        if (usb_pipebulk(urb->pipe) && out && length &&
+            (urb->transfer_flags & URB_ZERO_PACKET) && usb_endpoint_maxp(&urb->ep->desc) &&
+            length % usb_endpoint_maxp(&urb->ep->desc) == 0)
+            p->need_zlp = true;
+		submit.stream_id = urb->stream_id;
+		submit.interval = urb->interval;
+		if (usb_pipecontrol(urb->pipe)) {
+			if (!urb->setup_packet) { ret = -EINVAL; goto free_priv; }
+			submit.transfer_type = USBWARP_XFER_CONTROL;
+			memcpy(submit.setup_packet, urb->setup_packet, 8);
+		} else if (usb_pipebulk(urb->pipe))
+			submit.transfer_type = USBWARP_XFER_BULK;
+		else if (usb_pipeint(urb->pipe))
+			submit.transfer_type = USBWARP_XFER_INTERRUPT;
+		else { ret = -EINVAL; goto free_priv; }
+		submit.data_mode = !length ? USBWARP_DATA_NONE :
+				   inl ? USBWARP_DATA_INLINE : USBWARP_DATA_BUFFER;
+		if (inl && out && usbwarp_copy_urb_data(urb, 0, submit.inline_data, NULL, length, false) != length) {
+            ret = -EINVAL; goto free_priv;
+        }
+		if (buf >= 0) {
+			submit.buffer_offset = usbwarp_buf_offset(w, buf);
+			if (out && length && usbwarp_copy_urb_data(urb, 0, NULL,
+                usbwarp_buf_addr(w, buf), length, false) != length) {
+                ret = -EINVAL; goto free_priv;
+            }
+		}
+	}
+
+	if (!is_iso) p->wire_submit = submit;
+
+	/* Initialize and link everything before the host can see the message.
+	 * Completion, cancellation and device removal take this same lock. */
+	spin_lock_irqsave(&w->urb_lock, flags);
+	if (w->shutting_down || w->quiescing || !dev->connected || dev->generation != generation || dev->udev != urb->dev) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
+	if (usbwarp_debugfs_g2h_paused()) { ret = -EBUSY; goto unlock; }
+	if (atomic_read(&dev->pending_urbs) >= w->max_pending_urbs ||
+	    !usbwarp_device_quota_allows(w, id, slots)) { ret = -ENOSPC; goto unlock; }
+	ret = usb_hcd_link_urb_to_ep(hcd, urb);
+	if (ret)
+		goto unlock;
+	urb->hcpriv = p;
+	hash_add(w->urb_table, &p->hash_node, p->transaction_id);
+	atomic_inc(&w->total_pending);
+	atomic_inc(&dev->pending_urbs);
+	atomic_add(slots, &dev->buf_in_use);
+	if (is_iso) {
+		atomic_inc(&w->iso_pending);
+        smp_mb__after_atomic();
+    }
+    if (!is_iso && usbwarp_submission_blocked(p)) {
+        p->queued = true;
+        atomic_inc(&w->tx_pending);
+        ret = 0;
+    } else {
+        ret = usbwarp_ring_produce(&w->g2h, message, msg_len);
+        if (!ret && !is_iso) {
+            p->published_ns = ktime_get_ns();
+            p->busy_eligible = usbwarp_rx_submit(w, submit.transfer_type, length);
+        }
+    }
+	if (ret) {
+		hash_del(&p->hash_node);
+		urb->hcpriv = NULL;
+		usb_hcd_unlink_urb_from_ep(hcd, urb);
+		atomic_dec(&w->total_pending);
+		atomic_dec(&dev->pending_urbs);
+		atomic_sub(slots, &dev->buf_in_use);
+		if (is_iso)
+			atomic_dec(&w->iso_pending);
+	}
+unlock:
+	spin_unlock_irqrestore(&w->urb_lock, flags);
+    if (!ret && (atomic_read(&w->tx_pending) ||
+        (is_iso && usbwarp_rx_priority_pending(w)))) wake_up(&w->irq_wait);
+	kfree(iso);
+	iso = NULL;
+	if (!ret)
+		return 0; /* p and urb may already have completed. */
+free_priv:
+	kfree(iso);
+	kfree(p);
+free_buffer:
+	if (buf >= 0)
+		usbwarp_buf_free_range(w, buf, slots);
+	return ret;
 }
 
-static struct usbwarp_urb_priv *urb_table_find(struct usbwarp_hcd *w,
-					       uint32_t txn_id)
+static int usbwarp_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
-	struct usbwarp_urb_priv *priv;
+	struct usbwarp_hcd *w = hcd_to_warp(hcd);
+	struct usbwarp_urb_priv *p;
 	unsigned long flags;
-
+	int ret;
 	spin_lock_irqsave(&w->urb_lock, flags);
-	hash_for_each_possible(w->urb_table, priv, hash_node, txn_id) {
-		if (priv->transaction_id == txn_id) {
-			spin_unlock_irqrestore(&w->urb_lock, flags);
-			return priv;
-		}
+	ret = usb_hcd_check_unlink_urb(hcd, urb, status);
+	p = urb->hcpriv;
+	if (!ret && p) {
+		p->state = URB_STATE_CANCELING;
+		p->cancel_status = status;
+		if (!p->queued) usbwarp_send_cancel_locked(w, p);
+	}
+	spin_unlock_irqrestore(&w->urb_lock, flags);
+	return ret;
+}
+
+/* Remove and claim exactly once, while the pointer is still protected. */
+static struct usbwarp_urb_priv *take_urb(struct usbwarp_hcd *w,
+		const struct usbwarp_msg_header *hdr, bool iso)
+{
+	struct usbwarp_urb_priv *p;
+	unsigned long flags;
+	spin_lock_irqsave(&w->urb_lock, flags);
+	hash_for_each_possible(w->urb_table, p, hash_node, hdr->transaction_id) {
+		if (p->transaction_id != hdr->transaction_id || p->device_id != hdr->device_id ||
+		    p->epoch != hdr->flags || p->queued || !!p->number_of_packets != iso)
+			continue;
+		hash_del(&p->hash_node);
+		p->state = URB_STATE_DEAD;
+		p->urb->hcpriv = NULL;
+		usb_hcd_unlink_urb_from_ep(bus_to_hcd(p->urb->dev->bus), p->urb);
+		spin_unlock_irqrestore(&w->urb_lock, flags);
+		return p;
 	}
 	spin_unlock_irqrestore(&w->urb_lock, flags);
 	return NULL;
 }
 
-static void urb_table_remove(struct usbwarp_hcd *w,
-			     struct usbwarp_urb_priv *priv)
+static int status_to_errno(int32_t status)
 {
+	switch (status) {
+	case USBWARP_STATUS_SUCCESS: return 0;
+	case USBWARP_STATUS_NOT_SUPPORTED: return -EOPNOTSUPP;
+	case USBWARP_STATUS_CANCELLED: return -ECONNRESET;
+	case USBWARP_STATUS_STALL: return -EPIPE;
+	case USBWARP_STATUS_TIMEOUT: return -ETIMEDOUT;
+	case USBWARP_STATUS_ISO_MISSED: return -EXDEV;
+	case USBWARP_STATUS_CRC: return -EILSEQ;
+	case USBWARP_STATUS_BABBLE: return -EOVERFLOW;
+	case USBWARP_STATUS_SHORT_PACKET: return -EREMOTEIO;
+	case USBWARP_STATUS_DISCONNECTED:
+	case USBWARP_STATUS_SHUTDOWN: return -ESHUTDOWN;
+	case USBWARP_STATUS_OVERFLOW: return -EOVERFLOW;
+	case USBWARP_STATUS_NO_RESOURCE: return -ENOMEM;
+	default: return -EPROTO;
+	}
+}
+
+static void finish_urb(struct usbwarp_hcd *w, struct usbwarp_urb_priv *p, int status)
+{
+	struct urb *urb = p->urb;
+	struct usbwarp_device *dev = &w->devices[p->device_id - 1];
 	unsigned long flags;
-
-	spin_lock_irqsave(&w->urb_lock, flags);
-	hash_del(&priv->hash_node);
+	if (p->buffer_index >= 0)
+		usbwarp_buf_free_range(w, p->buffer_index, p->slot_count);
+	atomic_sub(p->slot_count, &dev->buf_in_use);
+	atomic_dec(&dev->pending_urbs);
 	atomic_dec(&w->total_pending);
-	spin_unlock_irqrestore(&w->urb_lock, flags);
+	if (p->number_of_packets)
+		atomic_dec(&w->iso_pending);
+	if (p->cancel_status)
+		status = p->cancel_status;
+    usbwarp_rx_progress(w, p->busy_eligible, p->published_ns, status);
+	kfree(p);
+	/* Callback may free or immediately resubmit urb. Touch neither after it. */
+	local_irq_save(flags);
+	usb_hcd_giveback_urb(bus_to_hcd(urb->dev->bus), urb, status);
+	local_irq_restore(flags);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §3  URB timeout callback
- *
- *   CAS ACTIVE→CANCELING.  Send MSG_URB_CANCEL — if ring is full, log
- *   the failure but don't leak: the URB will eventually be giveback'd
- *   by the shutdown path or a subsequent completion.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static void urb_timeout_fn(struct timer_list *t)
+void usbwarp_flush_queued(struct usbwarp_hcd *w)
 {
-	struct usbwarp_urb_priv *priv =
-		from_timer(priv, t, timeout_timer);
-	struct urb *urb = priv->urb;
-	struct usb_hcd *hcd = bus_to_hcd(urb->dev->bus);
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	struct usbwarp_msg_urb_cancel cancel_msg;
-	int ret;
-
-	if (atomic_cmpxchg(&priv->state,
-			   URB_STATE_ACTIVE,
-			   URB_STATE_CANCELING) != URB_STATE_ACTIVE)
-		return;
-
-	dev_dbg(&w->pdev->dev,
-		"usbwarp: URB timeout txn=%u dev=%u\n",
-		priv->transaction_id, priv->device_id);
-
-	memset(&cancel_msg, 0, sizeof(cancel_msg));
-	fill_msg_header(&cancel_msg.hdr,
-			USBWARP_MSG_URB_CANCEL,
-			priv->device_id,
-			priv->transaction_id,
-			sizeof(cancel_msg));
-	cancel_msg.device_id = priv->device_id;
-
-	ret = usbwarp_ring_produce(&w->g2h, &cancel_msg, sizeof(cancel_msg));
-	if (ret) {
-		dev_warn(&w->pdev->dev,
-			 "usbwarp: cancel send failed (ring full) txn=%u\n",
-			 priv->transaction_id);
-		/* URB remains CANCELING.  It will be cleaned up by:
-		 * (a) a later Host completion arriving, or
-		 * (b) the device removal / shutdown path.          */
-	}
+    struct usbwarp_urb_priv *p, *next;
+    struct hlist_node *tmp;
+    unsigned long flags;
+    int bkt;
+    LIST_HEAD(done);
+    if (!atomic_read(&w->tx_pending)) return;
+    spin_lock_irqsave(&w->urb_lock, flags);
+    hash_for_each_safe(w->urb_table, bkt, tmp, p, hash_node) {
+        if (!p->queued) continue;
+        if (p->state == URB_STATE_CANCELING || w->quiescing || w->shutting_down) {
+            hash_del(&p->hash_node);
+            p->urb->hcpriv = NULL;
+            usb_hcd_unlink_urb_from_ep(bus_to_hcd(p->urb->dev->bus), p->urb);
+            atomic_dec(&w->tx_pending);
+            p->queued = false;
+            if (!p->cancel_status) p->cancel_status = -ESHUTDOWN;
+            list_add_tail(&p->cancel_node, &done);
+        } else usbwarp_publish_queued(w, p);
+    }
+    spin_unlock_irqrestore(&w->urb_lock, flags);
+    list_for_each_entry_safe(p, next, &done, cancel_node) {
+        list_del(&p->cancel_node);
+        p->urb->actual_length = p->saved_actual;
+        finish_urb(w, p, p->cancel_status);
+    }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §4  urb_enqueue
- *
- *   FIX: Use usbwarp_find_devid_by_addr() to map Linux USB address
- *   to Host-assigned device_id.  The old code used usb_pipedevice()
- *   directly, which is wrong because the Host assigns independent IDs.
- *
- *   FIX: Per-device buffer quota check before alloc.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int usbwarp_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
-			       gfp_t mem_flags)
+void usbwarp_complete_urb(struct usbwarp_hcd *w, const struct usbwarp_msg_urb_complete *msg)
 {
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	struct usbwarp_urb_priv *priv;
-	struct usbwarp_msg_urb_submit submit;
-	struct usbwarp_device *wdev;
-	int buf_idx = -1;
-	uint32_t dev_id;
-	uint32_t xfer_len;
-	bool is_out, use_inline;
-	int ret;
-
-	if (READ_ONCE(w->shutting_down))
-		return -ESHUTDOWN;
-
-	/* Map Linux USB device address → Host-assigned device_id.
-	 *
-	 * Three cases:
-	 *
-	 * 1) Address 0: default USB address during enumeration before
-	 *    SET_ADDRESS.  Look up by port number.
-	 *
-	 * 2) Non-zero address, found in map: normal fast path.
-	 *
-	 * 3) Non-zero address, NOT in map: this happens because Linux USB
-	 *    core's hub_set_address() calls our address_device() callback
-	 *    BEFORE update_devnum() sets udev->devnum.  So address_device
-	 *    sees devnum=0 and can't store the real address.  We handle
-	 *    this with lazy mapping: look up by port, then update the
-	 *    address map for future fast-path hits.
-	 */
-	if (usb_pipedevice(urb->pipe) == 0) {
-		/* Case 1: address 0 → find by port. */
-		if (!urb->dev || !urb->dev->parent)
-			return -EINVAL;
-		dev_id = usbwarp_find_devid_by_port(w, urb->dev->portnum);
-	} else {
-		/* Case 2: try address lookup first. */
-		dev_id = usbwarp_find_devid_by_addr(w, usb_pipedevice(urb->pipe));
-
-		/* Case 3: lazy address mapping fallback. */
-		if (dev_id == 0 && urb->dev && urb->dev->parent) {
-			dev_id = usbwarp_find_devid_by_port(w, urb->dev->portnum);
-			if (dev_id != 0) {
-				/* Store the mapping so future lookups are fast.
-				 * set_usb_addr takes 0-based port index. */
-				usbwarp_set_usb_addr(w, urb->dev->portnum - 1,
-						     usb_pipedevice(urb->pipe));
-				dev_dbg(&w->pdev->dev,
-					"usbwarp: lazy addr map port=%u addr=%u → devid=%u\n",
-					urb->dev->portnum,
-					usb_pipedevice(urb->pipe), dev_id);
-			}
-		}
-	}
-
-	if (dev_id == 0)
-		return -ENODEV;
-
-	wdev = usbwarp_get_device(w, dev_id);
-	if (!wdev)
-		return -ENODEV;
-
-	/* Per-device pending URB limit. */
-	if (atomic_read(&wdev->pending_urbs) >= (int)w->max_pending_urbs)
-		return -ENOSPC;
-
-	xfer_len = urb->transfer_buffer_length;
-	is_out   = usb_pipeout(urb->pipe);
-
-	/* ISO transfers use separate ring messages (ISO_SUBMIT) which are
-	 * not implemented yet.  Fail cleanly — without this the URB falls
-	 * through the transfer-type chain as a zeroed control transfer and
-	 * the host's L4 validation rejects it as a confusing -EPROTO. */
-	if (usb_pipeisoc(urb->pipe))
-		return -ENOSYS;
-
-	use_inline = (xfer_len > 0 && xfer_len <= USBWARP_INLINE_DATA_SIZE &&
-		      (w->negotiated_caps & USBWARP_CAP_INLINE_DATA));
-
-	/* Allocate Data Region buffer for non-inline transfers. */
-	if (xfer_len > 0 && !use_inline) {
-		/* A transfer larger than one buffer slot would silently
-		 * overrun into the neighbouring slot.  Reject cleanly
-		 * until multi-slot contiguous allocation lands. */
-		if (xfer_len > w->buffer_size)
-			return -EMSGSIZE;
-
-		/* Per-device quota check. */
-		if (!usbwarp_device_quota_allows(w, dev_id))
-			return -ENOSPC;
-
-		buf_idx = usbwarp_buf_alloc(w);
-		if (buf_idx < 0)
-			return -ENOMEM;
-
-		atomic_inc(&wdev->buf_in_use);
-
-		if (is_out && urb->transfer_buffer) {
-			memcpy_toio(usbwarp_buf_addr(w, buf_idx),
-				    urb->transfer_buffer, xfer_len);
-			smp_wmb();
-		}
-	}
-
-	/* Allocate URB private context. */
-	priv = kzalloc(sizeof(*priv), mem_flags);
-	if (!priv) {
-		if (buf_idx >= 0) {
-			usbwarp_buf_free(w, buf_idx);
-			atomic_dec(&wdev->buf_in_use);
-		}
-		return -ENOMEM;
-	}
-
-	priv->urb            = urb;
-	priv->transaction_id = next_txn_id(w);
-	priv->device_id      = dev_id;
-	priv->buffer_index   = buf_idx;
-	priv->submit_time    = ktime_get();
-	atomic_set(&priv->state, URB_STATE_ACTIVE);
-	urb->hcpriv = priv;
-
-	/* Add to pending table BEFORE ring produce (two-phase commit). */
-	urb_table_add(w, priv);
-	atomic_inc(&wdev->pending_urbs);
-
-	/* Build MSG_URB_SUBMIT. */
-	memset(&submit, 0, sizeof(submit));
-
-	{
-		uint32_t msg_len;
-
-		if (use_inline && is_out)
-			msg_len = USBWARP_MSG_URB_SUBMIT_BASE_SIZE + xfer_len;
-		else
-			msg_len = USBWARP_MSG_URB_SUBMIT_BASE_SIZE;
-
-		fill_msg_header(&submit.hdr, USBWARP_MSG_URB_SUBMIT,
-				dev_id, priv->transaction_id, msg_len);
-	}
-
-	submit.device_id       = dev_id;
-	submit.endpoint        = usb_pipeendpoint(urb->pipe);
-	submit.direction       = is_out ? 0 : 1;
-	submit.transfer_flags  = urb->transfer_flags;
-	submit.transfer_length = xfer_len;
-
-	if (usb_pipecontrol(urb->pipe)) {
-		submit.transfer_type = USBWARP_XFER_CONTROL;
-		if (urb->setup_packet)
-			memcpy(submit.setup_packet, urb->setup_packet, 8);
-	} else if (usb_pipebulk(urb->pipe)) {
-		submit.transfer_type = USBWARP_XFER_BULK;
-	} else if (usb_pipeint(urb->pipe)) {
-		submit.transfer_type = USBWARP_XFER_INTERRUPT;
-		submit.interval      = urb->interval;
-	}
-
-	if (xfer_len == 0) {
-		submit.data_mode = USBWARP_DATA_NONE;
-	} else if (use_inline) {
-		submit.data_mode = USBWARP_DATA_INLINE;
-		if (is_out && urb->transfer_buffer)
-			memcpy(submit.inline_data, urb->transfer_buffer,
-			       xfer_len);
-	} else {
-		submit.data_mode     = USBWARP_DATA_BUFFER;
-		submit.buffer_offset = usbwarp_buf_offset(w, buf_idx);
-	}
-
-	/* Reject URB submit while G2H is paused for fuzz injection.
-	 * Preserves SPSC invariant — fuzz injector is sole producer. */
-	if (usbwarp_debugfs_g2h_paused()) {
-		atomic_dec(&wdev->pending_urbs);
-		urb_table_remove(w, priv);
-		urb->hcpriv = NULL;
-		kfree(priv);
-		if (buf_idx >= 0) {
-			usbwarp_buf_free(w, buf_idx);
-			atomic_dec(&wdev->buf_in_use);
-		}
-		return -EBUSY;
-	}
-
-	ret = usbwarp_ring_produce(&w->g2h, &submit,
-				   submit.hdr.message_length);
-	if (ret) {
-		atomic_dec(&wdev->pending_urbs);
-		urb_table_remove(w, priv);
-		urb->hcpriv = NULL;
-		kfree(priv);
-		if (buf_idx >= 0) {
-			usbwarp_buf_free(w, buf_idx);
-			atomic_dec(&wdev->buf_in_use);
-		}
-		return ret;
-	}
-
-	/* Start timeout timer. */
-	{
-		unsigned long timeout_ms =
-			usb_pipecontrol(urb->pipe) ? 10000 : 5000;
-		timer_setup(&priv->timeout_timer, urb_timeout_fn, 0);
-		mod_timer(&priv->timeout_timer,
-			  jiffies + msecs_to_jiffies(timeout_ms));
-	}
-
-	return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §5  urb_dequeue
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int usbwarp_urb_dequeue(struct usb_hcd *hcd, struct urb *urb,
-			       int status)
-{
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	struct usbwarp_urb_priv *priv = urb->hcpriv;
-	struct usbwarp_msg_urb_cancel cancel_msg;
-
-	if (!priv)
-		return -EINVAL;
-
-	if (atomic_cmpxchg(&priv->state,
-			   URB_STATE_ACTIVE,
-			   URB_STATE_CANCELING) != URB_STATE_ACTIVE)
-		return 0;
-
-	memset(&cancel_msg, 0, sizeof(cancel_msg));
-	fill_msg_header(&cancel_msg.hdr,
-			USBWARP_MSG_URB_CANCEL,
-			priv->device_id,
-			priv->transaction_id,
-			sizeof(cancel_msg));
-	cancel_msg.device_id = priv->device_id;
-
-	/* Best-effort send. */
-	usbwarp_ring_produce(&w->g2h, &cancel_msg, sizeof(cancel_msg));
-
-	return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §6  URB completion  (called from poll thread on MSG_URB_COMPLETE)
- *
- *   FIX: Validate host message fields (device_id range, actual_length
- *   bounds, data_mode sanity) before trusting them.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-void usbwarp_complete_urb(struct usbwarp_hcd *w,
-			  const struct usbwarp_msg_urb_complete *msg)
-{
-	struct usbwarp_urb_priv *priv;
-	struct usbwarp_device *wdev;
+	struct usbwarp_urb_priv *p;
 	struct urb *urb;
-	int urb_status;
-	int old_state;
-	uint32_t actual_len;
-
-	/* Validate transaction_id lookup. */
-	priv = urb_table_find(w, msg->hdr.transaction_id);
-	if (!priv) {
-		dev_warn(&w->pdev->dev,
-			 "usbwarp: complete for unknown txn %u\n",
-			 msg->hdr.transaction_id);
+	u32 n;
+	int status;
+    if (usbwarp_stage_zlp(w, msg)) return;
+    p = take_urb(w, &msg->hdr, false);
+	if (!p)
 		return;
+	urb = p->urb;
+	n = msg->actual_length;
+	status = status_to_errno(msg->status);
+	if (msg->device_id != p->device_id || msg->endpoint != usb_pipeendpoint(urb->pipe) ||
+	    n > urb->transfer_buffer_length || msg->data_mode > USBWARP_DATA_INLINE ||
+	    (msg->data_mode == USBWARP_DATA_INLINE &&
+	     (n > USBWARP_INLINE_DATA_SIZE || (!usb_pipeout(urb->pipe) &&
+	      msg->hdr.message_length < USBWARP_MSG_URB_COMPLETE_BASE_SIZE + n))) ||
+	    (msg->data_mode == USBWARP_DATA_BUFFER &&
+	     (p->buffer_index < 0 || msg->buffer_offset != usbwarp_buf_offset(w, p->buffer_index))) ||
+	    (n && msg->data_mode == USBWARP_DATA_NONE)) {
+		status = -EPROTO;
+		n = 0;
 	}
-
-	/* Validate device_id matches what we expect. */
-	if (msg->hdr.device_id != priv->device_id) {
-		dev_warn(&w->pdev->dev,
-			 "usbwarp: complete dev_id mismatch: msg=%u priv=%u\n",
-			 msg->hdr.device_id, priv->device_id);
-		return;
+	/* Short/error transfers can contain valid partial IN data. */
+	if (n && !usb_pipeout(urb->pipe)) {
+        size_t copied = usbwarp_copy_urb_data(urb, 0, (void *)msg->inline_data,
+            msg->data_mode == USBWARP_DATA_BUFFER ? usbwarp_buf_addr(w, p->buffer_index) : NULL,
+            n, true);
+        if (copied != n) { status = -EFAULT; n = 0; }
 	}
-
-	/* CAS → DEAD. */
-	old_state = atomic_read(&priv->state);
-	if (old_state == URB_STATE_DEAD)
-		return;
-
-	if (atomic_cmpxchg(&priv->state, old_state, URB_STATE_DEAD)
-	    != old_state)
-		return;
-
-	del_timer_sync(&priv->timeout_timer);
-
-	urb = priv->urb;
-
-	/* Validate actual_length: must not exceed transfer_buffer_length. */
-	actual_len = msg->actual_length;
-	if (actual_len > urb->transfer_buffer_length)
-		actual_len = urb->transfer_buffer_length;
-
-	/* Map protocol status to Linux errno. */
-	switch (msg->status) {
-	case USBWARP_STATUS_SUCCESS:       urb_status = 0;            break;
-	case USBWARP_STATUS_CANCELLED:     urb_status = -ECONNRESET;  break;
-	case USBWARP_STATUS_STALL:         urb_status = -EPIPE;       break;
-	case USBWARP_STATUS_TIMEOUT:       urb_status = -ETIMEDOUT;   break;
-	case USBWARP_STATUS_SHORT_PACKET:  urb_status = -EREMOTEIO;   break;
-	case USBWARP_STATUS_DISCONNECTED:  urb_status = -ESHUTDOWN;   break;
-	case USBWARP_STATUS_OVERFLOW:      urb_status = -EOVERFLOW;   break;
-	case USBWARP_STATUS_NO_RESOURCE:   urb_status = -ENOMEM;      break;
-	case USBWARP_STATUS_SHUTDOWN:      urb_status = -ESHUTDOWN;   break;
-	default:                           urb_status = -EPROTO;      break;
-	}
-
-	urb->actual_length = actual_len;
-	urb->status        = urb_status;
-
-	/* Copy IN data from shared memory to URB transfer_buffer. */
-	if (urb_status == 0 && !usb_pipeout(urb->pipe) &&
-	    actual_len > 0 && urb->transfer_buffer) {
-		if (msg->data_mode == USBWARP_DATA_INLINE) {
-			uint32_t copy_len = min_t(uint32_t,
-						  actual_len,
-						  USBWARP_INLINE_DATA_SIZE);
-			memcpy(urb->transfer_buffer, msg->inline_data,
-			       copy_len);
-		} else if (msg->data_mode == USBWARP_DATA_BUFFER &&
-			   priv->buffer_index >= 0) {
-			uint32_t copy_len = min_t(uint32_t,
-						  actual_len,
-						  urb->transfer_buffer_length);
-			memcpy_fromio(urb->transfer_buffer,
-				      usbwarp_buf_addr(w, priv->buffer_index),
-				      copy_len);
-		}
-	}
-
-	/* Free Data Region buffer + update per-device counter. */
-	if (priv->buffer_index >= 0) {
-		usbwarp_buf_free(w, priv->buffer_index);
-		wdev = usbwarp_get_device(w, priv->device_id);
-		if (wdev)
-			atomic_dec(&wdev->buf_in_use);
-	}
-
-	/* Update per-device pending count. */
-	wdev = usbwarp_get_device(w, priv->device_id);
-	if (wdev)
-		atomic_dec(&wdev->pending_urbs);
-
-	urb_table_remove(w, priv);
-
-	usb_hcd_giveback_urb(warp_to_hcd(w), urb, urb_status);
-
-	urb->hcpriv = NULL;
-	kfree(priv);
+	urb->actual_length = p->zlp_stage ? p->saved_actual : n;
+	finish_urb(w, p, status);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §7  Cancel all pending URBs for a device (issue #2 fix)
- *
- *   Called from usbwarp_handle_device_removed before clearing the device
- *   slot.  Walks the hash table, finds all URBs with matching device_id,
- *   marks them DEAD, and gives them back to USB Core with -ESHUTDOWN.
- * ═══════════════════════════════════════════════════════════════════════════ */
+void usbwarp_complete_iso_urb(struct usbwarp_hcd *w,
+		const struct usbwarp_msg_iso_complete *msg, uint32_t msg_len)
+{
+	struct usbwarp_urb_priv *p = take_urb(w, &msg->hdr, true);
+	const struct usbwarp_iso_packet_result *results = usbwarp_iso_results_const(msg);
+	struct urb *urb;
+	u32 i, off = 0, actual = 0;
+	int status;
+	bool valid;
+	if (!p)
+		return;
+	urb = p->urb;
+	status = status_to_errno(msg->status);
+	valid = usbwarp_iso_complete_valid(msg, msg_len) &&
+		msg->endpoint == usb_pipeendpoint(urb->pipe) &&
+		msg->number_of_packets == p->number_of_packets &&
+		(msg->data_mode == USBWARP_DATA_BUFFER && p->buffer_index >= 0 &&
+		 msg->buffer_offset == usbwarp_buf_offset(w, p->buffer_index));
+	if (!valid && !status)
+		status = -EPROTO;
+	urb->error_count = 0;
+	for (i = 0; i < p->number_of_packets; ++i) {
+		struct usb_iso_packet_descriptor *d = &urb->iso_frame_desc[i];
+		u32 n = valid ? results[i].actual_length : 0;
+		int ps = valid ? status_to_errno(results[i].status) : status;
+		if (n > d->length) { n = 0; ps = -EOVERFLOW; }
+        if (n && !usb_pipeout(urb->pipe) && usbwarp_copy_urb_data(urb, d->offset, NULL,
+            usbwarp_buf_addr(w, p->buffer_index) + off, n, true) != n) {
+            n = 0;
+            ps = -EFAULT;
+        }
+        if (ps) ++urb->error_count;
+        d->actual_length = n;
+        d->status = ps;
+		off += d->length;
+		actual += n;
+	}
+	urb->actual_length = actual;
+	/* Windows reports frames, Linux HS ISO URBs report microframes. */
+	urb->start_frame = msg->start_frame * (urb->dev->speed >= USB_SPEED_HIGH ? 8 : 1);
+	finish_urb(w, p, status);
+}
 
 void usbwarp_cancel_device_urbs(struct usbwarp_hcd *w, uint32_t device_id)
 {
-	struct usbwarp_urb_priv *priv;
+	struct usbwarp_urb_priv *p, *next;
 	struct hlist_node *tmp;
 	unsigned long flags;
-	int bkt;
-	struct usbwarp_device *wdev;
-	LIST_HEAD(giveback_list);
-
-	/* Collect URBs to give back (can't call giveback under urb_lock). */
+	int bkt, i;
+	LIST_HEAD(done);
 	spin_lock_irqsave(&w->urb_lock, flags);
-	hash_for_each_safe(w->urb_table, bkt, tmp, priv, hash_node) {
-		if (priv->device_id != device_id)
+	/* Prevent a completion callback from submitting another URB on removal. */
+	w->devices[device_id - 1].connected = false;
+    if (w->config_txn && w->config_device == device_id) {
+        w->config_status = -ESHUTDOWN;
+        complete(&w->config_done);
+    }
+	hash_for_each_safe(w->urb_table, bkt, tmp, p, hash_node) {
+		if (p->device_id != device_id)
 			continue;
-
-		/* Force to DEAD regardless of current state. */
-		atomic_set(&priv->state, URB_STATE_DEAD);
-		hash_del(&priv->hash_node);
-		atomic_dec(&w->total_pending);
-
-		/* Move to local list via the dedicated cancel_node member. */
-		list_add_tail(&priv->cancel_node, &giveback_list);
+		hash_del(&p->hash_node);
+        if (p->queued) atomic_dec(&w->tx_pending);
+		p->urb->hcpriv = NULL;
+		usb_hcd_unlink_urb_from_ep(bus_to_hcd(p->urb->dev->bus), p->urb);
+		list_add_tail(&p->cancel_node, &done);
 	}
 	spin_unlock_irqrestore(&w->urb_lock, flags);
-
-	/* Give back collected URBs outside the lock. */
-	while (!list_empty(&giveback_list)) {
-		priv = list_first_entry(&giveback_list,
-					struct usbwarp_urb_priv, cancel_node);
-		list_del(&priv->cancel_node);
-
-		del_timer_sync(&priv->timeout_timer);
-
-		if (priv->buffer_index >= 0) {
-			usbwarp_buf_free(w, priv->buffer_index);
-			wdev = usbwarp_get_device(w, device_id);
-			if (wdev)
-				atomic_dec(&wdev->buf_in_use);
+	list_for_each_entry_safe(p, next, &done, cancel_node) {
+		list_del(&p->cancel_node);
+		p->urb->actual_length = p->saved_actual;
+		p->urb->error_count = p->number_of_packets;
+		for (i = 0; i < p->number_of_packets; ++i) {
+			p->urb->iso_frame_desc[i].actual_length = 0;
+			p->urb->iso_frame_desc[i].status = -ESHUTDOWN;
 		}
-
-		wdev = usbwarp_get_device(w, device_id);
-		if (wdev)
-			atomic_dec(&wdev->pending_urbs);
-
-		priv->urb->status = -ESHUTDOWN;
-		priv->urb->actual_length = 0;
-		usb_hcd_giveback_urb(warp_to_hcd(w), priv->urb, -ESHUTDOWN);
-		priv->urb->hcpriv = NULL;
-		kfree(priv);
+		finish_urb(w, p, -ESHUTDOWN);
 	}
 }
 
 void usbwarp_shutdown_all_devices(struct usbwarp_hcd *w, uint32_t reason)
 {
-	unsigned long flags;
-	bool changed = false;
-	int i;
-
-	WRITE_ONCE(w->shutting_down, true);
-
-	for (i = 0; i < USBWARP_MAX_PORTS; i++)
-		usbwarp_cancel_device_urbs(w, i + 1);
-
-	spin_lock_irqsave(&w->dev_lock, flags);
-	for (i = 0; i < USBWARP_MAX_PORTS; i++) {
-		if (!w->devices[i].connected &&
-		    !(w->port_status[i] & USB_PORT_STAT_CONNECTION))
-			continue;
-
-		w->devices[i].connected = false;
-		w->devices[i].usb_addr  = 0;
-		atomic_set(&w->devices[i].pending_urbs, 0);
-		atomic_set(&w->devices[i].buf_in_use, 0);
-
-		w->port_status[i] = USB_PORT_STAT_POWER |
-				     (USB_PORT_STAT_C_CONNECTION << 16);
-		set_bit(i, &w->port_change);
-		changed = true;
-	}
-	w->device_count = 0;
-	spin_unlock_irqrestore(&w->dev_lock, flags);
-
-	if (changed)
-		usb_hcd_poll_rh_status(warp_to_hcd(w));
-
-	dev_info(&w->pdev->dev,
-		 "usbwarp: all devices detached for host shutdown reason=%u\n",
-		 reason);
+    unsigned long flags;
+    unsigned int bus, i;
+    WRITE_ONCE(w->shutting_down, true);
+    for (i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
+        usbwarp_cancel_device_urbs(w, i + 1);
+    spin_lock_irqsave(&w->dev_lock, flags);
+    for (bus = 0; bus < 2; ++bus) {
+        struct usbwarp_roothub *rh = hcd_to_rh(w->hcd[bus]);
+        for (i = 0; i < rh->num_ports; ++i) {
+            rh->device_id[i] = 0;
+            rh->port_status[i] = (bus ? USB_SS_PORT_STAT_POWER : USB_PORT_STAT_POWER) |
+                                (USB_PORT_STAT_C_CONNECTION << 16);
+        }
+    }
+    w->device_count = 0;
+    spin_unlock_irqrestore(&w->dev_lock, flags);
+    usb_hcd_poll_rh_status(w->hcd[0]);
+    usb_hcd_poll_rh_status(w->hcd[1]);
+    dev_info(&w->pdev->dev, "usbwarp: shutdown reason=%u\n", reason);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §8  Root hub emulation
- *
- *   FIX: hub_status_data bitmap: bit 0 = hub change (always 0 for us),
- *   bit N = port N (1-based).  So port index i maps to bit (i+1).
- *
- *   FIX: Set usb_addr on port reset — USB Core reads the device address
- *   from the port during enumeration after SET_ADDRESS succeeds.
- *   We record the mapping in the address_change callback.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static const u8 usbwarp_rh_desc[] = {
-	0x09,                   /* bLength            */
-	USB_DT_HUB,            /* bDescriptorType    */
-	USBWARP_MAX_PORTS,     /* bNbrPorts          */
-	0x00, 0x00,             /* wHubCharacteristics */
-	0x01,                   /* bPwrOn2PwrGood     */
-	0x00,                   /* bHubContrCurrent   */
-	0x00,                   /* DeviceRemovable    */
-	0xff,                   /* PortPwrCtrlMask    */
-};
-
-static int usbwarp_hub_status_data(struct usb_hcd *hcd, char *buf)
+void usbwarp_handle_device_added(struct usbwarp_hcd *w, const struct usbwarp_msg_device_added *msg)
 {
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	int i, changed = 0;
-	/* Bitmap size: need (USBWARP_MAX_PORTS + 1) bits.
-	 * bit 0 = hub status change (always 0).
-	 * bit i+1 = port i change.                         */
-	int nbytes = (USBWARP_MAX_PORTS + 1 + 7) / 8;
-
-	memset(buf, 0, nbytes);
-
-	for (i = 0; i < USBWARP_MAX_PORTS; i++) {
-		if (test_and_clear_bit(i, &w->port_change)) {
-			/* Port i change → bit (i+1) in the bitmap. */
-			buf[(i + 1) / 8] |= 1 << ((i + 1) % 8);
-			changed = 1;
-		}
-	}
-
-	return changed ? nbytes : 0;
+    u32 id = msg->device_id;
+    unsigned long flags;
+    struct usbwarp_msg_device_ack ack = { 0 };
+    struct usbwarp_device *dev;
+    struct usb_hcd *hcd;
+    struct usbwarp_roothub *rh;
+    unsigned int port;
+    bool ss = usbwarp_speed_is_super(msg->speed);
+    int status = USBWARP_STATUS_SUCCESS;
+    if (!id || id > USBWARP_MAX_DEVICES_LIMIT || msg->speed < USBWARP_SPEED_LOW || msg->speed > USBWARP_SPEED_MAX)
+        return;
+    hcd = w->hcd[ss ? 1 : 0];
+    rh = hcd_to_rh(hcd);
+    dev = &w->devices[id - 1];
+    spin_lock_irqsave(&w->dev_lock, flags);
+    spin_lock(&w->urb_lock);
+    if (dev->connected) { status = USBWARP_STATUS_INVALID_PARAM; goto unlock; }
+    for (port = 0; port < rh->num_ports; ++port)
+        if (!rh->device_id[port]) break;
+    if (port == rh->num_ports) { status = USBWARP_STATUS_NO_RESOURCE; goto unlock; }
+    dev->device_id = id;
+    dev->epoch = msg->hdr.flags;
+    ++dev->generation;
+    dev->udev = NULL;
+    dev->hcd = hcd;
+    dev->port = port + 1;
+    dev->connected = true;
+    dev->vendor_id = msg->vendor_id;
+    dev->product_id = msg->product_id;
+    dev->speed = msg->speed;
+    dev->usb_addr = 0;
+    atomic_set(&dev->pending_urbs, 0);
+    atomic_set(&dev->buf_in_use, 0);
+    ++w->device_count;
+    rh->device_id[port] = id;
+    rh->port_status[port] = USB_PORT_STAT_CONNECTION | (USB_PORT_STAT_C_CONNECTION << 16) |
+                           (ss ? USB_SS_PORT_STAT_POWER | USB_PORT_STAT_ENABLE : USB_PORT_STAT_POWER);
+    if (msg->speed == USBWARP_SPEED_LOW) rh->port_status[port] |= USB_PORT_STAT_LOW_SPEED;
+    if (msg->speed == USBWARP_SPEED_HIGH) rh->port_status[port] |= USB_PORT_STAT_HIGH_SPEED;
+unlock:
+    spin_unlock(&w->urb_lock);
+    spin_unlock_irqrestore(&w->dev_lock, flags);
+    if (!status) usb_hcd_poll_rh_status(hcd);
+    fill_msg_header(&ack.hdr, USBWARP_MSG_DEVICE_ADD_ACK, id, 0, sizeof(ack));
+    ack.device_id = id;
+    ack.status = status;
+    usbwarp_ring_produce(&w->g2h, &ack, sizeof(ack));
 }
 
-/* Called by USB Core to set the USB address on a device after SET_ADDRESS. */
-void usbwarp_set_usb_addr(struct usbwarp_hcd *w, unsigned int port,
-			   int usb_addr)
+void usbwarp_handle_device_removed(struct usbwarp_hcd *w, const struct usbwarp_msg_device_removed *msg)
 {
-	unsigned long flags;
-
-	if (port >= USBWARP_MAX_PORTS)
-		return;
-
-	spin_lock_irqsave(&w->dev_lock, flags);
-	if (w->devices[port].connected)
-		w->devices[port].usb_addr = usb_addr;
-	spin_unlock_irqrestore(&w->dev_lock, flags);
+    u32 id = msg->device_id;
+    struct usbwarp_device *dev;
+    struct usb_hcd *hcd;
+    struct usbwarp_roothub *rh;
+    struct usbwarp_msg_device_ack ack = { 0 };
+    unsigned long flags;
+    unsigned int port;
+    if (!id || id > USBWARP_MAX_DEVICES_LIMIT) return;
+    dev = &w->devices[id - 1];
+    if (!dev->connected || dev->epoch != msg->hdr.flags) return;
+    hcd = dev->hcd;
+    rh = hcd_to_rh(hcd);
+    port = dev->port - 1;
+    usbwarp_cancel_device_urbs(w, id);
+    spin_lock_irqsave(&w->dev_lock, flags);
+    rh->device_id[port] = 0;
+    rh->port_status[port] = (usbwarp_is_usb3(hcd) ? USB_SS_PORT_STAT_POWER : USB_PORT_STAT_POWER) |
+                           (USB_PORT_STAT_C_CONNECTION << 16);
+    if (w->device_count) --w->device_count;
+    spin_unlock_irqrestore(&w->dev_lock, flags);
+    usb_hcd_poll_rh_status(hcd);
+    fill_msg_header(&ack.hdr, USBWARP_MSG_DEVICE_REMOVE_ACK, id, 0, sizeof(ack));
+    ack.device_id = id;
+    usbwarp_ring_produce(&w->g2h, &ack, sizeof(ack));
 }
 
-static int usbwarp_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
-			       u16 wIndex, char *buf, u16 wLength)
+static int usbwarp_enable_device(struct usb_hcd *hcd, struct usb_device *udev)
 {
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	unsigned port = wIndex - 1;   /* wIndex is 1-based */
-
-	switch (typeReq) {
-	case GetHubDescriptor:
-		if (wLength < sizeof(usbwarp_rh_desc))
-			return -EINVAL;
-		memcpy(buf, usbwarp_rh_desc, sizeof(usbwarp_rh_desc));
-		return 0;
-
-	case GetHubStatus:
-		memset(buf, 0, 4);
-		return 0;
-
-	case GetPortStatus:
-		if (port >= USBWARP_MAX_PORTS)
-			return -EPIPE;
-		((u32 *)buf)[0] = cpu_to_le32(w->port_status[port]);
-		return 0;
-
-	case SetPortFeature:
-		if (port >= USBWARP_MAX_PORTS)
-			return -EPIPE;
-		switch (wValue) {
-		case USB_PORT_FEAT_POWER:
-			w->port_status[port] |= USB_PORT_STAT_POWER;
-			return 0;
-		case USB_PORT_FEAT_RESET:
-			/* Simulate reset complete.  After reset, USB Core
-			 * will assign a USB address via SET_ADDRESS.  We
-			 * record the mapping later via address_change. */
-			w->port_status[port] |= USB_PORT_STAT_RESET;
-			w->port_status[port] &= ~USB_PORT_STAT_RESET;
-			w->port_status[port] |= USB_PORT_STAT_ENABLE |
-						 (USB_PORT_STAT_C_RESET << 16);
-			set_bit(port, &w->port_change);
-			return 0;
-		default:
-			return 0;
-		}
-
-	case ClearPortFeature:
-		if (port >= USBWARP_MAX_PORTS)
-			return -EPIPE;
-		switch (wValue) {
-		case USB_PORT_FEAT_C_CONNECTION:
-			w->port_status[port] &=
-				~(USB_PORT_STAT_C_CONNECTION << 16);
-			return 0;
-		case USB_PORT_FEAT_C_RESET:
-			w->port_status[port] &=
-				~(USB_PORT_STAT_C_RESET << 16);
-			return 0;
-		case USB_PORT_FEAT_C_ENABLE:
-			w->port_status[port] &=
-				~(USB_PORT_STAT_C_ENABLE << 16);
-			return 0;
-		default:
-			return 0;
-		}
-
-	default:
-		return -EPIPE;
-	}
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §9  Device add / remove handlers
- *
- *   FIX (issue #3): Validate incoming message fields.
- *   FIX (issue #2): Cancel all pending URBs before clearing device slot.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-void usbwarp_handle_device_added(struct usbwarp_hcd *w,
-				 const struct usbwarp_msg_device_added *msg)
-{
-	uint32_t id = msg->device_id;
-	unsigned long flags;
-	struct usbwarp_msg_device_ack ack;
-
-	/* Validate device_id range. */
-	if (id == 0 || id > USBWARP_MAX_PORTS) {
-		dev_warn(&w->pdev->dev,
-			 "usbwarp: device_added bad id %u\n", id);
-		return;
-	}
-
-	/* Validate speed field. */
-	if (msg->speed > USBWARP_SPEED_SUPER) {
-		dev_warn(&w->pdev->dev,
-			 "usbwarp: device_added bad speed %u\n", msg->speed);
-		return;
-	}
-
-	spin_lock_irqsave(&w->dev_lock, flags);
-
-	w->devices[id - 1].device_id  = id;
-	w->devices[id - 1].connected  = true;
-	w->devices[id - 1].vendor_id  = msg->vendor_id;
-	w->devices[id - 1].product_id = msg->product_id;
-	w->devices[id - 1].speed      = msg->speed;
-	w->devices[id - 1].usb_addr   = 0;  /* set later by USB Core */
-	atomic_set(&w->devices[id - 1].pending_urbs, 0);
-	atomic_set(&w->devices[id - 1].buf_in_use, 0);
-	w->device_count++;
-
-	w->port_status[id - 1] = USB_PORT_STAT_CONNECTION |
-				  USB_PORT_STAT_POWER |
-				  (USB_PORT_STAT_C_CONNECTION << 16);
-
-	switch (msg->speed) {
-	case USBWARP_SPEED_LOW:
-		w->port_status[id - 1] |= USB_PORT_STAT_LOW_SPEED;
-		break;
-	case USBWARP_SPEED_HIGH:
-		w->port_status[id - 1] |= USB_PORT_STAT_HIGH_SPEED;
-		break;
-	case USBWARP_SPEED_SUPER:
-		/* No super-speed port bit exists on a USB2 root hub —
-		 * enumerate as high-speed (best effort). */
-		w->port_status[id - 1] |= USB_PORT_STAT_HIGH_SPEED;
-		dev_info(&w->pdev->dev,
-			 "usbwarp: SS device id=%u enumerated as high-speed\n",
-			 id);
-		break;
-	default:
-		break;
-	}
-
-	set_bit(id - 1, &w->port_change);
-
-	spin_unlock_irqrestore(&w->dev_lock, flags);
-
-	usb_hcd_poll_rh_status(warp_to_hcd(w));
-
-	dev_info(&w->pdev->dev,
-		 "usbwarp: device added id=%u VID=%04x PID=%04x speed=%u\n",
-		 id, msg->vendor_id, msg->product_id, msg->speed);
-
-	memset(&ack, 0, sizeof(ack));
-	fill_msg_header(&ack.hdr, USBWARP_MSG_DEVICE_ADD_ACK, id, 0,
-			sizeof(ack));
-	ack.device_id = id;
-	ack.status    = 0;
-	usbwarp_ring_produce(&w->g2h, &ack, sizeof(ack));
-}
-
-void usbwarp_handle_device_removed(struct usbwarp_hcd *w,
-				   const struct usbwarp_msg_device_removed *msg)
-{
-	uint32_t id = msg->device_id;
-	unsigned long flags;
-	struct usbwarp_msg_device_ack ack;
-
-	if (id == 0 || id > USBWARP_MAX_PORTS)
-		return;
-
-	/* Cancel all pending URBs for this device FIRST. */
-	usbwarp_cancel_device_urbs(w, id);
-
-	spin_lock_irqsave(&w->dev_lock, flags);
-
-	w->devices[id - 1].connected = false;
-	w->devices[id - 1].usb_addr  = 0;
-	if (w->device_count > 0)
-		w->device_count--;
-
-	w->port_status[id - 1] = USB_PORT_STAT_POWER |
-				  (USB_PORT_STAT_C_CONNECTION << 16);
-	set_bit(id - 1, &w->port_change);
-
-	spin_unlock_irqrestore(&w->dev_lock, flags);
-
-	usb_hcd_poll_rh_status(warp_to_hcd(w));
-
-	dev_info(&w->pdev->dev,
-		 "usbwarp: device removed id=%u reason=%u\n",
-		 id, msg->reason);
-
-	memset(&ack, 0, sizeof(ack));
-	fill_msg_header(&ack.hdr, USBWARP_MSG_DEVICE_REMOVE_ACK, id, 0,
-			sizeof(ack));
-	ack.device_id = id;
-	ack.status    = 0;
-	usbwarp_ring_produce(&w->g2h, &ack, sizeof(ack));
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §10  HCD callbacks: address_device — capture USB address mapping
- *
- *   When USB Core completes SET_ADDRESS for a new device, it calls
- *   address_device if provided, or we intercept via the alloc_dev_fn.
- *   Since the virtual HCD doesn't do real USB transactions, we use
- *   the hub_control RESET completion to detect the port, then match
- *   during the first URB enqueue.
- *
- *   Alternative: implement .address_device callback.  For now, we
- *   scan at enqueue time and set usb_addr on first successful match
- *   via the alloc_dev/free_dev hooks.
- *
- *   SIMPLIFIED APPROACH: In alloc_dev, the USB Core tells us the
- *   devnum.  We match it to the most recently reset port.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int usbwarp_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
-{
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-
-	/* Root hub itself: always succeed. */
-	if (!udev->parent)
-		return 1;
-
-	/* udev->portnum is 1-based.  Map to our 0-based port index. */
-	if (udev->portnum >= 1 && udev->portnum <= USBWARP_MAX_PORTS) {
-		unsigned int port = udev->portnum - 1;
-
-		if (w->devices[port].connected) {
-			/* Record the USB address → device_id mapping.
-			 * At this point udev->devnum may be 0 (not yet
-			 * assigned).  We store portnum for now and update
-			 * devnum later via .address_device or lazily in
-			 * urb_enqueue. */
-			dev_dbg(&w->pdev->dev,
-				"usbwarp: alloc_dev port=%u devnum=%u\n",
-				udev->portnum, udev->devnum);
-		}
-	}
-
-	return 1;  /* 1 = success in alloc_dev */
+    struct usbwarp_hcd *w = hcd_to_warp(hcd);
+    struct usbwarp_device *dev;
+    unsigned long flags;
+    u32 id;
+    int ret = -ENODEV;
+    if (!udev->parent) return 0;
+    if (udev->parent->parent) return -ENODEV;
+    spin_lock_irqsave(&w->dev_lock, flags);
+    spin_lock(&w->urb_lock);
+    id = usbwarp_find_devid_by_port(hcd, udev->portnum);
+    if (id) {
+        dev = &w->devices[id - 1];
+        if (dev->connected && dev->hcd == hcd && (!dev->udev || dev->udev == udev)) {
+            dev->udev = udev;
+            ret = 0;
+        }
+    }
+    spin_unlock(&w->urb_lock);
+    spin_unlock_irqrestore(&w->dev_lock, flags);
+    return ret;
 }
 
 static void usbwarp_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
 {
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-	unsigned long flags;
-	unsigned int i;
-
-	if (!udev->parent)
-		return;
-
-	/* Clear USB address mapping. */
-	spin_lock_irqsave(&w->dev_lock, flags);
-	for (i = 0; i < USBWARP_MAX_PORTS; i++) {
-		if (w->devices[i].connected &&
-		    w->devices[i].usb_addr == udev->devnum) {
-			w->devices[i].usb_addr = 0;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&w->dev_lock, flags);
+    struct usbwarp_hcd *w = hcd_to_warp(hcd);
+    unsigned long flags;
+    unsigned int i;
+    spin_lock_irqsave(&w->urb_lock, flags);
+    for (i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
+        if (w->devices[i].udev == udev) w->devices[i].udev = NULL;
+    spin_unlock_irqrestore(&w->urb_lock, flags);
 }
 
-static int usbwarp_address_device(struct usb_hcd *hcd, struct usb_device *udev,
-				  unsigned int timeout_ms)
+static int usbwarp_address_device(struct usb_hcd *hcd, struct usb_device *udev, unsigned int timeout_ms)
 {
-	struct usbwarp_hcd *w = hcd_to_warp(hcd);
-
-	(void)timeout_ms;
-	if (udev->parent && udev->portnum >= 1 &&
-	    udev->portnum <= USBWARP_MAX_PORTS) {
-		unsigned int port = udev->portnum - 1;
-
-		/* NOTE: udev->devnum is 0 here!  Linux USB core calls
-		 * address_device() BEFORE update_devnum().  We must NOT
-		 * store usb_addr=0 as that would overwrite any valid
-		 * mapping.  The real address will be captured lazily in
-		 * urb_enqueue when the first URB arrives at the new
-		 * address and falls through to port-based lookup. */
-		if (udev->devnum != 0) {
-			usbwarp_set_usb_addr(w, port, udev->devnum);
-		}
-
-		dev_info(&w->pdev->dev,
-			 "usbwarp: address_device port=%u devnum=%u → devid=%u\n",
-			 udev->portnum, udev->devnum,
-			 w->devices[port].device_id);
-	}
-
-	return 0;
+    (void)timeout_ms;
+    /* Physical addresses stay owned by Windows. */
+    return usbwarp_enable_device(hcd, udev);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §11  HCD start / stop / stubs
- * ═══════════════════════════════════════════════════════════════════════════ */
+static int usbwarp_hcd_setup(struct usb_hcd *hcd)
+{
+    bool ss = usbwarp_is_usb3(hcd);
+    struct usbwarp_roothub *rh = hcd_to_rh(hcd);
+    rh->num_ports = ss ? USBWARP_USB3_PORTS : USBWARP_USB2_PORTS;
+    hcd->speed = ss ? HCD_USB32 : HCD_USB2;
+    hcd->self.root_hub->speed = ss ? USB_SPEED_SUPER_PLUS : USB_SPEED_HIGH;
+    if (ss) {
+        hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x2;
+        hcd->self.root_hub->rx_lanes = 2;
+        hcd->self.root_hub->tx_lanes = 2;
+    }
+    hcd->self.sg_tablesize = 128;
+    hcd->self.no_sg_constraint = 1;
+    hcd->can_do_streams = ss;
+    return 0;
+}
 
 static int usbwarp_hcd_start(struct usb_hcd *hcd)
 {
-	hcd->state = HC_STATE_RUNNING;
-	hcd->uses_new_polling = 1;
-	return 0;
+    hcd->state = HC_STATE_RUNNING;
+    hcd->uses_new_polling = 1;
+    return 0;
 }
-
-static void usbwarp_hcd_stop(struct usb_hcd *hcd)
+static void usbwarp_hcd_stop(struct usb_hcd *hcd) { (void)hcd; }
+static int usbwarp_bus_suspend(struct usb_hcd *hcd) { hcd->state = HC_STATE_SUSPENDED; return 0; }
+static int usbwarp_bus_resume(struct usb_hcd *hcd) { hcd->state = HC_STATE_RUNNING; return 0; }
+static void usbwarp_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep)
 {
-	(void)hcd;
+    (void)hcd; (void)ep; /* USB core has flushed its URB list before this callback. */
 }
-
-static void usbwarp_endpoint_disable(struct usb_hcd *hcd,
-				     struct usb_host_endpoint *ep)
-{
-	(void)hcd; (void)ep;
-}
-
 static int usbwarp_get_frame_number(struct usb_hcd *hcd)
 {
-	(void)hcd;
-	return 0;
+    (void)hcd;
+    return (ktime_get_ns() / NSEC_PER_MSEC) & 0x7ff;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §12  hc_driver table
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* Stream RPC callbacks are defined below; they execute in sleepable context. */
+static int usbwarp_alloc_streams(struct usb_hcd *, struct usb_device *,
+    struct usb_host_endpoint **, unsigned int, unsigned int, gfp_t);
+static int usbwarp_free_streams(struct usb_hcd *, struct usb_device *,
+    struct usb_host_endpoint **, unsigned int, gfp_t);
 
 const struct hc_driver usbwarp_hc_driver = {
-	.description       = "usbwarp-hcd",
-	.product_desc      = "UsbWarp Virtual Host Controller",
-	.hcd_priv_size     = sizeof(struct usbwarp_hcd),
-	.flags             = HCD_USB2,
-
-	.start             = usbwarp_hcd_start,
-	.stop              = usbwarp_hcd_stop,
-
-	.urb_enqueue       = usbwarp_urb_enqueue,
-	.urb_dequeue       = usbwarp_urb_dequeue,
-
-	.hub_status_data   = usbwarp_hub_status_data,
-	.hub_control       = usbwarp_hub_control,
-
-	.alloc_dev         = usbwarp_alloc_dev,
-	.free_dev          = usbwarp_free_dev,
-	.address_device    = usbwarp_address_device,
-
-	.endpoint_disable  = usbwarp_endpoint_disable,
-	.get_frame_number  = usbwarp_get_frame_number,
+    .description = "usbwarp-hcd",
+    .product_desc = "UsbWarp USB 2 / USB 3.2 Virtual Host Controller",
+    .hcd_priv_size = sizeof(struct usbwarp_roothub),
+    .flags = HCD_USB3 | HCD_SHARED | HCD_BH,
+    .reset = usbwarp_hcd_setup,
+    .start = usbwarp_hcd_start,
+    .stop = usbwarp_hcd_stop,
+    .urb_enqueue = usbwarp_urb_enqueue,
+    .urb_dequeue = usbwarp_urb_dequeue,
+    .hub_status_data = usbwarp_hub_status_data,
+    .hub_control = usbwarp_hub_control,
+    .enable_device = usbwarp_enable_device,
+    .free_dev = usbwarp_free_dev,
+    .address_device = usbwarp_address_device,
+    .endpoint_disable = usbwarp_endpoint_disable,
+    .get_frame_number = usbwarp_get_frame_number,
+    .bus_suspend = usbwarp_bus_suspend,
+    .bus_resume = usbwarp_bus_resume,
+    .alloc_streams = usbwarp_alloc_streams,
+    .free_streams = usbwarp_free_streams,
 };
+
+void usbwarp_complete_streams(struct usbwarp_hcd *w,
+                             const struct usbwarp_msg_streams_response *msg)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&w->urb_lock, flags);
+    if (w->config_txn && msg->hdr.transaction_id == w->config_txn &&
+        msg->hdr.device_id == w->config_device && msg->hdr.flags == w->config_epoch && w->config_status == -EINPROGRESS) {
+        w->config_status = status_to_errno(msg->status);
+        w->config_streams = msg->num_streams;
+        complete(&w->config_done);
+    }
+    spin_unlock_irqrestore(&w->urb_lock, flags);
+}
+
+static int streams_rpc(struct usb_hcd *hcd, struct usb_device *udev,
+                       struct usb_host_endpoint **eps, unsigned int num_eps,
+                       unsigned int count)
+{
+    struct usbwarp_hcd *w = hcd_to_warp(hcd);
+    struct usbwarp_msg_streams_request msg = { 0 };
+    unsigned long flags;
+    u32 id;
+    int ret;
+    unsigned int i;
+    if (!usbwarp_is_usb3(hcd) || !(w->negotiated_caps & USBWARP_CAP_STREAMS))
+        return -EOPNOTSUPP;
+    if (!num_eps || num_eps > 30 || in_interrupt()) return -EINVAL;
+    for (i = 0; i < num_eps; ++i) {
+        u32 bit = usbwarp_endpoint_mask(eps[i]->desc.bEndpointAddress);
+        if (!bit || (msg.endpoint_mask & bit) || !usb_endpoint_xfer_bulk(&eps[i]->desc))
+            return -EINVAL;
+        msg.endpoint_mask |= bit;
+    }
+    mutex_lock(&w->config_lock);
+    spin_lock_irqsave(&w->dev_lock, flags);
+    spin_lock(&w->urb_lock);
+    id = usbwarp_find_devid_by_port(hcd, udev->portnum);
+    if (!id || w->devices[id - 1].udev != udev || !w->devices[id - 1].connected ||
+        w->shutting_down || w->quiescing) {
+        ret = -ENODEV;
+        goto unlock;
+    }
+    fill_msg_header(&msg.hdr, USBWARP_MSG_STREAMS_REQUEST, id, next_txn_id(w), sizeof(msg));
+    msg.hdr.flags = w->devices[id - 1].epoch;
+    msg.num_streams = min(count, USBWARP_MAX_STREAMS);
+    reinit_completion(&w->config_done);
+    w->config_txn = msg.hdr.transaction_id;
+    w->config_device = id;
+    w->config_epoch = msg.hdr.flags;
+    w->config_status = -EINPROGRESS;
+    ret = usbwarp_ring_produce(&w->g2h, &msg, sizeof(msg));
+unlock:
+    spin_unlock(&w->urb_lock);
+    spin_unlock_irqrestore(&w->dev_lock, flags);
+    if (!ret) {
+        if (!wait_for_completion_timeout(&w->config_done, msecs_to_jiffies(30000))) {
+            /* State may have changed on the host. Stop new requests until a
+             * session restart rather than guess whether stream handles exist. */
+            WRITE_ONCE(w->quiescing, true);
+            ret = -ETIMEDOUT;
+        } else {
+            ret = w->config_status;
+            if (!ret && count) {
+                ret = w->config_streams;
+                if (ret <= 0 || ret > msg.num_streams) ret = -EPROTO;
+            }
+        }
+    }
+    spin_lock_irqsave(&w->urb_lock, flags);
+    w->config_txn = 0;
+    spin_unlock_irqrestore(&w->urb_lock, flags);
+    mutex_unlock(&w->config_lock);
+    return ret;
+}
+static int usbwarp_alloc_streams(struct usb_hcd *hcd, struct usb_device *dev,
+    struct usb_host_endpoint **eps, unsigned int num_eps, unsigned int count, gfp_t flags)
+{
+    (void)flags;
+    if (!count) return -EINVAL;
+    return streams_rpc(hcd, dev, eps, num_eps, count);
+}
+static int usbwarp_free_streams(struct usb_hcd *hcd, struct usb_device *dev,
+    struct usb_host_endpoint **eps, unsigned int num_eps, gfp_t flags)
+{
+    (void)flags;
+    return streams_rpc(hcd, dev, eps, num_eps, 0);
+}

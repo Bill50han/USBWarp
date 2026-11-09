@@ -16,7 +16,7 @@
 #ifndef USBWARP_FILTER_IOCTL_H
 #define USBWARP_FILTER_IOCTL_H
 
-#include "usbwarp_shared.h"
+#include "usbwarp_iso.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Device interface GUID
@@ -53,6 +53,26 @@ DEFINE_GUID(GUID_USBWARP_FILTER_INTERFACE,
 #define IOCTL_USBWARP_FILTER_GET_DESCRIPTOR \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_USBWARP_FILTER_SUBMIT_ISO \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBWARP_FILTER_SELECT_INTERFACE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBWARP_FILTER_STREAMS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBWARP_FILTER_RESET_PIPE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* A capture is a single kernel file object's lease on one PnP incarnation.
+ * Closing that file retires the incarnation; another lease requires a port
+ * cycle. This handshake deliberately rejects the old transparent filter. */
+#define USBWARP_CAPTURE_VERSION 1u
+#define IOCTL_USBWARP_FILTER_CLAIM \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
+typedef struct _USBWARP_FILTER_CLAIM {
+    uint32_t Version;
+    uint32_t Reserved;
+} USBWARP_FILTER_CLAIM;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §3  SUBMIT_URB request / response
  *
@@ -63,6 +83,7 @@ DEFINE_GUID(GUID_USBWARP_FILTER_INTERFACE,
 
 /* Transfer types (same as usbwarp_shared.h enum values). */
 #define USBWARP_FXFER_CONTROL      0
+#define USBWARP_FXFER_ISO          1
 #define USBWARP_FXFER_BULK         2
 #define USBWARP_FXFER_INTERRUPT    3
 
@@ -85,7 +106,17 @@ typedef struct _USBWARP_FILTER_URB_REQUEST {
      * Required for BULK/INTERRUPT transfers.  64-bit to avoid truncation
      * of USBD_PIPE_HANDLE on 64-bit systems. */
     uint64_t PipeHandle;          /* USBD_PIPE_HANDLE as uint64_t       */
+    uint32_t StreamId;           /* 0=ordinary pipe, otherwise 1..N */
+    uint32_t Reserved;
 } USBWARP_FILTER_URB_REQUEST;
+
+typedef struct _USBWARP_FILTER_STREAMS_REQUEST {
+    uint32_t EndpointMask;
+    uint32_t NumberOfStreams;
+} USBWARP_FILTER_STREAMS_REQUEST;
+typedef struct _USBWARP_FILTER_STREAMS_RESPONSE {
+    uint32_t NumberOfStreams;
+} USBWARP_FILTER_STREAMS_RESPONSE;
 
 typedef struct _USBWARP_FILTER_URB_RESPONSE {
     int32_t  NtStatus;            /* NTSTATUS from USB stack             */
@@ -94,6 +125,31 @@ typedef struct _USBWARP_FILTER_URB_RESPONSE {
     uint32_t Reserved;
     /* For IN transfers: data follows if KernelVa was NULL (inline path) */
 } USBWARP_FILTER_URB_RESPONSE;
+
+typedef struct _USBWARP_FILTER_ISO_REQUEST {
+    uint64_t KernelVa;
+    uint64_t PipeHandle;
+    uint32_t Endpoint;
+    uint32_t Direction;
+    uint32_t TransferLength;
+    uint32_t NumberOfPackets;
+    uint32_t Speed;
+    uint32_t Interval;
+    /* struct usbwarp_iso_packet_desc packets[NumberOfPackets] follows */
+} USBWARP_FILTER_ISO_REQUEST;
+
+typedef struct _USBWARP_FILTER_ISO_RESPONSE {
+    int32_t NtStatus;
+    int32_t UsbdStatus;
+    uint32_t NumberOfPackets;
+    uint32_t StartFrame;
+    /* usbwarp_iso_packet_result follows; status is raw USBD_STATUS here */
+} USBWARP_FILTER_ISO_RESPONSE;
+
+typedef struct _USBWARP_FILTER_SELECT_INTERFACE_REQUEST {
+    uint32_t InterfaceNumber;
+    uint32_t AlternateSetting;
+} USBWARP_FILTER_SELECT_INTERFACE_REQUEST;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §4  GET_PIPES response
@@ -107,7 +163,10 @@ typedef struct _USBWARP_FILTER_PIPE_INFO {
     uint8_t  EndpointAddress;     /* e.g. 0x81 = EP1 IN                 */
     uint8_t  PipeType;            /* UsbdPipeTypeBulk/Interrupt/...      */
     uint16_t MaxPacketSize;
-    uint32_t _pad;
+    uint8_t  InterfaceNumber;
+    uint8_t  AlternateSetting;
+    uint8_t  Interval;
+    uint8_t  Reserved;
     uint64_t PipeHandle;          /* USBD_PIPE_HANDLE as uint64_t       */
 } USBWARP_FILTER_PIPE_INFO;
 
@@ -142,6 +201,8 @@ typedef struct _USBWARP_FILTER_GET_DESC_REQUEST {
 
 typedef struct _USBWARP_FILTER_SELECT_CONFIG_REQUEST {
     uint32_t ConfigIndex;         /* usually 0                           */
+    uint32_t ConfigurationValue;  /* 0=unconfigure; ignored if ByValue=0 */
+    uint32_t ByValue;             /* standard SET_CONFIGURATION request */
 } USBWARP_FILTER_SELECT_CONFIG_REQUEST;
 
 /* Response: USBWARP_FILTER_PIPES_RESPONSE */

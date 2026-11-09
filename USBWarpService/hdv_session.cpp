@@ -12,6 +12,8 @@
 #include "warp_service.h"
 #include <stdio.h>
 #include <string.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Dynamic API loading (unchanged)
@@ -28,8 +30,8 @@
 BOOL HdvLoadApis(struct usbwarp_hdv_api *api)
 {
     memset(api, 0, sizeof(*api));
-    api->hComputeCore  = LoadLibraryA("computecore.dll");
-    api->hVmDeviceHost = LoadLibraryA("vmdevicehost.dll");
+    api->hComputeCore  = LoadLibraryExW(L"computecore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    api->hVmDeviceHost = LoadLibraryExW(L"vmdevicehost.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 
     if (!api->hComputeCore) {
         LogError("Failed to load computecore.dll (%lu)", GetLastError());
@@ -49,6 +51,9 @@ BOOL HdvLoadApis(struct usbwarp_hdv_api *api)
     LOAD_OR_FAIL(hdv, "HdvTeardownDeviceHost",           T_HdvTeardownDeviceHost,           HdvTeardownHost);
     LOAD_OR_FAIL(hdv, "HdvCreateDeviceInstance",         T_HdvCreateDeviceInstance,         HdvCreateDevice);
     LOAD_OR_FAIL(hdv, "HdvCreateSectionBackedMmioRange", T_HdvCreateSectionBackedMmioRange, HdvCreateMmio);
+    LOAD_OR_FAIL(hdv, "HdvDestroySectionBackedMmioRange", T_HdvDestroySectionBackedMmioRange, HdvDestroyMmio);
+    api->HdvRegisterDoorbell = (T_HdvRegisterDoorbell)GetProcAddress(hdv,"HdvRegisterDoorbell");
+    api->HdvUnregisterDoorbell = (T_HdvUnregisterDoorbell)GetProcAddress(hdv,"HdvUnregisterDoorbell");
 
     LogInfo("HCS/HDV APIs loaded (computecore=%p  vmdevicehost=%p)",
             (void *)cc, (void *)api->hVmDeviceHost);
@@ -74,11 +79,24 @@ static void InitConfigSpace(struct warp_session *s)
     s->bar0_mask    = ~(s->cfg.shm_size - 1u);
     s->bar0_probing = false;
 
-    /* 0x04: Status bit 4 (Capabilities List) = 1 */
-    s->pci_cfg[0x04 / 4] = 0x00100000;
+    // A 64-bit BAR avoids the tiny low-MMIO aperture in WSL utility VMs.
+    s->pci_cfg[0x10 / 4] = 0xc; // 64-bit, prefetchable coherent RAM
+    s->pci_cfg[0x18 / 4] = s->doorbellEvent ? 0x4 : 0;
     s->pci_cfg[0x0C / 4] = 0x00000000;
     s->pci_cfg[0x34 / 4] = 0x00000000;
     s->pci_cfg[0x3C / 4] = 0x00000100;
+    memset(s->msixTable, 0, sizeof(s->msixTable));
+    s->msixTable[12] = 1;
+    s->irqRevision = 0;
+    s->msixPresent = (s->driverCaps & USBWARP_DRIVER_CAP_H2G_IRQ) != 0;
+    if (s->msixPresent) {
+        s->pci_cfg[0x04 / 4] = 0x00100000;
+        s->pci_cfg[0x34 / 4] = 0x50;
+        s->pci_cfg[0x50 / 4] = 0x00000011; // MSI-X, one vector
+        s->pci_cfg[0x54 / 4] = 4;          // table: BAR4, offset 0
+        s->pci_cfg[0x58 / 4] = 0x804;      // PBA: BAR4, offset 0x800
+        s->pci_cfg[0x20 / 4] = 4;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -97,6 +115,7 @@ static void CALLBACK Cb_Teardown(void *ctx)
     struct warp_session *s = (struct warp_session *)ctx;
     LogInfo("[HDV] Teardown");
     s->hdv_torn_down = true;
+    if (s->memSpaceEvent) SetEvent(s->memSpaceEvent);
 }
 
 static HRESULT CALLBACK Cb_SetConfiguration(void *ctx, UINT32 count,
@@ -124,7 +143,13 @@ static HRESULT CALLBACK Cb_GetDetails(void *ctx, HDV_PCI_PNP_ID *pnp,
 
     UINT32 n = (barCount < HDV_PCI_BAR_COUNT) ? barCount : HDV_PCI_BAR_COUNT;
     memset(bars, 0, sizeof(UINT32) * n);
-    bars[0] = s->bar0_mask;
+    if (n < 2) return E_INVALIDARG;
+    bars[0] = s->bar0_mask | 0xc;
+    bars[1] = 0xffffffffu;
+    if (s->doorbellEvent && n>=4) { bars[2]=0xfffff004u; bars[3]=0xffffffffu; }
+    if (s->msixPresent && n >= 6) {
+        bars[4] = 0xfffff004u; bars[5] = 0xffffffffu;
+    }
 
     LogInfo("[HDV] GetDetails: VID=0x%04X DID=0x%04X BAR0=0x%08X (%u MB)",
             pnp->VendorID, pnp->DeviceID, bars[0],
@@ -142,7 +167,9 @@ static HRESULT CALLBACK Cb_Start(void *ctx)
 
 static void CALLBACK Cb_Stop(void *ctx)
 {
-    (void)ctx;
+    auto s = (warp_session *)ctx;
+    s->hdv_started = false;
+    if (s->memSpaceEvent) SetEvent(s->memSpaceEvent);
     LogInfo("[HDV] Stop");
 }
 
@@ -153,13 +180,13 @@ static HRESULT CALLBACK Cb_ReadConfigSpace(void *ctx, UINT32 offset,
 {
     struct warp_session *s = (struct warp_session *)ctx;
 
-    if (offset < USBWARP_PCI_CFG_SIZE)
-        *value = s->pci_cfg[offset / 4];
-    else
-        *value = 0;
+    if (!value || (offset & 3)) return E_INVALIDARG;
+    AcquireSRWLockShared(&s->pciLock);
+    *value = offset < USBWARP_PCI_CFG_SIZE ? s->pci_cfg[offset / 4] : 0xffffffffu;
+    ReleaseSRWLockShared(&s->pciLock);
 
     s->cfg_reads++;
-    if (s->cfg_reads <= 60 || s->cfg_reads % 100 == 0)
+    if (s->cfg.debug && (s->cfg_reads <= 60 || s->cfg_reads % 100 == 0))
         LogInfo("[HDV] CfgRd [0x%02X] → 0x%08X", offset, *value);
 
     return S_OK;
@@ -174,6 +201,9 @@ static bool IsPciReadOnly(UINT32 offset)
     case 0x00:   /* Vendor ID / Device ID */
     case 0x08:   /* Revision ID / Class Code */
     case 0x2C:   /* Subsystem Vendor ID / Subsystem ID */
+    case 0x34:
+    case 0x54:
+    case 0x58:
         return true;
     default:
         return false;
@@ -185,6 +215,13 @@ static HRESULT CALLBACK Cb_WriteConfigSpace(void *ctx, UINT32 offset,
 {
     struct warp_session *s = (struct warp_session *)ctx;
     UINT32 old = 0;
+    if (offset & 3) return E_INVALIDARG;
+    struct Lock {
+        SRWLOCK *lock;
+        explicit Lock(SRWLOCK *p) : lock(p) { AcquireSRWLockExclusive(lock); }
+        void unlock() { if (lock) { ReleaseSRWLockExclusive(lock); lock = nullptr; } }
+        ~Lock() { unlock(); }
+    } lock(&s->pciLock);
 
     if (offset < USBWARP_PCI_CFG_SIZE)
         old = s->pci_cfg[offset / 4];
@@ -197,13 +234,32 @@ static HRESULT CALLBACK Cb_WriteConfigSpace(void *ctx, UINT32 offset,
     }
 
     /* ── BAR0 (offset 0x10): handle probe and address assignment ───────── */
+    if (offset == 0x18) {
+        s->pci_cfg[0x18 / 4] = !s->doorbellEvent ? 0 :
+            (value == 0xffffffffu ? 0xfffff004u : (value & 0xfffff000u) | 4);
+        goto done;
+    }
+    if (offset == 0x50) {
+        s->pci_cfg[offset / 4] = s->msixPresent ?
+            0x11 | (value & 0xc0000000u) : 0;
+        goto done;
+    }
+    if (offset == 0x20 && s->msixPresent) {
+        s->pci_cfg[offset / 4] = (value & 0xfffff000u) | 4;
+        goto done;
+    }
+    if (((offset==0x20 || offset==0x24) && !s->msixPresent) ||
+        (offset==0x1c && !s->doorbellEvent)) {
+        s->pci_cfg[offset/4]=0;
+        goto done;
+    }
     if (offset == 0x10) {
         if (value == 0xFFFFFFFF) {
-            s->pci_cfg[0x10 / 4] = s->bar0_mask;
+            s->pci_cfg[0x10 / 4] = s->bar0_mask | 0xc;
             s->bar0_probing = true;
             LogInfo("[HDV] CfgWr [0x10] BAR0 probe → mask 0x%08X", s->bar0_mask);
         } else {
-            s->pci_cfg[0x10 / 4] = value & s->bar0_mask;
+            s->pci_cfg[0x10 / 4] = (value & s->bar0_mask) | 0xc;
             s->bar0_probing = false;
             LogInfo("[HDV] CfgWr [0x10] BAR0 assigned → 0x%08X",
                     s->pci_cfg[0x10 / 4]);
@@ -253,15 +309,39 @@ static HRESULT CALLBACK Cb_WriteConfigSpace(void *ctx, UINT32 offset,
         LogInfo("[HDV] CfgWr [0x%02X] 0x%08X → 0x%08X", offset, old, value);
 
 done:
+    lock.unlock();
+    if (offset == 0x50 && !DrvClientConfigureIrq(s)) return HRESULT_FROM_WIN32(GetLastError());
     return S_OK;
 }
 
 /* ── MMIO callbacks (should never fire once section-backed range exists) ─ */
 
+static bool ValidMmio(const warp_session *s, HDV_PCI_BAR_SELECTOR bar,
+                      UINT64 offset, UINT64 length, const void *value)
+{
+    UINT64 size = bar == HDV_PCI_BAR0 ? s->shm_size :
+        bar == HDV_PCI_BAR2 && s->doorbellEvent ? 4096 :
+        bar == HDV_PCI_BAR4 && s->msixPresent ? 4096 : 0;
+    return value && length && offset <= size && length <= size - offset;
+}
+
 static HRESULT CALLBACK Cb_ReadMmio(void *ctx, HDV_PCI_BAR_SELECTOR bar,
                                     UINT64 offset, UINT64 length, BYTE *value)
 {
-    (void)ctx;
+    auto s = (warp_session *)ctx;
+    if (!ValidMmio(s, bar, offset, length, value)) return E_INVALIDARG;
+    if (bar == HDV_PCI_BAR4 && s->msixPresent) {
+        if (!value || offset > 4096 || length > 4096 - offset) return E_INVALIDARG;
+        memset(value, 0, (size_t)length);
+        AcquireSRWLockShared(&s->pciLock);
+        for (UINT64 i = 0; i < length; ++i) {
+            if (offset + i < 16) value[i] = s->msixTable[offset + i];
+            else if (offset + i == 0x800 && s->shm_base)
+                value[i] = (BYTE)(((volatile usbwarp_control_block *)s->shm_base)->irq_pending & 1);
+        }
+        ReleaseSRWLockShared(&s->pciLock);
+        return S_OK;
+    }
     LogWarn("[HDV] ReadMmio BAR%d off=0x%llX len=%llu — unexpected!",
             (int)bar, (unsigned long long)offset, (unsigned long long)length);
     memset(value, 0, (size_t)length);
@@ -272,7 +352,24 @@ static HRESULT CALLBACK Cb_WriteMmio(void *ctx, HDV_PCI_BAR_SELECTOR bar,
                                      UINT64 offset, UINT64 length,
                                      const BYTE *value)
 {
-    (void)ctx; (void)value;
+    auto s=(warp_session *)ctx;
+    if (!ValidMmio(s, bar, offset, length, value)) return E_INVALIDARG;
+    if (bar == HDV_PCI_BAR4 && s->msixPresent) {
+        if (!value || offset > 4096 || length > 4096 - offset) return E_INVALIDARG;
+        AcquireSRWLockExclusive(&s->pciLock);
+        for (UINT64 i = 0; i < length && offset + i < 16; ++i)
+            s->msixTable[offset + i] = value[i];
+        s->msixTable[12] &= 1;
+        s->msixTable[13] = s->msixTable[14] = s->msixTable[15] = 0;
+        ReleaseSRWLockExclusive(&s->pciLock);
+        if (offset < 16 && !DrvClientConfigureIrq(s)) return HRESULT_FROM_WIN32(GetLastError());
+        return S_OK;
+    }
+    if (bar==HDV_PCI_BAR2 && offset==0 && length==sizeof(UINT64) && s->doorbellEvent) {
+        SetEvent(s->doorbellEvent); // startup/fallback; registered writes signal in the kernel
+        return S_OK;
+    }
+    (void)value;
     LogWarn("[HDV] WriteMmio BAR%d off=0x%llX len=%llu — unexpected!",
             (int)bar, (unsigned long long)offset, (unsigned long long)length);
     return S_OK;
@@ -315,166 +412,166 @@ static void GuidBare(const GUID *g, WCHAR *buf, int sz)
  * §5  Public API: HdvSessionOpen / MapMmio / Close
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-BOOL HdvSessionOpen(struct warp_session *s)
+namespace {
+// The emulation class identifies UsbWarp. Instance IDs must be fresh because
+// HCS FlexibleIov supports Add only: stopped PCI instances persist until VM exit.
+const GUID EmulatorClass = {0x88421827,0x8545,0x4a35,{0xb8,0xa1,0x51,0xa9,0xd9,0x1d,0xeb,0x15}};
+
+DWORD ErrorCode(HRESULT hr)
 {
-    HRESULT hr;
-    const struct usbwarp_hdv_api *a = &s->api;
+    return HRESULT_FACILITY(hr) == FACILITY_WIN32 ? HRESULT_CODE(hr) : (DWORD)hr;
+}
 
-    s->hdv_started   = false;
-    s->hdv_torn_down = false;
-    s->mem_space_on  = false;
-    s->mmio_mapped   = false;
-    s->cfg_reads     = 0;
-    s->cfg_writes    = 0;
+HRESULT AddDevice(warp_session *s)
+{
+    WCHAR id[80], cls[80], json[1024];
+    GuidBare(&s->instance_id, id, _countof(id));
+    GuidBare(&s->class_id, cls, _countof(cls));
+    swprintf_s(json, L"{\"ResourcePath\":\"VirtualMachine/Devices/FlexibleIov/%ls\","
+            L"\"RequestType\":\"Add\",\"Settings\":{\"EmulatorId\":\"%ls\","
+            L"\"HostingModel\":\"External\",\"Configuration\":[]}}", id, cls);
+    HCS_OPERATION op = s->api.HcsCreateOp(nullptr, nullptr);
+    if (!op) return E_OUTOFMEMORY;
+    HRESULT hr = s->api.HcsModify(s->hcs_system, op, json, nullptr);
+    if (SUCCEEDED(hr)) {
+        // HcsCancelOperation is documented as E_NOTIMPL. Keep the operation and
+        // callback resources alive until completion; SCM progress is reported
+        // independently by the service thread during shutdown.
+        for (;;) {
+            PWSTR document = nullptr;
+            hr = s->api.HcsWait(op, 100, &document);
+            if (document) {
+                if (hr != HCS_E_OPERATION_TIMEOUT && *document && s->cfg.debug)
+                    LogInfo("[HCS Add] %ls", document);
+                LocalFree(document);
+            }
+            if (hr != HCS_E_OPERATION_TIMEOUT) break;
+            // Make BAR memory available during hot-add, before guest probe's
+            // timeout, even if HCS hasn't returned the add result yet.
+            if (!StopRequested(s) && s->mem_space_on && !s->mmio_mapped)
+                HdvSessionMapMmio(s);
+        }
+    }
+    s->api.HcsCloseOp(op);
+    return hr;
+}
+}
 
+BOOL HdvSessionOpen(warp_session *s)
+{
+    if (s->hdv_host || s->hcs_system || s->memSpaceEvent) {
+        SetLastError(ERROR_INVALID_STATE); return FALSE;
+    }
+    s->hdv_started = false; s->hdv_torn_down = false;
+    s->mem_space_on = false; s->mmio_mapped = false;
+    s->cfg_reads = 0; s->cfg_writes = 0;
+    s->class_id = EmulatorClass;
     InitConfigSpace(s);
-
-    /* Create memSpaceEvent (#9). */
-    s->memSpaceEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-
-    /* Step 1: open VM. */
-    hr = a->HcsOpen(s->cfg.vm_id, GENERIC_ALL, &s->hcs_system);
+    s->memSpaceEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!s->memSpaceEvent) return FALSE;
+    const char *operation = "HcsOpenComputeSystem";
+    HRESULT hr = s->api.HcsOpen(s->cfg.vm_id, GENERIC_ALL, &s->hcs_system);
+    if (SUCCEEDED(hr) && StopRequested(s)) hr = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+    if (SUCCEEDED(hr)) {
+        operation = "CoCreateGuid(device instance)";
+        hr = CoCreateGuid(&s->instance_id);
+    }
+    if (SUCCEEDED(hr)) {
+        operation = "HdvInitializeDeviceHost";
+        hr = s->api.HdvInitHost(s->hcs_system, &s->hdv_host);
+    }
+    if (SUCCEEDED(hr)) {
+        static const HDV_PCI_DEVICE_INTERFACE iface = MakePciInterface();
+        operation = "HdvCreateDeviceInstance";
+        hr = s->api.HdvCreateDevice(s->hdv_host, HdvDeviceTypePCI,
+            &s->class_id, &s->instance_id, &iface, s, &s->hdv_device);
+    }
+    if (SUCCEEDED(hr)) {
+        s->stage.store(USBWARP_SESSION_CONNECTING);
+        if (s->msixPresent) {
+            NTSTATUS randomStatus = BCryptGenRandom(nullptr, (PUCHAR)&s->irqNonce,
+                sizeof(s->irqNonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (randomStatus < 0 || !s->irqNonce || !DrvClientConfigureIrq(s)) {
+                LogWarn("Native interrupt backend unavailable; using guest polling");
+                // No guest can access config space before AddDevice. Preserve
+                // the normal device even if optional backend allocation fails.
+                AcquireSRWLockExclusive(&s->driverLock);
+                s->driverCaps &= ~USBWARP_DRIVER_CAP_H2G_IRQ;
+                ReleaseSRWLockExclusive(&s->driverLock);
+                InitConfigSpace(s);
+                if (s->shm_base)
+                    ((volatile usbwarp_control_block *)s->shm_base)->flags &= ~USBWARP_FLAG_H2G_IRQ;
+            }
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        operation = "HcsModifyComputeSystem(Add)";
+        hr = AddDevice(s);
+        if (SUCCEEDED(hr)) s->hdv_added = true;
+    }
+    if (SUCCEEDED(hr) && (!s->hdv_started || StopRequested(s))) {
+        operation = "HDV Start callback";
+        hr = HRESULT_FROM_WIN32(StopRequested(s) ? ERROR_OPERATION_ABORTED : ERROR_DEVICE_NOT_CONNECTED);
+    }
     if (FAILED(hr)) {
-        LogError("HcsOpenComputeSystem failed: 0x%08lX", (unsigned long)hr);
+        DWORD error = ErrorCode(hr);
+        // Once mapped, let SessionWorker drain the kernel/guest before unmap.
+        if (!s->mmio_mapped) HdvSessionClose(s);
+        if (!StopRequested(s)) LogWarn("%s failed for VM %ls: 0x%08lX", operation, s->cfg.vm_id, (unsigned long)hr);
+        SetLastError(error);
         return FALSE;
     }
-    LogInfo("VM opened");
-
-    /* Step 2: init HDV device host. */
-    hr = a->HdvInitHost(s->hcs_system, &s->hdv_host);
-    if (FAILED(hr)) {
-        LogError("HdvInitializeDeviceHost failed: 0x%08lX", (unsigned long)hr);
-        a->HcsCloseSys(s->hcs_system);
-        s->hcs_system = NULL;
-        return FALSE;
-    }
-    LogInfo("HDV device host initialised");
-
-    /* Step 3: create PCI device instance. */
-    CoCreateGuid(&s->class_id);
-    CoCreateGuid(&s->instance_id);
-    HDV_PCI_DEVICE_INTERFACE iface = MakePciInterface();
-
-    hr = a->HdvCreateDevice(s->hdv_host, HdvDeviceTypePCI,
-                            &s->class_id, &s->instance_id,
-                            &iface, s, &s->hdv_device);
-    if (FAILED(hr)) {
-        LogError("HdvCreateDeviceInstance failed: 0x%08lX", (unsigned long)hr);
-        a->HdvTeardownHost(s->hdv_host);
-        a->HcsCloseSys(s->hcs_system);
-        s->hdv_host = NULL;
-        s->hcs_system = NULL;
-        return FALSE;
-    }
-    LogInfo("PCI device instance created");
-
-    /* Step 4: hot-add to VM. */
-    WCHAR cs[80], is[80];
-    GuidBare(&s->class_id,    cs, 80);
-    GuidBare(&s->instance_id, is, 80);
-
-    WCHAR json[1024];
-    swprintf_s(json, 1024,
-        L"{\"ResourcePath\":\"VirtualMachine/Devices/FlexibleIov/%s\","
-        L"\"RequestType\":\"Add\","
-        L"\"Settings\":{"
-            L"\"EmulatorId\":\"%s\","
-            L"\"HostingModel\":\"External\","
-            L"\"Configuration\":[]"
-        L"}}",
-        is, cs);
-
-    HCS_OPERATION op = a->HcsCreateOp(NULL, NULL);
-    hr = a->HcsModify(s->hcs_system, op, json, NULL);
-
-    PWSTR resultDoc = NULL;
-    hr = a->HcsWait(op, 15000, &resultDoc);
-    a->HcsCloseOp(op);
-
-    /* FIX #4: Always log resultDoc content for diagnostics. */
-    if (resultDoc) {
-        if (resultDoc[0] != L'\0')
-            LogInfo("[HCS] OperationResult: %ls", resultDoc);
-        LocalFree(resultDoc);
-    }
-
-    if (FAILED(hr)) {
-        LogError("Hot-add failed: 0x%08lX", (unsigned long)hr);
-        a->HdvTeardownHost(s->hdv_host);
-        a->HcsCloseSys(s->hcs_system);
-        s->hdv_host = NULL;
-        s->hcs_system = NULL;
-        return FALSE;
-    }
-
-    if (!s->hdv_started) {
-        LogError("Hot-add returned success but Start callback did not fire");
-        a->HdvTeardownHost(s->hdv_host);
-        a->HcsCloseSys(s->hcs_system);
-        s->hdv_host = NULL;
-        s->hcs_system = NULL;
-        return FALSE;
-    }
-
-    LogInfo("Hot-add complete — PCI device live in guest");
-    LogInfo("Waiting for guest to enable Memory Space ...");
+    WCHAR instance[80]; GuidBare(&s->instance_id, instance, _countof(instance));
+    LogInfo("HDV session attached to VM %ls (instance %ls)", s->cfg.vm_id, instance);
     return TRUE;
 }
 
-BOOL HdvSessionMapMmio(struct warp_session *s)
+BOOL HdvSessionMapMmio(warp_session *s)
 {
     if (s->mmio_mapped) return TRUE;
-    if (!s->mem_space_on) return FALSE;
-    if (!s->section) {
-        LogError("Cannot map MMIO: Section not created");
-        return FALSE;
+    if (!s->mem_space_on || !s->section || !s->hdv_device) { SetLastError(ERROR_NOT_READY); return FALSE; }
+    if (s->doorbellEvent && !s->doorbellRegistered) {
+        HRESULT doorbell=s->api.HdvRegisterDoorbell(s->hdv_device,HDV_PCI_BAR2,0,1,USBWARP_HDV_DOORBELL_FLAGS,s->doorbellEvent);
+        if (SUCCEEDED(doorbell)) {
+            s->doorbellRegistered=true;
+            LogInfo("HDV G2H doorbell registered (kernel event wakeup)");
+        } else {
+            // Initialization only: BAR0 is not exposed to the guest yet.
+            auto cb=(usbwarp_control_block *)s->shm_base;
+            cb->flags &= ~USBWARP_FLAG_G2H_DOORBELL;
+            LogWarn("HDV doorbell unavailable: 0x%08lX",(unsigned long)doorbell);
+        }
     }
-
-    UINT64 page_count = s->shm_size / USBWARP_PAGE_SIZE;
-
-    LogInfo("Mapping Section to BAR0: %llu pages (%u MB), R/W",
-            (unsigned long long)page_count,
-            s->shm_size / (1024 * 1024));
-
-    HRESULT hr = s->api.HdvCreateMmio(
-        s->hdv_device, HDV_PCI_BAR0,
-        0, page_count,
-        (HDV_MMIO_MAPPING_FLAGS)(HdvMmioMappingFlagWriteable),
-        s->section, 0);
-
-    if (FAILED(hr)) {
-        LogError("HdvCreateSectionBackedMmioRange failed: 0x%08lX",
-                 (unsigned long)hr);
-        return FALSE;
-    }
-
+    HRESULT hr = s->api.HdvCreateMmio(s->hdv_device, HDV_PCI_BAR0, 0,
+        s->shm_size / USBWARP_PAGE_SIZE, HdvMmioMappingFlagWriteable, s->section, 0);
+    if (FAILED(hr)) { SetLastError(ErrorCode(hr)); return FALSE; }
     s->mmio_mapped = true;
-    s->cb->host_state = USBWARP_STATE_READY;
-    LogInfo("Section-backed MMIO established — zero-copy SHM active");
+    // Kernel SETUP_SHM has already initialized the transport and owns its state.
     return TRUE;
 }
 
-void HdvSessionClose(struct warp_session *s)
+BOOL HdvSessionClose(warp_session *s)
 {
-    const struct usbwarp_hdv_api *a = &s->api;
-    LogInfo("Closing HDV session");
-
+    if (s->doorbellRegistered && s->hdv_device) {
+        HRESULT hr=s->api.HdvUnregisterDoorbell(s->hdv_device,HDV_PCI_BAR2,0,1,USBWARP_HDV_DOORBELL_FLAGS);
+        if (FAILED(hr) && !s->hdv_torn_down) LogWarn("HDV doorbell unregister: 0x%08lX",(unsigned long)hr);
+        s->doorbellRegistered=false;
+    }
+    // The kernel shutdown handshake has quiesced guest transfers. Release the
+    // BAR backing explicitly; FlexibleIov has no supported hot-remove request.
+    if (s->mmio_mapped && s->hdv_device) {
+        HRESULT hr = s->api.HdvDestroyMmio(s->hdv_device, HDV_PCI_BAR0, 0);
+        if (SUCCEEDED(hr)) s->mmio_mapped = false;
+        else if (!s->hdv_torn_down) LogWarn("HDV MMIO unmap returned 0x%08lX", (unsigned long)hr);
+    }
     if (s->hdv_host) {
-        a->HdvTeardownHost(s->hdv_host);
-        s->hdv_host   = NULL;
-        s->hdv_device = NULL;
+        HRESULT hr = s->api.HdvTeardownHost(s->hdv_host);
+        if (FAILED(hr)) { SetLastError(ErrorCode(hr)); return FALSE; }
+        s->hdv_host = nullptr; s->hdv_device = nullptr;
     }
-    if (s->hcs_system) {
-        a->HcsCloseSys(s->hcs_system);
-        s->hcs_system = NULL;
-    }
-
-    if (s->memSpaceEvent) {
-        CloseHandle(s->memSpaceEvent);
-        s->memSpaceEvent = NULL;
-    }
-
-    s->hdv_started  = false;
-    s->mem_space_on = false;
-    s->mmio_mapped  = false;
+    s->hdv_added = false;
+    if (s->hcs_system) { s->api.HcsCloseSys(s->hcs_system); s->hcs_system = nullptr; }
+    if (s->memSpaceEvent) { CloseHandle(s->memSpaceEvent); s->memSpaceEvent = nullptr; }
+    s->hdv_started = false; s->mem_space_on = false; s->mmio_mapped = false;
+    return TRUE;
 }

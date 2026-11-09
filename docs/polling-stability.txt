@@ -1,0 +1,88 @@
+USBWarp 默认轮询与 U300 稳定性测试（2026-11-09）
+
+当前默认行为
+
+h2g_irq=0、poll_us=0、rx_busy_us=0、rx_repoll_us=0。
+使用原自适应轮询，不分配实验性的 MSI-X，也不启动分区 ID 标记发现。
+中断/混合策略保留为显式选择的实验功能。设备捕获、ISO 协议、URB 生命周期
+等正确性修复保留，包括取消转发层统一 5/10 秒超时的修复。
+
+增加了 debugfs inflight 行，报告在途 URB、待发布请求、ISO、槽总数、原子
+空闲计数和位图空闲数。活动期间是诊断快照；测试在 I/O 排空后检查一致性。
+
+环境与范围
+
+Win11Debug，8 GiB；内层 Ubuntu-22.04/WSL，Linux 6.6.87.2，2 vCPU。
+ASUS adol U300，346d:5678，FC131A137FFE8，容量 62914560000 字节，USB 5 Gb/s。
+本轮所有测试数据访问均为只读直接 I/O；没有格式化或覆盖用户数据。
+测试前以 Windows 原生驱动读取 1–9 GiB 区域内 4096 个固定 4 KiB 样本，
+建立独立指纹；Linux 校验此指纹及原首 64 MiB SHA-256。
+
+完成的测试
+
+1. 按编译默认值加载，未传入 h2g_irq/poll_us 覆盖参数：IRQ vector=-1，
+   sent=received=0，busy windows=0，timer repoll arms=0。
+2. WSL Ubuntu-22.04 编译与 ASan/UBSan 软件回归通过：
+   KBUILD_MODPOST_WARN=1 make KDIR=/home/oh2/WSL2-Linux-Kernel KCFLAGS=-Werror -j4
+   Module.symvers/BTF 缺失警告仍在；实际模块加载没有使用 force。
+3. 605.56 秒混合负载，30 批，基准负载读取 12821716992 字节（约 11.94 GiB），
+   另有周期性的前缀 SHA-256 与跨 Windows/Linux 随机区域指纹校验。
+4. 捕获/归还 20 轮，每轮确认目标驱动切换、Windows 磁盘独占、数据正确、
+   归还后 USBSTOR 与健康 D: 恢复、捕获日志清空；其中 4 轮在读取中归还。
+5. 读取中正常停止并重启服务 3 轮，停止用时约 3.12、10.95、6.33 秒，
+   包含 Windows 设备恢复；每轮重新捕获、读取校验均通过。
+6. 强制终止明确身份的测试服务进程 3 轮，SCM 自动重启后数据校验通过。
+   前两轮可用会话恢复约 9.94、23.19 秒。第三轮进程自动重启约 60.01 秒；
+   最初脚本等待上限不足，完整会话就绪时间没有连续测得，后续恢复检查通过。
+7. 捕获状态下空闲 30 秒后继续读取，数据正确。首次 4 KiB 读约 893.6 us，
+   这是一次端到端读取样本，不能当作线程唤醒延迟或尾延迟保证。
+
+恢复测试脚本的修正
+
+原脚本统一等待 45 秒，短于本机 SCM 第三次重启的 60 秒退避，造成超时误判。
+SCM 事件 7031 与新进程启动时间证明服务按策略自动重启；之后重新捕获并完成
+数据、资源检查。测试增加 RecoveryTimeoutSeconds（默认 120），保持 SCM
+配置不变。第三轮原始读进程的退出码未保存，保留的 stderr 是 pread ENODEV。
+没有为了重复这个故障注入而再次强杀服务，也没有伪造连续测量的恢复耗时。
+SCM 的失败计数/退避会跨测试累积，重跑故障注入前需要核对其现有恢复策略。
+
+资源观察
+
+92 次排空快照均为 URB=queued=ISO=0，503/503 槽空闲，位图与计数一致。
+同一服务进程在负载及捕获循环后，句柄从冷启动 212 到稳定 229（峰值 231）。
+私有内存从 2551808 到 3735552 字节，存在约 1.13 MiB 的增长，未做堆归因，
+不能将它直接认定为泄漏或证明完全无泄漏。
+Win11Debug 非分页池范围 163942400–167428096 字节，末值 165810176；这是
+整台测试 VM 的池统计，不是 USBWarp 专用池。Linux SUnreclaim 从约 31 MiB
+增至约 38 MiB，也包含分配器缓存。没有观察到资源耗尽；上述结果是短时证据。
+采集的 Linux 日志未出现 Oops、BUG 或调度上下文警告。
+
+数据范围与测速口径
+
+持续测试使用 1–9 GiB 区域，区别于此前反复读取首 64 MiB 的性能对照。
+同一区域的原生 Windows 顺序 1 MiB QD4 读为 30.54 MiB/s，Linux 此轮约
+29.13–30.21 MiB/s。不能把先前首 64 MiB 的约 130 MiB/s 外推为全盘速度，也不能
+仅凭这两个不同范围的结果判断轮询策略发生性能回退。
+
+结束状态
+
+Windows 驱动/服务路径、二进制、配置和新增测试信任已还原，捕获日志为空，
+U 盘健康返回 D:，测试模式和虚拟机内存未更改，内层 WSL/HCS 已停止。
+按用户选择，C:\USBWarp-Test\bin\usbwarp.ko 保留本轮测试过的默认轮询版本，
+原模块备份仍在 C:\USBWarp-Test\PollingStability\guest-original.ko。
+模块 SHA-256：34DAE6526199003FD0663D373C4734BE467DAC8968263C754E01CBC439637331。
+
+证据与后续范围
+
+tests/usb_poll_stability.py、tests/vm_usb_poll_stability.ps1 可复用。
+x64/ReviewChecks/PollingStability/ 保存 summary.json、events.jsonl、soak.jsonl、
+recovery-failure.txt、recovery-completion.txt、guest-dmesg.txt、cleanup.json、
+final-state.json 和编译日志。cleanup.json 是恢复原部署的快照，final-state.json
+记录随后保留新的默认轮询模块的最终状态。
+
+现有 U 盘还可以用于更长时间的压力、更多生命周期循环、定向驱动验证和故障
+注入。真实 HID 长等待、ISO 音视频、UAS streams、不同速率及多设备并发仍需
+相应硬件。本轮不构成这些设备类别或 Windows 认证测试已经通过的声明。
+
+SCM 失败计数及动作语义：
+https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actionsw

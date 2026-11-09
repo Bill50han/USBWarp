@@ -1,0 +1,39 @@
+USBWarp 小量写入验证（2026-11-09）
+
+目标：Win11Debug 内的 ASUS adol U300，序列号 FC131A137FFE8，容量
+62914560000 字节。仍使用默认自适应轮询，Driver Verifier 未启用。
+
+经内层 Linux -> USBWarp 创建一个唯一命名的临时文件，顺序写入 16 MiB，
+fsync 后回读；再覆盖文件中间的 4 KiB，fsync 后再次校验。成功提交的文件
+数据总量为 16781312 字节（16 MiB + 4 KiB），另有正常文件系统元数据更新。
+没有循环写入或容量填充。脚本以 O_EXCL 创建文件，并用尝试标记拒绝重复
+执行同一个测试 ID。
+
+Linux 干净卸载 exFAT 后，设备归还 Windows。Windows 独立回读得到的 SHA-256
+与预先生成的数据一致：
+cc40f2f8ef48d123fc31be1a9a744ccba2795fb77a5dd1929a7b66c7021d1bc9
+
+随后删除唯一的临时测试文件。原售后 PDF 的长度和 SHA-256 未改变，根目录
+名称列表恢复，D: 健康。原文件 SHA-256：
+5acc2804d9535507b293982131e823a850023ad0725349320312c93a4b1b3ef2
+
+16 MiB 文件写入连同 fsync 约 0.171 秒，4 KiB 覆盖连同 fsync 约 0.0021 秒。
+这是小文件功能测试，不能作为持续写速或掉电持久性保证。
+
+当前 WSL 内核未启用 exFAT。测试从现有 6.6.87.2 内核源码在 Ubuntu-22.04
+编译了临时 exfat.ko，未改全局内核配置。先只读挂载核对原文件，再进行上述
+有限写入；测试后文件系统正常卸载、临时模块卸载。
+
+创建/删除文件会合法改变原始扇区内容，因此保留原基线后，以 Windows 独立
+读取更新了首 64 MiB 基线，并经 USBWarp 再次只读校验一致：
+1baa61091127126000986ce692898179fc0b77c0dcece14f0e75b37d8391ee58
+原历史基线 c9c26e72... 保留在此前测试记录中，不再适用于当前盘内容。
+backup/usb-read-baseline.json 和当前测试脚本的预期值已更新。
+
+补充只读校验最初在异步设备枚举结束前执行，返回“找不到设备”；改用现有
+等待设备就绪的校验入口后通过，没有重跑写入。
+
+实现：tests/usb_small_write_test.py。
+证据：x64/ReviewChecks/SmallWrite/ 的 before.json、write-result.json、
+result.json、usb-read-baseline-before.json、usb-read-baseline-after.json、
+baseline-recheck.jsonl、build-exfat.txt 和 cleanup.json。

@@ -119,6 +119,11 @@
 #define USBWARP_PENDING_URBS_MAX        1024u
 #define USBWARP_BUFFER_QUOTA_MIN        4u
 
+/* ISO messages have a 64-byte base and an 8-byte entry per packet. */
+#define USBWARP_ISO_MAX_PACKETS         1024u
+#define USBWARP_MAX_MESSAGE_SIZE        (64u + 8u * USBWARP_ISO_MAX_PACKETS)
+#define USBWARP_MAX_TRANSFER_SIZE       (64u * 1024u * 1024u)
+
 /* TransactionId sentinel */
 #define USBWARP_TXN_ID_NONE  0u
 
@@ -145,7 +150,22 @@
 #define USBWARP_CAP_INLINE_DATA     0x00000002u  /* Inline data ≤ 96 B        */
 #define USBWARP_CAP_BATCH_SUBMIT    0x00000004u  /* Batch produce / consume   */
 #define USBWARP_CAP_STATS           0x00000008u  /* Stats query messages      */
-/* Bits 4–31 reserved for future versions */
+/* Old experimental hosts advertised ISO without implementing it. Require
+ * this bit as well before sending the packed, validated ISO wire format. */
+#define USBWARP_CAP_ISO_PACKED       0x00000010u
+#define USBWARP_CAP_USB3             0x00000020u
+#define USBWARP_CAP_STREAMS          0x00000040u
+#define USBWARP_CAP_DEVICE_EPOCH     0x00000080u
+#define USBWARP_CAP_G2H_DOORBELL     0x00000100u
+/* Bits 8–31 reserved for future versions */
+#define USBWARP_MAX_STREAMS         32u /* nonzero stream IDs, per endpoint */
+
+static inline int usbwarp_binding_matches(uint32_t caps, uint32_t request_epoch,
+                                         uint32_t current_epoch)
+{
+    return !(caps & USBWARP_CAP_DEVICE_EPOCH) ||
+           (current_epoch != 0 && request_epoch == current_epoch);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §4  Control Block global-flags
@@ -153,6 +173,17 @@
 
 #define USBWARP_FLAG_ISO_ENABLED    0x00000001u
 #define USBWARP_FLAG_DEBUG_ENABLED  0x00000002u
+#define USBWARP_FLAG_COHERENT_RAM   0x00000004u /* BAR is coherent, section-backed RAM */
+#define USBWARP_FLAG_G2H_DOORBELL    0x00000008u /* BAR2 writeq(1) signals host event */
+#define USBWARP_FLAG_H2G_IRQ         0x00000010u /* optional native MSI-X backend */
+
+/* Marker requests are serialized, acknowledged with release/acquire ordering.
+ * No partition ID or interrupt route is accepted from shared memory. */
+enum usbwarp_irq_state {
+    USBWARP_IRQ_OFF, USBWARP_IRQ_BEGIN, USBWARP_IRQ_TAG,
+    USBWARP_IRQ_RESTORE, USBWARP_IRQ_TEST, USBWARP_IRQ_READY,
+    USBWARP_IRQ_FAILED
+};
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §5  Endpoint / session state
@@ -173,7 +204,10 @@ enum usbwarp_state {
  *   Cache Line 0  [0x000–0x03F]  Protocol identity + layout (Host-init, RO)
  *   Cache Line 1  [0x040–0x07F]  Host heartbeat   (Host writes, Guest reads)
  *   Cache Line 2  [0x080–0x0BF]  Guest heartbeat  (Guest writes, Host reads)
- *   Remainder     [0x0C0–0xFFF]  Reserved / zero
+ *   Cache Line 3  [0x0C0–0x0FF]  Host interrupt/discovery state
+ *   Cache Line 4  [0x100–0x13F]  Guest interrupt/discovery state
+ *   Cache Line 5  [0x140–0x17F]  Guest PCI identity
+ *   Remainder     [0x180–0xFFF]  Reserved / zero
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 struct usbwarp_control_block {
@@ -209,7 +243,34 @@ struct usbwarp_control_block {
     uint8_t  _pad2[48];                  /* [0x090] pad to cache-line boundary  */
 
     /* ── Remainder: reserved to 4 KB ─────────────────────────────────────── */
-    uint8_t  _reserved[USBWARP_CONTROL_BLOCK_SIZE - 3 * USBWARP_CACHELINE_SIZE];
+    /* Host-owned cache line, 0xC0. request_seq publishes state/challenge. */
+    uint32_t irq_host_state;
+    uint32_t irq_request_seq;
+    uint64_t irq_challenge;
+    uint64_t irq_event_seq;
+    uint64_t irq_sent;
+    uint64_t irq_failed;
+    uint32_t irq_pending;
+    uint32_t irq_last_status;
+    uint64_t irq_generation;
+    uint64_t irq_partition_id; /* diagnostic only; never supplied by guest */
+    /* Guest-owned cache line, 0x100. Odd arm tokens request one wakeup;
+     * only the serialized consumer changes the token, never the hard IRQ. */
+    uint64_t irq_arm_token;
+    uint64_t irq_ack_seq;
+    uint64_t irq_original_os_id;
+    uint32_t irq_ack_request;
+    int32_t irq_marker_result;
+    uint32_t irq_guest_state;
+    uint32_t _irq_guest_reserved;
+    uint64_t irq_received;
+    uint64_t irq_watchdog;
+    uint8_t _irq_guest_pad[8];
+    /* Guest reports the PCI VMBus identity for route validation. */
+    uint8_t irq_instance_id[16];
+    uint32_t irq_pci_function;
+    uint8_t _irq_identity_pad[44];
+    uint8_t _reserved[USBWARP_CONTROL_BLOCK_SIZE - 6 * USBWARP_CACHELINE_SIZE];
 };
 
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_control_block) == 4096,
@@ -225,6 +286,7 @@ USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_control_block) == 4096,
 
 /* Ring producer / consumer flag bits */
 #define USBWARP_RING_FLAG_NO_NOTIFY  0x00000001u  /* suppress peer wakeup */
+#define USBWARP_RING_FLAG_NEED_SPACE 0x00000002u  /* producer requests credit wakeup */
 
 struct usbwarp_ring_header {
     /* ── Cache Line 0: producer-owned (only producer writes) ─────────────── */
@@ -267,6 +329,13 @@ static inline uint32_t usbwarp_ring_used(uint32_t pi, uint32_t ci,
     return (pi - ci) & mask;
 }
 
+/* Indices are monotonic uint32 counters, not offsets. Masking an impossible
+ * distance would turn a malicious overrun into apparently valid old data. */
+static inline int usbwarp_ring_state_valid(uint32_t pi, uint32_t ci, uint32_t mask)
+{
+    return !((pi | ci) & (USBWARP_CACHELINE_SIZE - 1u)) && (uint32_t)(pi - ci) <= mask;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §9  Message header  (32 bytes, begins every ring message)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -278,7 +347,8 @@ struct usbwarp_msg_header {
     uint32_t message_length;             /* [0x08] total bytes including header */
     uint32_t transaction_id;             /* [0x0C] request/response correlator  */
     uint32_t device_id;                  /* [0x10] 0=global, 1+=per-device     */
-    uint32_t flags;                      /* [0x14] reserved, set 0             */
+    uint32_t flags;                      /* [0x14] binding epoch when negotiated;
+                                         * otherwise reserved, set 0 */
     uint64_t timestamp;                  /* [0x18] sender monotonic ns          */
 };
 
@@ -310,6 +380,8 @@ enum usbwarp_message_type {
     USBWARP_MSG_URB_COMPLETE          = 101, /* H → G */
     USBWARP_MSG_URB_CANCEL            = 102, /* G → H */
     USBWARP_MSG_URB_CANCEL_ACK        = 103, /* H → G */
+    USBWARP_MSG_STREAMS_REQUEST       = 110, /* G → H, allocate/free group */
+    USBWARP_MSG_STREAMS_RESPONSE      = 111, /* H → G */
 
     /* ── ISO messages (200–299, optional) ─────────────────────────────────── */
     USBWARP_MSG_ISO_SUBMIT            = 200, /* G → H */
@@ -341,6 +413,7 @@ enum usbwarp_status {
     USBWARP_STATUS_BABBLE             =   -6,
     USBWARP_STATUS_CRC                =   -7,
     USBWARP_STATUS_BITSTUFF           =   -8,
+    USBWARP_STATUS_ISO_MISSED         =   -9,
 
     /* Device / system errors (−100 … −199) */
     USBWARP_STATUS_DISCONNECTED       = -100,
@@ -349,6 +422,7 @@ enum usbwarp_status {
     USBWARP_STATUS_INVALID_PARAM      = -103,
     USBWARP_STATUS_NO_RESOURCE        = -104,
     USBWARP_STATUS_SHUTDOWN           = -105,
+    USBWARP_STATUS_NOT_SUPPORTED      = -106,
 
     /* Security / protocol errors (−200 … −299) */
     USBWARP_STATUS_RATE_LIMITED       = -200,
@@ -379,7 +453,16 @@ enum usbwarp_usb_speed {
     USBWARP_SPEED_FULL                = 2,   /*    12 Mbps */
     USBWARP_SPEED_HIGH                = 3,   /*   480 Mbps */
     USBWARP_SPEED_SUPER               = 4,   /*     5 Gbps */
+    USBWARP_SPEED_SUPER_PLUS          = 5,   /* 10 Gbps, Gen 2 x 1 */
+    USBWARP_SPEED_SUPER_PLUS_2X       = 6,   /* 20 Gbps, Gen 2 x 2 */
+    USBWARP_SPEED_SUPER_GEN1_2X       = 7,   /* 10 Gbps, Gen 1 x 2 */
 };
+#define USBWARP_SPEED_MAX USBWARP_SPEED_SUPER_GEN1_2X
+
+static inline int usbwarp_speed_is_super(uint32_t speed)
+{
+    return speed >= USBWARP_SPEED_SUPER && speed <= USBWARP_SPEED_MAX;
+}
 
 enum usbwarp_shutdown_reason {
     USBWARP_SHUTDOWN_NORMAL           = 0,
@@ -523,8 +606,10 @@ struct usbwarp_msg_urb_submit {
     uint32_t data_mode;                  /* [0x38] enum usbwarp_data_mode     */
     uint32_t buffer_offset;              /* [0x3C] Data Region byte offset    */
     uint8_t  setup_packet[8];            /* [0x40] Control xfer only          */
-    uint32_t interval;                   /* [0x48] Interrupt polling (ms)     */
-    uint32_t _reserved[5];              /* [0x4C – 0x5F]                     */
+    uint32_t interval;                   /* [0x48] linear interval: FS/LS ms,
+                                         *        HS/SS 125-us units        */
+    uint32_t stream_id;                  /* [0x4C] 0 = ordinary bulk pipe */
+    uint32_t _reserved[4];              /* [0x50 – 0x5F]                     */
 
     /* ── Inline data (96 bytes) ───────────────────────────────────────────── */
     uint8_t  inline_data[USBWARP_INLINE_DATA_SIZE]; /* [0x60 – 0xBF] */
@@ -576,7 +661,29 @@ struct usbwarp_msg_urb_cancel_ack {
     uint32_t _reserved[3];
 };  /* 32 + 16 = 48 → ring slot 64 */
 
-/* ── 13.12  ISO_SUBMIT  (Guest → Host, optional) ────────────────────────── */
+struct usbwarp_msg_streams_request {
+    struct usbwarp_msg_header hdr;
+    uint32_t endpoint_mask; /* bit ep: OUT; bit (16+ep): IN, exclude ep0 */
+    uint32_t num_streams;   /* 0 closes streams; otherwise requested count */
+    uint32_t _reserved[2];
+};
+struct usbwarp_msg_streams_response {
+    struct usbwarp_msg_header hdr;
+    int32_t status;
+    uint32_t num_streams;
+    uint32_t _reserved[2];
+};
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_streams_request) == 48, "stream request ABI");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_streams_response) == 48, "stream response ABI");
+
+/* ── 13.12  ISO_SUBMIT  (Guest → Host, optional)
+ *
+ *   Enabled by CAP_ISO_TRANSFER in the negotiated capabilities (guest
+ *   module param enable_iso=1 AND host cb flag USBWARP_FLAG_ISO_ENABLED).
+ *   Protocol version stays 1.0 — the capability bit is the gate, a MINOR
+ *   bump would make old hosts reject new guests outright.
+ *   start_frame is ASAP-only in v1 (0); the host picks the frame and
+ *   reports it back in ISO_COMPLETE.start_frame.                       */
 
 struct usbwarp_iso_packet_desc {
     uint32_t offset;                     /* byte offset within buffer         */
@@ -592,9 +699,11 @@ struct usbwarp_msg_iso_submit {
     uint32_t start_frame;                /* 0 = ASAP                          */
     uint32_t buffer_offset;
     uint32_t total_length;
-    uint32_t _reserved;
+    uint32_t interval;                   /* service interval in (micro)frames */
     /* struct usbwarp_iso_packet_desc packets[]; — variable length            */
 };  /* 32 + 32 = 64 base; ring slot = ALIGN_CL(64 + 8*npackets) */
+
+#define USBWARP_MSG_ISO_SUBMIT_BASE_SIZE   64
 
 /* ── 13.13  ISO_COMPLETE  (Host → Guest, optional) ──────────────────────── */
 
@@ -610,9 +719,13 @@ struct usbwarp_msg_iso_complete {
     int32_t  status;                     /* overall status                    */
     uint32_t error_count;
     uint32_t number_of_packets;
-    uint32_t _reserved[3];
+    uint32_t buffer_offset;              /* where IN data landed (as submitted) */
+    uint32_t data_mode;                  /* NONE or BUFFER — never INLINE     */
+    uint32_t start_frame;                /* actual first frame (host-picked)  */
     /* struct usbwarp_iso_packet_result results[]; — variable length          */
 };  /* 32 + 32 = 64 base */
+
+#define USBWARP_MSG_ISO_COMPLETE_BASE_SIZE 64
 
 /* ── 13.14  CIRCUIT_BREAKER  (bidirectional) ─────────────────────────────── */
 
@@ -707,5 +820,26 @@ USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_urb_complete, actual_length)  
 USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_urb_complete, data_mode)      == 0x30, "");
 USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_urb_complete, buffer_offset)  == 0x34, "");
 USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_urb_complete, inline_data)    == 0x60, "");
+
+/* ISO message base sizes and body offsets.  buffer_offset/data_mode/
+ * start_frame consume the former _reserved[3] of iso_complete — the
+ * base stays 64 and the message was never wire-active before ISO. */
+USBWARP_STATIC_ASSERT(USBWARP_MSG_ISO_SUBMIT_BASE_SIZE   == 64, "");
+USBWARP_STATIC_ASSERT(USBWARP_MSG_ISO_COMPLETE_BASE_SIZE == 64, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_submit, number_of_packets) == 0x2C, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_submit, buffer_offset)     == 0x34, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_submit, total_length)      == 0x38, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_submit, interval)          == 0x3C, "");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_iso_submit) == 64, "ISO submit base");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_iso_complete) == 64, "ISO complete base");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_complete, error_count)     == 0x2C, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_complete, number_of_packets) == 0x30, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_complete, buffer_offset)   == 0x34, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_complete, data_mode)       == 0x38, "");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_iso_complete, start_frame)     == 0x3C, "");
+USBWARP_STATIC_ASSERT(USBWARP_MSG_ISO_SUBMIT_BASE_SIZE +
+                      USBWARP_ISO_MAX_PACKETS *
+                          sizeof(struct usbwarp_iso_packet_desc) ==
+                      USBWARP_MAX_MESSAGE_SIZE, "");
 
 #endif /* USBWARP_SHARED_H */

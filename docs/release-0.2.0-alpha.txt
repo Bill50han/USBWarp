@@ -1,0 +1,81 @@
+USBWarp v0.2.0-alpha
+===================
+
+This prerelease replaces the old global USB filter with explicit capture of
+one physical device at a time. Upgrade all four Windows components and the
+Linux module together. The product version changes; the negotiated base wire
+protocol remains 1.0.
+
+Changes since v0.1.2-alpha
+-------------------------
+* Dedicated KMDF capture function driver, exact device-instance targeting,
+  kernel-only exclusive leases, device reset on ownership transitions, and
+  persistent restoration of the original driver or originally driverless state.
+  Hubs/controllers and individual composite interfaces are not capture targets.
+* Standard SCM service with persistent configuration, bounded crash recovery,
+  cancellable control I/O, session supervision and restoration after interruption.
+  The kernel owns active bindings; the service owns PnP/HDV lifecycle.
+* USB 1.x/2.0/3.x transport, separate USB2 and USB3.2 virtual root hubs, actual
+  operating-speed reporting, bulk streams, scatter-gather and bulk OUT ZLP.
+  USB4 controller/tunnel support is outside this release.
+* Packed ISO_ASAP requests and per-packet completion, enabled explicitly at
+  both ends. Explicit frame scheduling is unsupported across unsynchronized
+  host/guest frame clocks. No physical ISO peripheral has been validated yet.
+* Completion batching, cancellation/teardown fixes and client-owned URB timeout
+  policy. The shipped default is adaptive polling: h2g_irq=0, poll_us=0,
+  rx_busy_us=0, rx_repoll_us=0. Native MSI-X remains an opt-in experiment with
+  platform/ABI limits described in kernel-interrupts.txt.
+* Shared-ring index, message/header, layout and MMIO validation; restricted pipe
+  permissions; overlapped controller I/O with timeout, cancellation and draining.
+  These changes add small validation costs. No controlled before/after benchmark
+  of the final security changes establishes zero performance cost.
+
+Validation and scope
+--------------------
+The development hardware matrix is Windows 11 in Hyper-V, a passed-through
+Intel xHCI, one USB 3 ASUS adol U300 behind a hub, and nested Ubuntu 22.04 on
+WSL kernel 6.6.87.2-microsoft-standard-WSL2 (x86_64).
+
+Development validation includes production-code ring/layout/ISO/USB3/RX unit
+tests under ASan/UBSan, Windows service/control/security fixtures, real kernel
+IOCTL rejection tests, and capture/read/restore tests. The longer polling run
+read 12.82 GB in 605.56 seconds, exercised 20 captures, active unbind, graceful
+service restart and crash recovery. One recovery observation needed a harness
+timeout correction for SCM's configured 60-second backoff; see polling-stability.txt.
+
+Driver Verifier standard checks covered both Windows drivers, active transfers,
+unbind, stop and unload, with no observed violation and zero tracked allocations
+after unload. That run preceded the final interface hardening and used a Debug
+capture driver; it is not a Verifier result for every binary in this archive.
+See driver-verifier.txt and interface-security.txt for the exact evidence.
+
+A bounded write test wrote one 16 MiB file plus a 4 KiB overwrite, flushed and
+unmounted it, and verified its SHA-256 independently in Windows. The temporary
+file was deleted and the original PDF was unchanged. It was not a sustained
+write benchmark. See small-write-test.txt.
+
+Physical ISO, HID, UAS, SSP lane configurations and other device/firmware
+combinations remain outside the current hardware test matrix. No USB-IF or
+WHQL certification, production reliability or universal throughput is claimed.
+Historical Pico tests belong to earlier builds. The release-candidate validation
+report beside the archives records checks of the final packaged artifacts.
+
+Installation and upgrade
+------------------------
+Use the Windows ZIP's INSTALL.txt. The drivers carry a private test signature;
+only the public certificate is distributed. Use a test-mode Windows machine.
+The Linux source is included in the full source archive; any supplied .ko is
+specific to its named kernel version/configuration and must never be force-loaded.
+
+Stop the old service and restore all captures before replacing it. Preserve
+restoration journals until recovery succeeds. install_capture.ps1 removes only
+the historical UsbWarpFilter USB class-filter entry; reboot if it reports this
+upgrade path. Do not install the new capture driver as a global UpperFilter.
+
+For user-owned WSL, configure the SCM service to run as that WSL owner with the
+required local administrator/Hyper-V and service-logon rights. LocalSystem HDV
+initialization was denied on the tested WSL 2.6.3 setup. The VM GUID is explicit
+configuration; update it when WSL creates a different utility VM.
+
+The full source archive and LICENSE accompany the binaries under GPL-2.0.
+SHA256SUMS.txt identifies all published archives and the validation report.

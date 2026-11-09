@@ -1,0 +1,336 @@
+USBWarp：按 URB 行为选择完成等待策略
+研究日期：2026-11-09
+
+结论与证据边界
+
+分类有必要，但不宜只按设备名称、USB 版本或四种传输类型划分。
+适合的单位是设备代次、接口/端点、方向、stream、请求长度区间和近期行为。
+描述符提供初始判断；真正决定是否值得忙轮询的是：近期出现完成的概率、
+完成后是否阻塞下一步、持续空转的代价，以及及时补充请求的时间余量。
+
+前六节记录 USB-IF 规范、微软 USB 驱动文档、Linux 6.6 类驱动和现有
+Win11Debug/WSL BOT 轨迹的研究。第七节记录随后实现的首版和验证范围。
+其他类别尚无新增硬件实测；设计建议和软件测试不等于已经验证的性能提升。
+
+1. 必须区分的三个层次
+
+USB 总线上的 transaction/service interval、操作系统提交的 URB、USBWarp
+共享完成环的消费，是三个层次。主机提交了 URB，不能推导设备马上会完成。
+一个 URB 可以包含多个包；一个 ISO URB 可以覆盖多个服务间隔。bInterval
+描述周期性端点的服务节奏，不保证每个间隔都有有效数据或一条完成消息。[1,9]
+
+USB Interrupt 传输也不是 Windows→Linux 的 PCI MSI-X 中断。后者用于通知
+各种类型 URB 的完成。Linux 忙轮询完成环，不会提高物理 xHCI 服务端点的频率。
+
+USB 1.x/2.0 的设备等待可表现为 NAK；SuperSpeed 的 Bulk/Interrupt 流控还
+包括 NRDY/ERDY。设备可以通知就绪，但实际数据传输仍受主机调度。USBWarp
+通过 Windows URB 接口看不到每一次这类总线握手，不宜通过私有 xHCI 状态
+猜测就绪。公开 URB 完成、队列和描述符信息足够构成保守的通用策略。[13]
+
+2. 不同设备和 URB 的现实行为
+
+Control：枚举、配置、类请求、厂商请求
+  通常串行、数据少，后续动作可能依赖它完成。但小请求并不等于快请求：
+  固件执行、复位恢复等可能占主要时间。建议默认中断；经过采样证明很快的
+  请求组可给有限忙轮询预算。不能让所有控制 URB 在提交者中同步自旋。
+  USB EP0 控制传输与 USBWarp 管理消息不是同一种“控制”；后者的状态屏障
+  仍必须保持。[1]
+
+Interrupt IN：键鼠、手柄、状态通知
+  可以长期预挂接收请求，等待外部事件。HID Set_Idle 的 duration=0 明确允许
+  内容不变时无限期不报告；不是每次物理查询都会完成一个 URB。[2]
+  默认保持接收请求、等待完成中断；实际有报告时尽快转交。高频输入设备若
+  在运动期间出现稳定完成节奏，可研究短期忙轮询，但停止活动就应退出。
+  不要仅凭 1 ms 或 125 us 服务间隔就永久占用 CPU。
+
+Interrupt OUT：灯光、震动、控制输出
+  主机已有输出数据，和等待外部输入不同，但仍受服务间隔和设备就绪限制。
+  小量输出宜直接等中断；只有持续低延迟输出且历史收益明确才短时忙轮询。
+  高优先级及时处理完成，不意味着发出后一直自旋。
+
+Bulk：BOT 磁盘
+  正常命令按 CBW、可选数据阶段、CSW 推进；这些阶段全是 Bulk，并非
+  USB Control 传输。命令和状态通常小，数据阶段受介质、缓存和长度影响。
+  读写、缓存命中、慢盘或恢复期间的行为都不同；小 CSW 也可能等设备内部
+  操作结束。适合研究短阶段有限忙轮询、长数据阶段中断等待。[3,4]
+  不能把本机 CBW/CSW 的速度写成所有磁盘的保证，更不能伪造提前完成。
+
+Bulk：UAS 存储
+  命令、状态和数据端点并行，使用 tag，并可使用 USB bulk streams；多个
+  SCSI 命令可同时在途。一个命令的所有 URB 完成次序也不能按 BOT 三阶段
+  解析。优先保留并发和流水线；在完成密集时批量消费、短时轮询，安静时
+  等中断。QD1 与高 QD 分开统计；不能为每个在途 URB 启动一个轮询线程。[5]
+
+Bulk IN：CDC-ACM、USB 串口
+  打开端口即可预挂多个读取，实际输入可能数秒乃至更久才到达。[6]
+  默认中断等待；持续突发时可短期活跃。某些 FTDI 芯片还有自身的接收
+  latency timer（文档示例默认 16 ms），设备尚未刷新缓冲时，Linux 端
+  自旋没有数据可读。不能擅自改变设备定时器或客户驱动的读取语义。[7]
+  Bulk OUT 仅说明 USB 数据交付进展，不代表 UART 已把所有位发到外部线路。
+
+Bulk IN/OUT：USB 网卡
+  接收队列预挂不意味着网络上已有包；空闲和突发负载行为相反。Linux
+  usbnet 维护接收队列并在完成后补充，多包封装还会影响 URB 粒度。[8]
+  建议空闲等待 IRQ，收到一批后按实际完成密度给有限轮询预算。接收和发送
+  分开统计；不要把预挂 RX 数量当作永久保持活跃的条件。
+
+ISO IN/OUT：音频、ISO 摄像头、语音
+  重点是提前提交足够 URB，维持设备端已经排好的时间范围，以及及时交回
+  完成供类驱动补充。Linux 音频驱动在完成回调中回收/准备/再次提交 URB；
+  某些播放路径还依赖反馈端点。[10]
+  应限制人为增加的完成延迟，首先用及时 IRQ 和批量消费。不能因 iso_pending
+  永远不为零而全程自旋。一个 URB 覆盖的名义时长可由 packet 数和服务间隔
+  估算，但实际剩余队列时长还需考虑排队、起始帧和已执行部分。[1,9]
+  在当前跨 VM 帧时钟尚未同步、只支持 ISO_ASAP 的条件下，这只是队列余量
+  的估计，不是精确的截止时间。USBWarp 不应自行改写类驱动的音频包结构。
+
+Bulk 摄像头、采集设备/SDR
+  摄像头并不一定用 ISO，Linux UVC 明确有 Bulk 和 ISO 两条提交路径。[11]
+  连续数据也不一定意味着频繁完成：URB 大时，收满缓冲本来就需要较长时间。
+  例如 librtlsdr 使用异步 Bulk 读取，默认缓冲长度为 262144 字节；假设
+  2.4 MS/s、每样本 2 字节，单缓冲仅积累数据就约需 54.6 ms。这是计算例子，
+  不是本机两只 SDR 的测量。[12]
+  优先保证排队深度和缓冲周转；以完成间隔而非数据字节率决定是否忙轮询。
+  缩小 URB 会增加完成频率并改变应用缓冲行为，不应由透明转发层擅自决定。
+
+蓝牙、复合设备
+  同一物理设备可能混用 Control、Interrupt 事件、Bulk 数据和 ISO 语音。
+  Linux btusb 的实现就是这种例子。[14] 应按端点/请求选择策略，不能给整台
+  设备套一个“低延迟设备”或“吞吐设备”的永久模式。
+
+厂商自定义测量仪、打印/扫描等
+  接口类甚至 Bulk IN/OUT 都不足以描述真实等待原因。可能是外部触发、机械
+  动作、命令应答或连续流。未知端点默认 IRQ，依据实际进展逐步调整；不能
+  因请求短或 OUT 方向就假定设备随时可接收。
+
+3. 本机 BOT 轨迹重新分析
+
+环境：Win11Debug 8 GiB、内层 WSL Linux 6.6.87.2、2 vCPU、ASUS adol U300，
+只读 4 KiB 随机读取 QD1。新分析没有访问设备，仅重放已有 ftrace 文本。
+脚本同时核对 entries-in-buffer/entries-written 和各 CPU 的 overrun、
+commit overrun、dropped events，三个有效文件均为零丢失。
+
+优化后 softirq IRQ 轨迹：7414 个完整串行三阶段读取，全部通过分组检查。
+
+推定阶段             P50       P95       <=50 us     <=200 us
+CBW / 小 Bulk OUT    122 us    193 us       0.15%        95.78%
+数据 / 4 KiB IN      963 us   1195 us       0.00%         0.027%
+CSW / 小 Bulk IN     119 us    192 us       0.08%        95.79%
+
+早先两条自适应轮询轨迹分别有 7059、7341 个完整读取，阶段中位数为：
+  CBW 124/125 us；数据 918/871 us；CSW 120/121 us。
+这些来自不同测试阶段，不能与上表拼成新的严格性能 A/B。
+
+阶段按单设备、QD1 和 BOT 类驱动正常三阶段顺序推定；原始 ftrace 没有记录
+transaction ID、端点和 payload，因此不能把这个分析器用于并发设备/UAS。
+时间起点是 Linux usbwarp_ring_produce 函数入口，终点是完成处理函数入口，
+包含 Windows 处理、物理设备时间、共享环传输和完成发现延迟，非纯 IRQ 延迟。
+
+由此可以提出实验假设：发出后仅忙等 20/50 us，在现有轨迹上很少覆盖一次
+完整往返；小阶段和数据阶段应分别试预算。不能据此直接断言 200 us 是最优
+参数，也不能把观察到的 CDF 当成新忙轮询实现的命中率。
+此前的 repoll 是完成后用定时器重新检查；本提案是提交/完成进展后保持 CPU
+运行。两种时间起点和调度方式不同，不能共用实验结论。
+
+4. 通用策略应如何表达
+
+两个问题分开做决定：
+  A. 此刻值得保持 CPU 运行多久，以便更早发现下一条完成？
+  B. 已有完成后，允许增加多少批处理延迟，才不会妨碍输入响应/补充队列？
+对 HID/音频，B 可以很严格，A 却仍接近零。低延迟需求不等于无限忙轮询。
+
+建议建立少量运行状态，而不是一张固定 VID/PID 规则表：
+  等待事件：默认 IRQ，适合长期预挂接收、未知设备、持续无进展。
+  短时等待：近期历史显示完成很快，给一个总时间和 CPU 占用都受限的预算。
+  持续有进展：批量处理已就绪完成，有限延长轮询，但必须受总预算约束。
+  周期流：优先维持排队和及时交回，依据估计队列余量决定是否需要更积极等待。
+
+可用信号：端点类型/方向、协商速率、规范化后的 interval、长度区间、stream、
+端点队列深度、实际已发布数量、近期完成间隔、请求年龄、短包比例、错误和
+取消状态。描述符是初始条件，不是完成时间保证。Control 和 Bulk 的相同
+方向/长度仍可能需要根据历史退回 IRQ。
+
+计时应至少分开：Linux 接受 URB、G2H 实际发布、Windows 接收/提交物理请求、
+Windows 完成回调、H2G 实际发布、发出 MSI、Linux IRQ 入口、消费完成、giveback。
+研究时的 p->submit_time 不能替代所有这些阶段，queued 请求尤其会混入本地
+等待。可先用同一系统内的时间差定位；Windows/Linux 原始时间戳不能未经
+校准直接相减，也不要增加一次同步跨 VM 往返来“预测”每个 URB。
+
+历史统计不能只看已完成的快请求：仍在途的长等待也要使该端点退出积极轮询。
+重枚举、复位、altsetting、速率和端点代次改变时重置历史；错误/取消不应
+当作“快速成功”训练信号。使用固定大小统计，避免每次检查扫描全部 URB。
+
+5. 当前 USBWarp 对实现的约束与发现
+
+现有 H2G 是一个共享 FIFO、一个 MSI-X 向量和一个串行消费者。按 URB 分类
+首先应改变消费者等待策略，而非创建每 URB 线程或抢读/重排共享环。
+任何类别的完成都必须能被处理；管理消息顺序、同端点/stream 顺序、ZLP
+屏障、取消/复位生命周期保持不变。
+
+忙轮询在可抢占的线程中执行，不在 urb_enqueue、硬 IRQ 或持锁区无限循环。
+当前 fast RX 由 tasklet 消费，不能仅令 poll 线程不睡就认为实现了直接忙轮询；
+需要明确的消费者所有权切换，避免双消费或仅反复调度 tasklet。退出时保留
+现有 arm + barrier + recheck。预算耗尽、需要调度、设备移除、停止、错误或
+无进展时退出；等待本身必须可被停止/取消打断。
+
+普通 URB 统一超时是本次发现的正确性问题：
+  原 usbwarp_hcd.c 初始化 Control 10 s、普通非 ISO 5 s；超时扫描主动取消并返回
+  -ETIMEDOUT。usbwarp_queue.c 的 ZLP 阶段也固定 5 s。HID 无限等待和串口/
+  网络空闲接收说明：5 s 未完成不能普遍等同于故障。
+  修正需要把客户驱动的取消/超时、隧道存活检测、停止后安全回收分别处理，
+  不能只把 5 s 增大，也不能在未确认物理 DMA 停止时释放共享缓冲。
+  首版已移除这个策略，见第七节。尚未用真实 HID/串口复现原分支，结论来自
+  可达代码和规范语义。
+
+原 include/usbwarp_shared.h 的普通请求 interval 注释写成毫秒，但 Linux 在 HS/
+SS 上使用规范化的 125 us 单位。若将该字段用于预测，必须按实际速率解释；
+不能把原始 bInterval 指数、Linux urb->interval、Windows pipe Interval 混用。
+首版已修正该注释，协议布局不变。
+
+单个大型 IN 完成还可能占用较长复制时间。现有 32 消息/100 us tasklet 预算
+是在 URB 之间检查，单个复制可超过预算；等待策略分类不会自动消除 FIFO
+前方大完成对 HID/ISO 的影响。需要分别测量，必要时另行设计有界复制或
+多队列机制，不能绕过现有控制屏障来掩盖它。
+
+6. 应验证的对照与指标
+
+第一步：添加端点/事务 ID 的分段计时，验证上述 5 s 语义，再做可选策略对照。
+同一会话交错重复：当前 IRQ、自适应轮询、在途全程忙轮询（上限对照）、
+按类别/进展限制预算的忙轮询。测试候选预算需覆盖本机约 120 us 的短阶段，
+但不应直接把 200 us 固化为默认值。独立统计冷启动、活跃、空闲后首次请求。
+
+设备矩阵：BOT 读写/QD1；UAS 多 QD/streams；HID 长空闲后事件；串口长时间
+无输入/突发；网卡空闲/小包/吞吐；ISO 音频不同缓冲和反馈；Bulk/ISO 摄像头；
+连续采集；大 Bulk 与 HID/ISO 混合；慢请求、暂停、取消、断连和复位。
+现有 U 盘继续只读；写入类验证应使用单独明确授权的测试数据/设备。
+其他类设备的规范分析不能算成物理验证已通过。
+
+指标：端到端 P50/P95/P99、完成发布到处理延迟、吞吐/IOPS、CPU 秒/操作、
+Windows 与 Linux CPU、总空转时间、忙轮询命中率、队列空洞、ISO 包错误/
+音频 xrun、输入首事件延迟、其他任务公平性。减少 IRQ 数量不是独立成功标准。
+
+可复现分析产物：
+  x64/ReviewChecks/UrbPolicy/analyze_bot_wait.py
+  x64/ReviewChecks/UrbPolicy/bot-wait-analysis.json
+已有对照：
+  x64/ReviewChecks/IrqCause/findings.txt
+  x64/ReviewChecks/XhciPath/findings.txt
+  x64/ReviewChecks/HybridRx/findings.txt
+
+7. 首版实现与验证（2026-11-09）
+
+已删除普通、Control、ISO 和 ZLP 阶段的转发层固定截止时间；没有给合法
+异步接收设置新的通用超时。客户驱动仍可 unlink；usbwarp_retry_cancels
+仅重试已处于 CANCELING 的物理请求，不根据年龄改变 ACTIVE 请求状态。
+共享缓冲和 URB 的释放条件保持为物理完成或已确认停止的设备/会话回收。
+
+rx_busy_us 默认 0；1..1000 表示一次有限忙轮询预算。rx_busy_bytes 默认 128，
+允许范围为 0..67108864，0 只让零长度请求符合长度条件。首版依据请求类型
+和长度做保守选择，不解析 BOT/UAS 数据、不硬编码 VID/PID，也未引入历史
+学习模型。Control/Bulk 的 IN/OUT 均可符合条件；方向本身不是快速完成保证。
+
+G2H 发布调用成功返回后才记录 published_ns 并启动窗口。该调用还包含
+doorbell 提交，因此这不是精确的共享环 index 提交时刻，也不能直接和第三节
+从 ring_produce 入口起算的时间分布比较。留在本地队列的请求
+不会启动窗口；ZLP 是单独的一次实际发布。成功且在预算内完成的候选请求
+可以延长活跃期；慢请求、取消、失败不能被视为快速进展。请求数量不会让
+窗口永久续期。连续真实进展可能使 CPU 长期活跃，每个工作段仍有时间上限，
+且 need_resched、停止、管理屏障会退出；这不是 CPU 使用率的硬性百分比上限。
+
+Interrupt/ISO 不主动启动窗口；任何 ISO 在途时暂时禁用此优化。这是单环
+首版的保守取舍，混合设备的更细粒度策略仍需实测。
+
+工作线程直接调用与 tasklet 共用的 rx_drain_locked，而非仅反复调度 tasklet。
+每次消费受 rx_lock 保护，保留管理消息屏障。空环检查不持锁、不关闭抢占；
+检查期间保留 IRQ 通知，调度器抢占工作线程后 softirq 仍能完成数据处理。
+这会保留一部分 IRQ 开销，但避免把完成进展完全绑定到忙轮询线程能否运行。
+忙轮询期间暂停旧的定时器 repoll，结束时执行 arm + recheck。
+
+debugfs busy 行记录窗口数、轮询次数、工作线程直接处理的完成数、让出次数、
+候选发布数、快/慢完成数等。elapsed_ns 是窗口经过时间，包含抢占延迟，不能
+当作 CPU 时间；性能脚本同时采集 /proc/stat 和工作线程 schedstat。
+
+验证：
+  - 普通和 ASan/UBSan 软件回归通过，编译实际 queue.c/rx.c 路径。
+  - 接收/排队请求跨过模拟 60 秒仍保持 ACTIVE；显式取消及环满后的重试不
+    提前摘除 URB；ZLP 真正发布后才启动策略。
+  - 参数边界、长等待不续期、取消不续期、预算退出、IRQ 抢先完成不重复消费、
+    管理屏障、动态禁用、停止、定时器 repoll 切换均通过。
+  - WSL Ubuntu-22.04 中，以用户指定的 kernel tree 和 KBUILD_MODPOST_WARN=1
+    编译成功，并启用 KCFLAGS=-Werror。缺 Module.symvers/BTF 的警告仍存在。
+  - Win11Debug 内层 WSL 实际加载成功，无 force 标志；MSI-X IRQ 29 握手完成，
+    原 GuestOsId 恢复，12 次空载模式切换通过，没有产生空载忙轮询窗口。
+  - 空载脚本首次把 1 MiB+1 错当超界值；查明协议上限为 64 MiB，修正测试
+    为 64 MiB+1 后通过。驱动按协议上限接受参数的行为无需修改。
+
+同一 Win11Debug/WSL 会话内完成三轮交错对照，每种模式/工作负载三次，
+每轮重新捕获并恢复原 U300。全部使用只读直接 I/O。以下为各轮结果中位数：
+
+模式                 随机 4K QD1 IOPS    随机 P99 us    内层 CPU 秒
+IRQ                         672.82          2359.2            1.81
+短请求，100 us               738.02          2117.3            3.13
+短请求，200 us               739.23          2128.7            4.24
+自适应轮询                  757.38          2203.4            3.45
+
+100 us 相对 IRQ 提高随机 IOPS 约 9.7%、降低 P99 约 10.3%，CPU 时间增加约
+73%。200 us 的随机性能基本没有额外收益，却增加更多 CPU 时间。CPU 统计来自
+/proc/stat，覆盖基准子进程的预热和后台任务，不包含 Windows/Hyper-V CPU。
+WSL 的进程视图未提供 poller schedstat，分析器将该项记为 null，不伪装成 0。
+
+顺序 1 MiB QD1：IRQ 125.01 MiB/s，100 us 133.36，200 us 131.19，轮询 131.34。
+顺序 1 MiB QD4：IRQ 117.46 MiB/s，100 us 120.12，200 us 122.58，轮询 127.24。
+QD4 的 P99 分别为 68.35、86.03、72.21、90.39 ms；尤其 100 us 方案未取得
+全面改善，不能只依据随机 IOPS 选择全局默认值。rx_busy_us=0 保持默认。
+
+探索阶段还测了 busy500 和 bulk1000；后者放宽候选长度到 1 MiB、预算 1000 us，
+仍是有限轮询。它们只有单次探索样本，CPU 代价较大，没有混入上述三轮结论。
+
+物理验证：418 次传输中的策略/消费者切换；MSI-X 屏蔽后 pending 重放；
+CPU0/CPU1 的实际中断与 worker affinity；中断关闭后的轮询回退均通过。
+屏蔽重放阶段临时关闭 busy，以确定走 IRQ/watchdog 路径；之后恢复 busy
+进行亲和性验证。首 64 MiB 的 SHA-256 与原基线一致。
+1000 us/4096 字节配置下活跃读取期间停止服务，用时 2334.99 ms（包含设备
+回 Windows 的时间）；读取按预期返回 ENODEV，WSL 响应正常。模块正常卸载
+约 101.88 ms（包含启动 wsl 命令的开销）。
+
+已恢复虚拟机原服务/驱动路径、二进制和配置，移除本轮新增测试信任；D: 健康、
+捕获日志为空。测试模式未更改。软件测试与其他设备类别的物理验证不能混同。
+
+本版证据：x64/ReviewChecks/UrbPolicy/final-build-unit.txt、idle-smoke.json；
+x64/ReviewChecks/UrbPolicyPerf/confirm-summary.json、results.jsonl、switch.jsonl、
+irq-exercise.jsonl、shutdown-result.json、unload-result.json、cleanup.json。
+
+一手资料（截至研究日期；驱动源码固定 Linux v6.6，与测试内核系列对应）
+
+[1] Linux USB Host Side API，usb_submit_urb、队列、interval、ISO
+https://docs.kernel.org/driver-api/usb/usb.html
+[2] USB-IF HID 1.11，7.2.4 Set_Idle，文档第 53 页
+https://www.usb.org/sites/default/files/hid1_11.pdf
+[3] USB-IF Mass Storage Bulk-Only 1.0，5/6 节
+https://www.usb.org/sites/default/files/usbmassbulk_10.pdf
+[4] Linux BOT，usb_stor_Bulk_transport
+https://github.com/torvalds/linux/blob/v6.6/drivers/usb/storage/transport.c
+[5] Linux UAS，uas_submit_urbs、cmd/status/data pipes、streams
+https://github.com/torvalds/linux/blob/v6.6/drivers/usb/storage/uas.c
+[6] Linux CDC-ACM，acm_port_activate、acm_submit_read_urbs
+https://github.com/torvalds/linux/blob/v6.6/drivers/usb/class/cdc-acm.c
+[7] FTDI，AN232B-04，接收缓冲和芯片 latency timer；仅对应文档覆盖型号
+https://ftdichip.com/Support/Knowledgebase/an232b_04smalldataend.htm
+[8] Linux usbnet，rx_submit、rx_complete、rx_alloc_submit
+https://github.com/torvalds/linux/blob/v6.6/drivers/net/usb/usbnet.c
+[9] Microsoft，ISO URB 的服务间隔、包和排队限制
+https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/transfer-data-to-isochronous-endpoints
+[10] Linux USB audio，snd_complete_urb、snd_usb_queue_pending_output_urbs
+https://github.com/torvalds/linux/blob/v6.6/sound/usb/endpoint.c
+[11] Linux UVC，uvc_init_video_isoc、uvc_init_video_bulk
+https://github.com/torvalds/linux/blob/v6.6/drivers/media/usb/uvc/uvc_video.c
+[12] Osmocom librtlsdr，DEFAULT_BUF_LENGTH 和异步 Bulk 读取
+https://github.com/osmocom/rtl-sdr/blob/master/src/librtlsdr.c
+[13] USB 3.2 Rev 1.1，2022，Bulk/Interrupt 流控；TI 托管的规范副本
+https://e2e.ti.com/cfs-file/__key/communityserver-discussions-components-files/138/USB-3.2-Revision-1.1.pdf
+USB-IF 版本入口：https://www.usb.org/document-library/usb-32-revision-11-june-2022
+该大 PDF 的全文抓取受工具大小限制；本次流控核对使用其可检索正文片段。
+[14] Linux btusb，Interrupt/Bulk/ISO 接收路径
+https://github.com/torvalds/linux/blob/v6.6/drivers/bluetooth/btusb.c
+[15] Linux NAPI，busy polling 与定时器 defer 是不同机制
+https://docs.kernel.org/networking/napi.html

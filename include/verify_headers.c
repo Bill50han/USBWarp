@@ -10,16 +10,28 @@
 #include <stdio.h>
 
 #include "usbwarp_shared.h"
+#include "usbwarp_iso.h"
 #include "usbwarp_ioctl.h"
 #include "usbwarp_pipe.h"
 
 /* ── Additional compile-time checks not in the headers ────────────────────── */
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_REGISTER_SERVICE_OUT) == 28, "register ABI");
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_SETUP_SHM_IN) == 48, "setup ABI");
+USBWARP_STATIC_ASSERT(sizeof(USBWARP_CONFIGURE_IRQ_IN) == 56, "IRQ config ABI");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_control_block, irq_host_state) == 0xc0, "host IRQ cache line");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_control_block, irq_arm_token) == 0x100, "guest IRQ cache line");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_control_block, irq_instance_id) == 0x140, "PCI identity cache line");
+USBWARP_STATIC_ASSERT(offsetof(USBWARP_SETUP_SHM_IN, DoorbellEventHandle) == 40, "reserved ABI slot");
 
 /* Control Block must occupy exactly 1 page */
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_control_block) == USBWARP_CONTROL_BLOCK_SIZE, "");
 
 /* Ring header must be exactly 3 cache lines */
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_ring_header) == 3 * USBWARP_CACHELINE_SIZE, "");
+
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_iso_submit) == USBWARP_MSG_ISO_SUBMIT_BASE_SIZE, "");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_iso_complete) == USBWARP_MSG_ISO_COMPLETE_BASE_SIZE, "");
+USBWARP_STATIC_ASSERT(USBWARP_MAX_MESSAGE_SIZE == 8256, "1024 ISO packet entries");
 
 /* Message header fits in half a cache line */
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_msg_header) == USBWARP_MSG_HEADER_SIZE, "");
@@ -68,6 +80,9 @@ USBWARP_STATIC_ASSERT(sizeof(USBWARP_ENUM_DEVICES_OUT) ==
  * reuse former padding, so offsets and total sizes are unchanged. */
 USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_bind_request) == 20, "");
 USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_pipe_bind_request, speed) == 18, "");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_device_entry) == 28, "list entry ABI");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_pipe_device_entry, speed) == 26, "speed reuses padding");
+USBWARP_STATIC_ASSERT(offsetof(struct usbwarp_msg_urb_submit, stream_id) == 0x4c, "stream reuses padding");
 USBWARP_STATIC_ASSERT(sizeof(USBWARP_BIND_DEVICE_IN) == 548, "");
 USBWARP_STATIC_ASSERT(offsetof(USBWARP_BIND_DEVICE_IN, Speed) == 540, "");
 

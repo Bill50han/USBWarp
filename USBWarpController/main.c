@@ -10,6 +10,7 @@
  */
 
 #include "usbwarp_cli.h"
+#include "../include/usbwarp_version.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Safe detail string extraction (#7)
@@ -39,6 +40,42 @@ static void ExtractDetail(const struct usbwarp_pipe_response *resp,
  * §2  'list' command — enumerate + cross-reference bound status (#1)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static bool ApplyBoundList(USB_DEVICE_LIST *local, const uint8_t *frame, uint32_t length)
+{
+    uint32_t prefix = sizeof(struct usbwarp_pipe_header) + sizeof(struct usbwarp_pipe_response);
+    if (length < prefix + sizeof(struct usbwarp_pipe_device_list)) return false;
+    const struct usbwarp_pipe_response *response =
+        (const struct usbwarp_pipe_response *)(frame + sizeof(struct usbwarp_pipe_header));
+    if (response->status) return false;
+    const struct usbwarp_pipe_device_list *list =
+        (const struct usbwarp_pipe_device_list *)(frame + prefix);
+    if (list->device_count > USBWARP_MAX_DEVICES_LIMIT) return false;
+    const struct usbwarp_pipe_device_entry *entries[USBWARP_MAX_DEVICES_LIMIT];
+    const uint8_t *cursor = frame + prefix + sizeof(*list);
+    uint32_t remaining = length - prefix - sizeof(*list);
+    for (uint32_t d = 0; d < list->device_count; ++d) {
+        if (remaining < sizeof(*entries[d])) return false;
+        entries[d] = (const struct usbwarp_pipe_device_entry *)cursor;
+        uint32_t size = sizeof(*entries[d]) + entries[d]->description_length;
+        if (size > remaining) return false;
+        cursor += size;
+        remaining -= size;
+    }
+    if (remaining) return false;
+    // Publish only a fully validated snapshot; errors leave state unknown.
+    for (int i = 0; i < local->count; ++i) {
+        local->devices[i].bound = false;
+        for (uint32_t d = 0; d < list->device_count; ++d) {
+            if (GuidsEqual(&local->devices[i].containerId, entries[d]->device_guid)) {
+                local->devices[i].bound = entries[d]->bound != 0;
+                if (entries[d]->speed) local->devices[i].speed = entries[d]->speed;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 static int CmdList(int argc, char *argv[])
 {
     USB_DEVICE_LIST devList;
@@ -55,8 +92,6 @@ static int CmdList(int argc, char *argv[])
 
     /* FIX #1: Query bound devices from Service and cross-reference. */
     if (PipeConnect(&pc) == 0) {
-        serviceOnline = true;
-
         uint8_t *respBuf = (uint8_t *)HeapAlloc(GetProcessHeap(), 0,
                                                   PIPE_BUF_SIZE);
         if (respBuf) {
@@ -65,43 +100,7 @@ static int CmdList(int argc, char *argv[])
             if (PipeSendCommand(&pc, USBWARP_PIPE_CMD_LIST_DEVICES,
                                 NULL, 0, respBuf, PIPE_BUF_SIZE,
                                 &respLen) == 0) {
-                uint32_t minResp = sizeof(struct usbwarp_pipe_header) +
-                                   sizeof(struct usbwarp_pipe_response) +
-                                   sizeof(struct usbwarp_pipe_device_list);
-
-                if (respLen >= minResp) {
-                    const uint8_t *p = respBuf +
-                        sizeof(struct usbwarp_pipe_header) +
-                        sizeof(struct usbwarp_pipe_response);
-                    const struct usbwarp_pipe_device_list *dl =
-                        (const struct usbwarp_pipe_device_list *)p;
-
-                    const uint8_t *cursor = p + sizeof(*dl);
-                    uint32_t remaining = respLen - (uint32_t)(cursor - respBuf);
-
-                    for (uint32_t d = 0; d < dl->device_count; d++) {
-                        if (remaining < sizeof(struct usbwarp_pipe_device_entry))
-                            break;
-
-                        const struct usbwarp_pipe_device_entry *entry =
-                            (const struct usbwarp_pipe_device_entry *)cursor;
-
-                        /* Cross-reference: match containerId with local
-                         * enumerated devices. */
-                        for (i = 0; i < devList.count; i++) {
-                            if (GuidsEqual(&devList.devices[i].containerId,
-                                           entry->device_guid)) {
-                                devList.devices[i].bound = true;
-                                break;
-                            }
-                        }
-
-                        cursor += sizeof(struct usbwarp_pipe_device_entry) +
-                                  entry->description_length;
-                        remaining = (uint32_t)(respLen -
-                            (uint32_t)(cursor - respBuf));
-                    }
-                }
+                serviceOnline = ApplyBoundList(&devList, respBuf, respLen);
             }
             HeapFree(GetProcessHeap(), 0, respBuf);
         }
@@ -111,10 +110,10 @@ static int CmdList(int argc, char *argv[])
 
     /* Print device list. */
     printf("\n");
-    printf("  %-10s  %-9s  %-4s  %-8s  %s\n",
-           "BUSID", "VID:PID", "SPD", "STATE", "DESCRIPTION");
-    printf("  %-10s  %-9s  %-4s  %-8s  %s\n",
-           "----------", "---------", "----", "--------",
+    printf("  %-10s  %-9s  %-11s  %-8s  %s\n",
+           "BUSID", "VID:PID", "SPEED", "STATE", "DESCRIPTION");
+    printf("  %-10s  %-9s  %-11s  %-8s  %s\n",
+           "----------", "---------", "-----------", "--------",
            "-------------------------------------------");
 
     if (devList.count == 0) {
@@ -124,7 +123,7 @@ static int CmdList(int argc, char *argv[])
     for (i = 0; i < devList.count; i++) {
         USB_HOST_DEVICE *d = &devList.devices[i];
         const char *state;
-        char spd[2] = { SpeedLetter(d->speed), '\0' };
+        const char *spd = SpeedName(d->speed);
 
         if (d->bound)
             state = "Attached";
@@ -133,7 +132,7 @@ static int CmdList(int argc, char *argv[])
         else
             state = "Unknown";
 
-        printf("  %-10s  %04x:%04x  %-4s  %-8s  %s\n",
+        printf("  %-10s  %04x:%04x  %-11s  %-8s  %s\n",
                d->busId,
                d->vendorId, d->productId,
                spd,
@@ -144,8 +143,7 @@ static int CmdList(int argc, char *argv[])
     printf("\n");
 
     if (!serviceOnline) {
-        printf("  Note: Service not running — device state unknown.\n");
-        printf("  Start the service: UsbWarpService.exe --id <VM-GUID>\n\n");
+        printf("  Note: Service device state unavailable. Use 'status' to check the session.\n\n");
     }
 
     return 0;
@@ -176,7 +174,7 @@ static int CmdStatus(int argc, char *argv[])
     uint32_t minLen = sizeof(struct usbwarp_pipe_header) +
                       sizeof(struct usbwarp_pipe_response) +
                       sizeof(struct usbwarp_pipe_status);
-    if (respLen < minLen) {
+    if (respLen < sizeof(struct usbwarp_pipe_header) + sizeof(struct usbwarp_pipe_response)) {
         fprintf(stderr, "Error: status response too short.\n");
         return 1;
     }
@@ -191,6 +189,11 @@ static int CmdStatus(int argc, char *argv[])
                       detail, sizeof(detail));
         fprintf(stderr, "Error: service returned status %d: %s\n",
                 resp->status, detail);
+        return 1;
+    }
+
+    if (respLen < minLen) {
+        fprintf(stderr, "Error: status response too short.\n");
         return 1;
     }
 
@@ -227,13 +230,14 @@ static int CmdStats(int argc, char *argv[])
     PIPE_CLIENT pc;
     uint8_t     respBuf[4096];
     uint32_t    respLen = 0;
+    struct usbwarp_pipe_stats_request request = {0};
 
     (void)argc; (void)argv;
 
     if (PipeConnect(&pc) != 0) return 1;
 
     if (PipeSendCommand(&pc, USBWARP_PIPE_CMD_QUERY_STATS,
-                        NULL, 0, respBuf, sizeof(respBuf), &respLen) != 0) {
+                        &request, sizeof(request), respBuf, sizeof(respBuf), &respLen) != 0) {
         fprintf(stderr, "Error: failed to query stats.\n");
         PipeDisconnect(&pc);
         return 1;
@@ -243,7 +247,7 @@ static int CmdStats(int argc, char *argv[])
     uint32_t minLen = sizeof(struct usbwarp_pipe_header) +
                       sizeof(struct usbwarp_pipe_response) +
                       sizeof(struct usbwarp_pipe_stats_response);
-    if (respLen < minLen) {
+    if (respLen < sizeof(struct usbwarp_pipe_header) + sizeof(struct usbwarp_pipe_response)) {
         fprintf(stderr, "Error: stats response too short.\n");
         return 1;
     }
@@ -260,31 +264,25 @@ static int CmdStats(int argc, char *argv[])
         return 1;
     }
 
+    if (respLen < minLen) {
+        fprintf(stderr, "Error: stats response too short.\n");
+        return 1;
+    }
+
     const struct usbwarp_pipe_stats_response *sr =
         (const struct usbwarp_pipe_stats_response *)
         ((const uint8_t *)resp + sizeof(*resp));
 
-    char outBuf[64], inBuf[64];
-    FormatBytes(sr->bytes_out, outBuf, sizeof(outBuf));
-    FormatBytes(sr->bytes_in, inBuf, sizeof(inBuf));
+    char bytesBuf[64];
+    FormatBytes(sr->bytes_out + sr->bytes_in, bytesBuf, sizeof(bytesBuf));
 
     printf("\n");
     printf("  UsbWarp Performance Statistics\n");
     printf("  ------------------------------\n");
-    printf("  URB submits:     %llu\n",
+    printf("  URBs processed:  %llu\n",
            (unsigned long long)sr->urb_submit_count);
-    printf("  URB completes:   %llu\n",
-           (unsigned long long)sr->urb_complete_count);
-    printf("  URB cancels:     %llu\n",
-           (unsigned long long)sr->urb_cancel_count);
-    printf("  URB errors:      %llu\n",
-           (unsigned long long)sr->urb_error_count);
-    printf("  Bytes OUT:       %s\n", outBuf);
-    printf("  Bytes IN:        %s\n", inBuf);
-    printf("  Ring usage:      %u%%\n", sr->ring_usage_percent);
-    printf("  Buffer usage:    %u%%\n", sr->buffer_usage_percent);
-    printf("  Rate limit hits: %u\n", sr->rate_limit_hits);
-    printf("  CB trips:        %u\n", sr->circuit_breaker_trips);
+    printf("  Bytes xferred:   %s\n", bytesBuf);
+    printf("  G2H ring usage:  %u%%\n", sr->ring_usage_percent);
     printf("\n");
 
     return 0;
@@ -333,12 +331,10 @@ static int CmdBind(int argc, char *argv[])
 
     if (PipeConnect(&pc) != 0) return 1;
 
-    /* Build bind request: fixed header + variable-length device path.
-     * We send the device interface path (\\?\USB#...#{GUID}) which
-     * the driver needs for WdfIoTargetOpen. */
+    /* The service resolves either an interface or a physical instance ID.
+     * Driverless devices do not need a pre-existing interface to bind. */
     {
-        const char *pathToSend = found->devicePath[0] ?
-                                 found->devicePath : found->instanceId;
+        const char *pathToSend = found->instanceId;
         struct usbwarp_pipe_bind_request req;
         uint32_t pathLen = (uint32_t)strlen(pathToSend);
         uint32_t payloadLen = sizeof(req) + pathLen;
@@ -439,7 +435,7 @@ static int CmdUnbind(int argc, char *argv[])
 
     if (PipeConnect(&pc) != 0) return 1;
 
-    struct usbwarp_pipe_bind_request req;
+    struct usbwarp_pipe_bind_request req = {0};
     memcpy(req.device_guid, &found->containerId, 16);
 
     uint8_t  respBuf[4096];
@@ -522,8 +518,8 @@ int main(int argc, char *argv[])
         return 0;
     }
     if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-v") == 0) {
-        printf("UsbWarp Controller v%u.%u (protocol %u.%u)\n",
-               0, 1,
+        printf("UsbWarp Controller v%s (protocol %u.%u)\n",
+               USBWARP_VERSION_STRING,
                USBWARP_PROTOCOL_VERSION_MAJOR,
                USBWARP_PROTOCOL_VERSION_MINOR);
         return 0;

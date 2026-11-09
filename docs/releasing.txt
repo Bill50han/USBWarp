@@ -1,0 +1,32 @@
+Building a USBWarp prerelease
+============================
+
+1. Update include/usbwarp_version.h and release notes. The product version is
+   distinct from the negotiated wire protocol and capture INF driver rank.
+2. Build all projects Release|x64 with VS 2022 / WDK 10.0.26100, using the x64
+   MSBuild host. Run tests/build_service_tests.ps1. Run the Linux production-code
+   tests with SANITIZE=1 bash tests/run_unit.sh and build usbwarp.ko against the
+   intended WSL kernel: KBUILD_MODPOST_WARN=1 make KCFLAGS=-Werror.
+3. Review and commit the complete source. Do not archive an uncommitted tree.
+4. Select a code-signing certificate with a private key in CurrentUser\My. For
+   alpha builds this may be a dedicated self-signed test certificate. Never
+   export its private key or trust it automatically on the build host.
+5. Run scripts/package_release.ps1 with -CertificateThumbprint, -SignTool and
+   -Inf2Cat paths. Optional -LinuxModule and -LinuxBuildInfo add a kernel-specific
+   module archive. The script accepts a clean checkout, signs copies of both
+   drivers, generates/signs the capture catalog and exports only the public CER.
+   It writes an exact-commit source archive, Windows package, matching PDB archive,
+   manifests and checksums under x64/ReleaseBundles/<version>.
+6. Validate the packaged artifacts in the test VM. Record exact hashes, build
+   configuration, test commands/results and any unavailable hardware coverage in
+   validation.txt beside the archives; regenerate SHA256SUMS.txt after that report.
+   Restore the VM's original deployment and remove temporary certificate trust.
+7. Only after checks pass, tag the source commit and publish a GitHub prerelease
+   with the notes and all archives/checksums. Authentication uses the authorized
+   GitHub login; do not include tokens, credential XML, lab snapshots or private
+   signing keys in commits or release assets.
+
+The packager uses explicit file lists and a clean git archive for source. It
+does not upload, create a tag, install a driver or import a certificate into Root.
+The Linux binary's build-info.txt must record uname -r, modinfo vermagic/version,
+kernel .config SHA-256 and kernel git commit. It is not a generic WSL module.

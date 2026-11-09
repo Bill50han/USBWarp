@@ -1,352 +1,253 @@
-/*
- * usbwarp_drv_client.cpp — IOCTL client for UsbWarp.sys Kernel Driver.
- *
- * Copyright (c) 2026 UsbWarp Project
- *
- * FIX #1: Complete IOCTL communication.
- *
- * Implements the Service → Kernel Driver interface defined in usbwarp_ioctl.h:
- *   - REGISTER_SERVICE:  Establish identity, enable heartbeat monitoring.
- *   - SETUP_SHM:         Pass Section handle for kernel-side mapping.
- *   - HEARTBEAT:         Periodic keep-alive (called every 2 seconds).
- *   - BIND_DEVICE:       Open a USB device for passthrough.
- *   - UNBIND_DEVICE:     Release a passthrough device.
- *   - QUERY_STATUS:      Read driver health/state.
- *   - ENUM_DEVICES:      Authoritative per-device snapshot.
- *
- * Concurrency: the kernel driver is the single source of truth for
- * bound-device state, so bind/unbind/list are GUID-keyed pass-throughs
- * with no Service-side mirror.  driverLock (SRWLOCK) guards the hDriver
- * lifetime — IOCTLs take it shared, open/close take it exclusive — so a
- * bind that runs for seconds never blocks the 2s heartbeat.
- *
- * All functions return FALSE if the driver is not loaded (graceful degradation).
- */
-
+// SPDX-License-Identifier: GPL-2.0-only
+/* The kernel is the only device manager. Every I/O has its own OVERLAPPED;
+ * cancellation is drained before buffers, events or the driver handle die. */
 #include "warp_service.h"
-#include <stdio.h>
-#include <string.h>
+#include <wchar.h>
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §1  Open / Close
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientOpen(struct warp_session *s)
+namespace {
+bool DriverLost(DWORD error)
 {
-    AcquireSRWLockExclusive(&s->driverLock);
-
-    if (s->hDriver) {
-        ReleaseSRWLockExclusive(&s->driverLock);
-        return TRUE;
-    }
-
-    s->hDriver = CreateFileW(
-        L"\\\\.\\UsbWarp",
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, NULL);
-
-    if (s->hDriver == INVALID_HANDLE_VALUE) {
-        s->hDriver = NULL;
-        ReleaseSRWLockExclusive(&s->driverLock);
-        return FALSE;
-    }
-
-    ReleaseSRWLockExclusive(&s->driverLock);
-
-    LogInfo("Kernel Driver opened: handle=%p", s->hDriver);
-    return TRUE;
+    return error == ERROR_INVALID_HANDLE || error == ERROR_DEVICE_NOT_CONNECTED ||
+           error == ERROR_FILE_NOT_FOUND || error == ERROR_GEN_FAILURE || error == ERROR_REVISION_MISMATCH;
 }
 
-void DrvClientClose(struct warp_session *s)
+BOOL Ioctl(warp_session *s, HANDLE driver, DWORD code, void *input, DWORD inBytes,
+           void *output, DWORD outBytes, DWORD *returned, DWORD timeout, bool cancellable)
 {
-    AcquireSRWLockExclusive(&s->driverLock);
-
-    if (s->hDriver) {
-        CloseHandle(s->hDriver);
-        s->hDriver = NULL;
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) return FALSE;
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(driver, code, input, inBytes, output, outBytes, &bytes, &ov);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && error == ERROR_IO_PENDING) {
+        HANDLE events[] = {ov.hEvent, s->stopEvent, s->sessionStopEvent};
+        DWORD result = WaitForMultipleObjects(cancellable ? 3 : 1, events, FALSE, timeout);
+        if (result != WAIT_OBJECT_0) CancelIoEx(driver, &ov);
+        // CancelIoEx only requests cancellation. No early return is safe here.
+        ok = GetOverlappedResult(driver, &ov, &bytes, TRUE);
+        error = ok ? ERROR_SUCCESS : GetLastError();
     }
-    s->driverRegistered = false;
-    s->driverShmSetup   = false;
-
-    ReleaseSRWLockExclusive(&s->driverLock);
+    CloseHandle(ov.hEvent);
+    if (returned) *returned = bytes;
+    SetLastError(error);
+    return ok;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §2  REGISTER_SERVICE
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientRegister(struct warp_session *s)
+BOOL Call(warp_session *s, DWORD code, void *input, DWORD inBytes,
+          void *output, DWORD outBytes, DWORD *returned, DWORD timeout = 30000)
 {
-    USBWARP_REGISTER_SERVICE_IN in;
-    USBWARP_REGISTER_SERVICE_OUT out;
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    memset(&in, 0, sizeof(in));
-    in.Version             = USBWARP_IOCTL_STRUCT_VERSION;
-    in.ProcessId           = GetCurrentProcessId();
-    in.HeartbeatIntervalMs = 2000;
-    memset(&out, 0, sizeof(out));
-
     AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_REGISTER_SERVICE,
-                         &in, sizeof(in), &out, sizeof(out),
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    if (!ok) {
-        LogError("IOCTL REGISTER_SERVICE failed: %lu", GetLastError());
-        return FALSE;
-    }
-
-    s->driverRegistered = true;
-    LogInfo("Driver registered: driverVer=0x%x maxDevices=%u",
-            out.DriverVersion, out.MaxDevices);
-    return TRUE;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §3  SETUP_SHM
- *
- *   Passes the Section handle to the kernel driver.  The driver calls
- *   ObReferenceObjectByHandle(UserMode) to independently hold the Section,
- *   then maps it into system space via MmMapViewInSystemSpace.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientSetupShm(struct warp_session *s)
-{
-    USBWARP_SETUP_SHM_IN in;
-    USBWARP_SETUP_SHM_OUT out;
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    if (!s->section) {
-        LogError("SETUP_SHM: no Section handle");
-        return FALSE;
-    }
-
-    memset(&in, 0, sizeof(in));
-    in.Version              = USBWARP_IOCTL_STRUCT_VERSION;
-    in.SectionHandle        = (uint64_t)(uintptr_t)s->section;
-    in.ExpectedSize         = s->shm_size;
-    in.RingSizePerDirection = s->cfg.ring_data_size;
-    in.BufferSize           = s->cfg.buffer_size;
-    memset(&out, 0, sizeof(out));
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver || !s->driverRegistered) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_SETUP_SHM,
-                         &in, sizeof(in), &out, sizeof(out),
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    if (!ok) {
-        LogError("IOCTL SETUP_SHM failed: %lu", GetLastError());
-        return FALSE;
-    }
-
-    s->driverShmSetup = true;
-    LogInfo("Driver SHM established: buffers=%u dataOff=0x%llx dataSz=0x%llx",
-            out.BufferCount,
-            (unsigned long long)out.DataRegionOffset,
-            (unsigned long long)out.DataRegionSize);
-    return TRUE;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §4  HEARTBEAT
- *
- *   Called every 2 seconds from the main loop.  Sends Service state to
- *   driver; receives driver state and pending URB count.
- *   This is also used by the driver for orphan detection (#3/#10).
- *
- *   Note: the fatal-error close happens AFTER releasing the shared lock —
- *   DrvClientClose takes it exclusively.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientHeartbeat(struct warp_session *s)
-{
-    USBWARP_HEARTBEAT_IN in;
-    USBWARP_HEARTBEAT_OUT out;
-    DWORD bytesReturned = 0;
     BOOL ok = FALSE;
-
-    memset(&in, 0, sizeof(in));
-    in.Version      = USBWARP_IOCTL_STRUCT_VERSION;
-    in.Timestamp    = NowNs();
-    in.ServiceState = s->mmio_mapped ? USBWARP_STATE_RUNNING :
-                                      USBWARP_STATE_INIT;
-    memset(&out, 0, sizeof(out));
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (s->hDriver && s->driverRegistered) {
-        ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_HEARTBEAT,
-                             &in, sizeof(in), &out, sizeof(out),
-                             &bytesReturned, NULL);
+    DWORD error = ERROR_NOT_READY;
+    if (s->hDriver && s->driverShmSetup && !StopRequested(s) &&
+        WaitForSingleObject(s->sessionStopEvent, 0) != WAIT_OBJECT_0) {
+        ok = Ioctl(s, s->hDriver, code, input, inBytes, output, outBytes, returned, timeout, true);
+        error = ok ? ERROR_SUCCESS : GetLastError();
     }
     ReleaseSRWLockShared(&s->driverLock);
-
-    if (!ok) {
-        DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_INVALID_HANDLE) {
-            LogWarn("Driver connection lost (heartbeat failed: %lu)", err);
-            DrvClientClose(s);
-        }
-        return FALSE;
+    if (!ok && (code == IOCTL_USBWARP_HEARTBEAT || code == IOCTL_USBWARP_QUERY_STATUS ||
+                code == IOCTL_USBWARP_ENUM_DEVICES) && DriverLost(error)) {
+        s->lastSessionError.store(error);
+        SetEvent(s->driverFaultEvent);
     }
+    SetLastError(error);
+    return ok;
+}
 
+BOOL ValidReply(DWORD actual, DWORD needed, uint32_t version)
+{
+    if (actual < needed) { SetLastError(ERROR_INVALID_DATA); return FALSE; }
+    if (version != USBWARP_IOCTL_STRUCT_VERSION) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
     return TRUE;
 }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §5  QUERY_STATUS / ENUM_DEVICES
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientQueryStatus(struct warp_session *s, USBWARP_QUERY_STATUS_OUT *out)
-{
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    memset(out, 0, sizeof(*out));
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_QUERY_STATUS,
-                         NULL, 0, out, sizeof(*out),
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    return ok;
 }
 
-BOOL DrvClientEnumDevices(struct warp_session *s, USBWARP_ENUM_DEVICES_OUT *out)
+BOOL DrvClientOpen(warp_session *s)
 {
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    memset(out, 0, sizeof(*out));
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_ENUM_DEVICES,
-                         NULL, 0, out, sizeof(*out),
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    return ok;
+    AcquireSRWLockExclusive(&s->driverLock);
+    if (s->hDriver) { ReleaseSRWLockExclusive(&s->driverLock); SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
+    HANDLE h = CreateFileW(L"\\\\.\\UsbWarp", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    DWORD error = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (!error) s->hDriver = h;
+    ReleaseSRWLockExclusive(&s->driverLock);
+    SetLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §6  BIND_DEVICE (GUID-keyed)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientBindGuid(struct warp_session *s, const uint8_t device_guid[16],
-                       const WCHAR *instance_path, uint8_t speed,
-                       uint32_t *device_index, uint16_t *vendor_id,
-                       uint16_t *product_id)
+BOOL DrvClientRegister(warp_session *s)
 {
-    USBWARP_BIND_DEVICE_IN in;
-    USBWARP_BIND_DEVICE_OUT out;
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    memset(&in, 0, sizeof(in));
+    USBWARP_REGISTER_SERVICE_IN in{};
+    USBWARP_REGISTER_SERVICE_OUT out{};
     in.Version = USBWARP_IOCTL_STRUCT_VERSION;
-    memcpy(in.DeviceGuid, device_guid, 16);
-    in.InstancePathLength =
-        (uint32_t)(wcslen(instance_path) + 1) * sizeof(WCHAR);
-    wcsncpy_s((wchar_t *)in.InstancePath, 256, instance_path, _TRUNCATE);
+    in.ProcessId = GetCurrentProcessId();
+    in.HeartbeatIntervalMs = 2000;
+    DWORD bytes = 0;
+    AcquireSRWLockExclusive(&s->driverLock);
+    SetLastError(ERROR_NOT_READY);
+    BOOL ok = s->hDriver && Ioctl(s, s->hDriver, IOCTL_USBWARP_REGISTER_SERVICE,
+        &in, sizeof(in), &out, sizeof(out), &bytes, 10000, true);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok) {
+        s->driverRegistered = true; // even a malformed success reply must be torn down
+        ok = ValidReply(bytes, sizeof(out), out.Version);
+        if (ok) s->driverCaps = out.Capabilities;
+        error = ok ? ERROR_SUCCESS : GetLastError();
+    }
+    ReleaseSRWLockExclusive(&s->driverLock);
+    SetLastError(error);
+    return ok;
+}
+
+BOOL DrvClientSetupShm(warp_session *s)
+{
+    USBWARP_SETUP_SHM_IN in{};
+    USBWARP_SETUP_SHM_OUT out{};
+    in.Version = USBWARP_IOCTL_STRUCT_VERSION;
+    in.SectionHandle = (uint64_t)(uintptr_t)s->section;
+    in.ExpectedSize = s->shm_size;
+    in.RingSizePerDirection = s->cfg.ring_data_size;
+    in.BufferSize = s->cfg.buffer_size;
+    in.MaxDevices = s->cfg.max_devices;
+    in.DoorbellEventHandle = (uint64_t)(uintptr_t)s->doorbellEvent;
+    DWORD bytes = 0;
+    AcquireSRWLockExclusive(&s->driverLock);
+    SetLastError(ERROR_NOT_READY);
+    BOOL ok = s->hDriver && s->driverRegistered && s->section &&
+        Ioctl(s, s->hDriver, IOCTL_USBWARP_SETUP_SHM, &in, sizeof(in), &out,
+              sizeof(out), &bytes, 10000, true);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok) {
+        s->driverShmSetup = true;
+        ok = ValidReply(bytes, sizeof(out), out.Version);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+    }
+    ReleaseSRWLockExclusive(&s->driverLock);
+    SetLastError(error);
+    return ok;
+}
+
+DWORD DrvClientClose(warp_session *s)
+{
+    if (s->sessionStopEvent) SetEvent(s->sessionStopEvent);
+    // Shared callers cancel and drain; the exclusive lease then owns all I/O.
+    AcquireSRWLockExclusive(&s->driverLock);
+    DWORD error = ERROR_SUCCESS;
+    if (s->hDriver) {
+        if (s->driverRegistered) {
+            USBWARP_TEARDOWN_SHM_IN in{};
+            in.Version = USBWARP_IOCTL_STRUCT_VERSION;
+            in.Flags = USBWARP_TEARDOWN_FLAG_GRACEFUL;
+            if (!Ioctl(s, s->hDriver, IOCTL_USBWARP_TEARDOWN_SHM, &in, sizeof(in),
+                       nullptr, 0, nullptr, INFINITE, false)) error = GetLastError();
+        }
+        CloseHandle(s->hDriver); // kernel file cleanup is the crash/failure fallback
+        s->hDriver = nullptr;
+    }
+    s->driverRegistered = s->driverShmSetup = false;
+    s->driverCaps = 0;
+    s->driverState.store(USBWARP_STATE_INIT);
+    ReleaseSRWLockExclusive(&s->driverLock);
+    return error;
+}
+
+BOOL DrvClientActive(warp_session *s)
+{
+    AcquireSRWLockShared(&s->driverLock);
+    BOOL active = s->hDriver && s->driverRegistered && s->driverShmSetup &&
+        !StopRequested(s) && WaitForSingleObject(s->sessionStopEvent, 0) != WAIT_OBJECT_0;
+    ReleaseSRWLockShared(&s->driverLock);
+    return active;
+}
+
+BOOL DrvClientConfigureIrq(warp_session *s)
+{
+    if (!s->msixPresent) return TRUE;
+    // Close holds driverLock while the kernel waits for the guest shutdown
+    // ACK. Guest vector teardown must not wait on that same lock. The PCI
+    // callback has already updated its shadow; shutdown quiesces the route.
+    if (StopRequested(s) || WaitForSingleObject(s->sessionStopEvent, 0) == WAIT_OBJECT_0)
+        return TRUE;
+    USBWARP_CONFIGURE_IRQ_IN in{};
+    in.Version = USBWARP_IOCTL_STRUCT_VERSION;
+    AcquireSRWLockExclusive(&s->pciLock);
+    memcpy(in.InstanceId, &s->instance_id, 16);
+    in.Nonce = s->irqNonce;
+    in.Revision = ++s->irqRevision;
+    memcpy(&in.MsiAddress, s->msixTable, 8);
+    memcpy(&in.MsiData, s->msixTable + 8, 4);
+    uint32_t control;
+    memcpy(&control, s->msixTable + 12, 4);
+    uint32_t cfg = s->pci_cfg[0x50 / 4];
+    if (cfg & 0x80000000u) in.Flags |= USBWARP_IRQ_CONFIG_ENABLED;
+    if ((cfg & 0x40000000u) || (control & 1)) in.Flags |= USBWARP_IRQ_CONFIG_MASKED;
+    ReleaseSRWLockExclusive(&s->pciLock);
+    BOOL ok = Call(s, IOCTL_USBWARP_CONFIGURE_IRQ, &in, sizeof(in), nullptr, 0, nullptr);
+    // The PCI shell can mask/free its vector after kernel session teardown.
+    // Keep emulating configuration until HdvTeardownDeviceHost returns.
+    if (!ok && (StopRequested(s) || WaitForSingleObject(s->sessionStopEvent, 0) == WAIT_OBJECT_0)) return TRUE;
+    return ok;
+}
+
+BOOL DrvClientHeartbeat(warp_session *s)
+{
+    USBWARP_HEARTBEAT_IN in{};
+    USBWARP_HEARTBEAT_OUT out{};
+    in.Version = USBWARP_IOCTL_STRUCT_VERSION;
+    in.Timestamp = NowNs();
+    in.ServiceState = s->mmio_mapped.load() ? USBWARP_STATE_RUNNING : USBWARP_STATE_INIT;
+    DWORD bytes = 0;
+    if (!Call(s, IOCTL_USBWARP_HEARTBEAT, &in, sizeof(in), &out, sizeof(out), &bytes, 5000)) return FALSE;
+    if (!ValidReply(bytes, sizeof(out), out.Version)) return FALSE;
+    s->driverState.store(out.DriverState);
+    BOOL healthy = out.DriverState != USBWARP_STATE_ERROR && out.DriverState != USBWARP_STATE_STOPPED &&
+                   out.DriverState != USBWARP_STATE_SHUTTING_DOWN;
+    if (!healthy) SetLastError(ERROR_DEVICE_NOT_CONNECTED);
+    return healthy;
+}
+
+BOOL DrvClientQueryStatus(warp_session *s, USBWARP_QUERY_STATUS_OUT *out)
+{
+    memset(out, 0, sizeof(*out));
+    DWORD bytes = 0;
+    return Call(s, IOCTL_USBWARP_QUERY_STATUS, nullptr, 0, out, sizeof(*out), &bytes) &&
+           ValidReply(bytes, sizeof(*out), out->Version);
+}
+BOOL DrvClientEnumDevices(warp_session *s, USBWARP_ENUM_DEVICES_OUT *out)
+{
+    memset(out, 0, sizeof(*out));
+    DWORD bytes = 0;
+    if (!Call(s, IOCTL_USBWARP_ENUM_DEVICES, nullptr, 0, out, sizeof(*out), &bytes) ||
+        !ValidReply(bytes, sizeof(*out), out->Version)) return FALSE;
+    if (out->DeviceCount > USBWARP_MAX_DEVICES_LIMIT) { SetLastError(ERROR_INVALID_DATA); return FALSE; }
+    return TRUE;
+}
+BOOL DrvClientBindGuid(warp_session *s, const uint8_t guid[16], const WCHAR *path,
+                       uint8_t speed, uint32_t *index, uint16_t *vid, uint16_t *pid)
+{
+    USBWARP_BIND_DEVICE_IN in{};
+    USBWARP_BIND_DEVICE_OUT out{};
+    size_t length = wcsnlen_s(path, _countof(in.InstancePath));
+    if (length == _countof(in.InstancePath)) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+    in.Version = USBWARP_IOCTL_STRUCT_VERSION;
+    memcpy(in.DeviceGuid, guid, 16);
+    memcpy(in.InstancePath, path, (length + 1) * sizeof(WCHAR));
+    in.InstancePathLength = (uint32_t)((length + 1) * sizeof(WCHAR));
     in.Speed = speed;
-    memset(&out, 0, sizeof(out));
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver || !s->driverShmSetup) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_BIND_DEVICE,
-                         &in, sizeof(in), &out, sizeof(out),
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    if (!ok) {
-        LogError("IOCTL BIND_DEVICE failed: %lu", GetLastError());
-        return FALSE;
-    }
-
-    if (device_index) *device_index = out.DeviceIndex;
-    if (vendor_id)    *vendor_id    = out.VendorId;
-    if (product_id)   *product_id   = out.ProductId;
-
-    LogInfo("Driver bound device idx=%u VID=%04x PID=%04x",
-            out.DeviceIndex, out.VendorId, out.ProductId);
+    DWORD bytes = 0;
+    if (!Call(s, IOCTL_USBWARP_BIND_DEVICE, &in, sizeof(in), &out, sizeof(out), &bytes) ||
+        !ValidReply(bytes, sizeof(out), out.Version)) return FALSE;
+    if (!out.DeviceIndex || out.DeviceIndex > USBWARP_MAX_DEVICES_LIMIT) { SetLastError(ERROR_INVALID_DATA); return FALSE; }
+    if (index) *index = out.DeviceIndex;
+    if (vid) *vid = out.VendorId;
+    if (pid) *pid = out.ProductId;
     return TRUE;
 }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §7  UNBIND_DEVICE (GUID-keyed) + unbind-all
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-BOOL DrvClientUnbindGuid(struct warp_session *s, const uint8_t device_guid[16])
+BOOL DrvClientUnbindGuid(warp_session *s, const uint8_t guid[16])
 {
-    USBWARP_UNBIND_DEVICE_IN in;
-    DWORD bytesReturned = 0;
-    BOOL ok;
-
-    memset(&in, 0, sizeof(in));
+    USBWARP_UNBIND_DEVICE_IN in{};
     in.Version = USBWARP_IOCTL_STRUCT_VERSION;
-    memcpy(in.DeviceGuid, device_guid, 16);
-
-    AcquireSRWLockShared(&s->driverLock);
-    if (!s->hDriver || !s->driverShmSetup) {
-        ReleaseSRWLockShared(&s->driverLock);
-        return FALSE;
-    }
-    ok = DeviceIoControl(s->hDriver, IOCTL_USBWARP_UNBIND_DEVICE,
-                         &in, sizeof(in), NULL, 0,
-                         &bytesReturned, NULL);
-    ReleaseSRWLockShared(&s->driverLock);
-
-    if (!ok)
-        LogError("IOCTL UNBIND_DEVICE failed: %lu", GetLastError());
-
-    return ok;
-}
-
-void DrvClientUnbindAll(struct warp_session *s)
-{
-    USBWARP_ENUM_DEVICES_OUT en;
-
-    for (int pass = 0; pass < 3; pass++) {
-        if (!DrvClientEnumDevices(s, &en))
-            return;
-        if (en.DeviceCount == 0)
-            return;
-
-        for (uint32_t i = 0; i < en.DeviceCount; i++) {
-            /* Removing=1: hot-remove teardown owns the slot and will
-             * free it on its own — don't fight it. */
-            if (en.Devices[i].Removing)
-                continue;
-            DrvClientUnbindGuid(s, en.Devices[i].DeviceGuid);
-        }
-    }
-
-    if (DrvClientEnumDevices(s, &en) && en.DeviceCount > 0)
-        LogWarn("unbind-all: %u device(s) still bound after 3 passes",
-                en.DeviceCount);
+    memcpy(in.DeviceGuid, guid, 16);
+    return Call(s, IOCTL_USBWARP_UNBIND_DEVICE, &in, sizeof(in), nullptr, 0, nullptr);
 }

@@ -30,9 +30,9 @@ extern bool usbwarp_debug;
 static struct dentry *dbg_dir;
 
 /* Global pointer to the active HCD — set during probe, cleared on remove.
- * Protected by RCU for safe access from debugfs handlers. */
+ * Protected for the full handler lifetime by g_warp_lock. */
 static struct usbwarp_hcd *g_warp_hcd __read_mostly;
-static DEFINE_SPINLOCK(g_warp_lock);
+static DEFINE_MUTEX(g_warp_lock);
 
 /* Fuzz state: when fuzz_paused is set, the Guest poll thread stops
  * writing to the G2H Ring (heartbeats and URB submits).  This prevents
@@ -46,9 +46,17 @@ static atomic_t fuzz_inject_fail  = ATOMIC_INIT(0);
 
 void usbwarp_debugfs_set_hcd(struct usbwarp_hcd *w)
 {
-	spin_lock(&g_warp_lock);
+	mutex_lock(&g_warp_lock);
 	g_warp_hcd = w;
-	spin_unlock(&g_warp_lock);
+	mutex_unlock(&g_warp_lock);
+}
+
+void usbwarp_debugfs_clear_hcd(struct usbwarp_hcd *w)
+{
+    mutex_lock(&g_warp_lock);
+    if (g_warp_hcd == w)
+        g_warp_hcd = NULL;
+    mutex_unlock(&g_warp_lock);
 }
 
 /* Check if G2H production is paused (called by poll thread).
@@ -76,15 +84,8 @@ static ssize_t inject_g2h_write(struct file *file, const char __user *ubuf,
 	uint8_t *kbuf;
 	int ret;
 
-	if (count == 0 || count > 4096)
+	if (count == 0 || count > USBWARP_MAX_MESSAGE_SIZE)
 		return -EINVAL;
-
-	spin_lock(&g_warp_lock);
-	w = g_warp_hcd;
-	spin_unlock(&g_warp_lock);
-
-	if (!w || !w->g2h.hdr)
-		return -ENODEV;
 
 	kbuf = kmalloc(count, GFP_KERNEL);
 	if (!kbuf)
@@ -97,7 +98,10 @@ static ssize_t inject_g2h_write(struct file *file, const char __user *ubuf,
 
 	/* Write raw bytes directly into G2H Ring — no validation.
 	 * This is intentional: we're testing Host-side validation. */
-	ret = usbwarp_ring_produce(&w->g2h, kbuf, count);
+    mutex_lock(&g_warp_lock);
+    w = g_warp_hcd;
+    ret = (!w || !w->g2h.hdr) ? -ENODEV : usbwarp_ring_inject_raw(&w->g2h, kbuf, count);
+    mutex_unlock(&g_warp_lock);
 
 	if (ret == 0) {
 		atomic_inc(&fuzz_inject_count);
@@ -174,12 +178,14 @@ static const struct file_operations pause_g2h_fops = {
 static int ring_status_show(struct seq_file *s, void *v)
 {
 	struct usbwarp_hcd *w;
+    unsigned long flags;
+    unsigned int bitmap_free = 0;
 
-	spin_lock(&g_warp_lock);
+	mutex_lock(&g_warp_lock);
 	w = g_warp_hcd;
-	spin_unlock(&g_warp_lock);
 
 	if (!w || !w->g2h.hdr) {
+		mutex_unlock(&g_warp_lock);
 		seq_puts(s, "not connected\n");
 		return 0;
 	}
@@ -192,10 +198,42 @@ static int ring_status_show(struct seq_file *s, void *v)
 		   ioread32(&w->h2g.hdr->producer_index),
 		   ioread32(&w->h2g.hdr->consumer_index),
 		   w->h2g.data_size);
+    /* Diagnostic snapshot only. Stability checks compare counters after I/O
+     * drains; independent fields need not agree while allocation is active. */
+    spin_lock_irqsave(&w->buf_lock, flags);
+    if (w->buf_bitmap) bitmap_free = bitmap_weight(w->buf_bitmap, w->buffer_count);
+    spin_unlock_irqrestore(&w->buf_lock, flags);
+    seq_printf(s, "inflight: urbs=%d queued=%d iso=%d slots=%u free=%d bitmap_free=%u\n",
+        atomic_read(&w->total_pending), atomic_read(&w->tx_pending),
+        atomic_read(&w->iso_pending), w->buffer_count,
+        atomic_read(&w->buf_free_count), bitmap_free);
 	seq_printf(s, "fuzz: injected=%d bytes=%d failed=%d\n",
 		   atomic_read(&fuzz_inject_count),
 		   atomic_read(&fuzz_inject_bytes),
 		   atomic_read(&fuzz_inject_fail));
+    for (unsigned int i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
+        if (READ_ONCE(w->devices[i].connected))
+            seq_printf(s, "device_epoch %u %u\n", i + 1, READ_ONCE(w->devices[i].epoch));
+    seq_printf(s, "irq: vector=%d host=%u guest=%u sent=%llu received=%lld failed=%llu status=%08x pending=%u watchdog=%llu\n",
+        w->irq_vector, ioread32(&w->cb->irq_host_state), ioread32(&w->cb->irq_guest_state),
+        readq(&w->cb->irq_sent), atomic64_read(&w->irq_count), readq(&w->cb->irq_failed),
+        ioread32(&w->cb->irq_last_status), ioread32(&w->cb->irq_pending), readq(&w->cb->irq_watchdog));
+    seq_printf(s, "irq_identity: partition=%llu original_osid=%016llx current_osid=%016llx marker_owned=%u\n",
+        readq(&w->cb->irq_partition_id), w->marker_original, usbwarp_irq_os_id(), READ_ONCE(w->marker_owned));
+    seq_printf(s, "irq_affinity: cpu=%d active=%u\n", READ_ONCE(w->irq_affinity_cpu), READ_ONCE(w->irq_affinity_applied));
+    seq_printf(s, "rx: softirq=%u batches=%llu completions=%llu deferred=%llu reschedules=%llu\n",
+        READ_ONCE(w->rx_fast), READ_ONCE(w->rx_batches), READ_ONCE(w->rx_completions),
+        READ_ONCE(w->rx_deferrals), READ_ONCE(w->rx_reschedules));
+    seq_printf(s, "repoll: active=%u arms=%llu fires=%llu hits=%llu empty=%llu delay_ns=%llu late_ns=%llu late_max_ns=%llu\n",
+        READ_ONCE(w->rx_repoll_active), READ_ONCE(w->rx_repoll_arms), READ_ONCE(w->rx_repoll_fires),
+        READ_ONCE(w->rx_repoll_hits), READ_ONCE(w->rx_repoll_empty),
+        READ_ONCE(w->rx_repoll_delay_ns), READ_ONCE(w->rx_repoll_late_ns), READ_ONCE(w->rx_repoll_late_max));
+    seq_printf(s, "busy: active=%u windows=%llu elapsed_ns=%llu polls=%llu completions=%llu yields=%llu submits=%lld fast=%lld slow=%lld kicks=%lld\n",
+        READ_ONCE(w->rx_busy_active), READ_ONCE(w->rx_busy_windows), READ_ONCE(w->rx_busy_ns),
+        READ_ONCE(w->rx_busy_polls), READ_ONCE(w->rx_busy_completions), READ_ONCE(w->rx_busy_yields),
+        atomic64_read(&w->rx_busy_submits), atomic64_read(&w->rx_busy_fast),
+        atomic64_read(&w->rx_busy_slow), atomic64_read(&w->rx_busy_kicks));
+    mutex_unlock(&g_warp_lock);
 	return 0;
 }
 

@@ -64,7 +64,7 @@ DriverEntry(
     /* ── Allocate control device init structure ─────────────────────────── */
     pInit = WdfControlDeviceInitAllocate(
                 hDriver,
-                &SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RW_RES_R);
+                &SDDL_DEVOBJ_SYS_ALL_ADM_ALL);
     if (pInit == NULL) {
         KdPrint(("UsbWarp: WdfControlDeviceInitAllocate failed\n"));
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -105,6 +105,14 @@ UsbWarpDeviceAdd(
     /* Exclusive: only one opener at a time (the Service). */
     WdfDeviceInitSetExclusive(DeviceInit, TRUE);
     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+    {
+        WDF_FILEOBJECT_CONFIG files;
+        WDF_OBJECT_ATTRIBUTES fileAttributes;
+        WDF_FILEOBJECT_CONFIG_INIT(&files, WDF_NO_EVENT_CALLBACK,
+                                  WDF_NO_EVENT_CALLBACK, UsbWarpEvtFileCleanup);
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&fileAttributes, USBWARP_FILE_CONTEXT);
+        WdfDeviceInitSetFileObjectConfig(DeviceInit, &files, &fileAttributes);
+    }
 
     status = WdfDeviceInitAssignName(DeviceInit, &ntDeviceName);
     if (!NT_SUCCESS(status)) {
@@ -127,6 +135,7 @@ UsbWarpDeviceAdd(
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&devAttributes,
                                             USBWARP_GLOBAL_CONTEXT);
     devAttributes.EvtCleanupCallback = UsbWarpEvtDeviceCleanup;
+    devAttributes.ExecutionLevel = WdfExecutionLevelPassive;
 
     status = WdfDeviceCreate(&DeviceInit, &devAttributes, &controlDevice);
     if (!NT_SUCCESS(status)) {
@@ -148,9 +157,26 @@ UsbWarpDeviceAdd(
     ctx->ControlDevice = controlDevice;
 
     KeInitializeSpinLock(&ctx->DeviceLock);
+    KeInitializeSpinLock(&ctx->ServiceLock);
+    KeInitializeMutex(&ctx->SessionMutex, 0);
+    ctx->SessionSyncInitialized = TRUE;
+    ctx->PublishedState = USBWARP_STATE_INIT;
+    ctx->MaxDevices = USBWARP_MAX_DEVICES_LIMIT;
+    {
+        WDF_WORKITEM_CONFIG work;
+        WDF_OBJECT_ATTRIBUTES workAttributes;
+        WDF_WORKITEM_CONFIG_INIT(&work, UsbWarpEvtSessionCleanup);
+        work.AutomaticSerialization = FALSE;
+        WDF_OBJECT_ATTRIBUTES_INIT(&workAttributes);
+        workAttributes.ParentObject = controlDevice;
+        status = WdfWorkItemCreate(&work, &workAttributes, &ctx->SessionCleanupWork);
+        if (!NT_SUCCESS(status)) goto End;
+    }
+    InitializeListHead(&ctx->Completions);
+    KeInitializeSpinLock(&ctx->CompletionLock);
     KeInitializeEvent(&ctx->PollStopEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&ctx->PollWakeEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&ctx->GuestShutdownAckEvent, NotificationEvent, FALSE);
-    KeInitializeEvent(&ctx->ServiceLostEvent, NotificationEvent, FALSE);
 
     for (i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
         InitializeListHead(&ctx->Devices[i].PendingUrbs);
@@ -159,19 +185,20 @@ UsbWarpDeviceAdd(
                           NotificationEvent, TRUE);  /* initially signalled */
     }
 
-    KeQuerySystemTime(&ctx->LastServiceHeartbeat);
+    ctx->LastServiceHeartbeat.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
-    /* ── Default I/O queue (sequential — one IOCTL at a time) ───────────── */
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig,
-                                           WdfIoQueueDispatchSequential);
+    /* Heartbeats have an independent parallel path. Slow management stays
+     * serialized, without delaying liveness checks behind a USB bind. */
+    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchSequential);
+    queueConfig.PowerManaged = WdfFalse;
+    queueConfig.EvtIoDeviceControl = UsbWarpEvtManagementControl;
+    status = WdfIoQueueCreate(controlDevice, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->ManagementQueue);
+    if (!NT_SUCCESS(status)) goto End;
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.PowerManaged = WdfFalse;
     queueConfig.EvtIoDeviceControl = UsbWarpEvtIoDeviceControl;
-
-    status = WdfIoQueueCreate(controlDevice, &queueConfig,
-                              WDF_NO_OBJECT_ATTRIBUTES, &ctx->DefaultQueue);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("UsbWarp: WdfIoQueueCreate failed 0x%x\n", status));
-        goto End;
-    }
+    status = WdfIoQueueCreate(controlDevice, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->DefaultQueue);
+    if (!NT_SUCCESS(status)) goto End;
 
     /* Finish initialising the control device — I/O now accepted. */
     WdfControlFinishInitializing(controlDevice);
@@ -199,7 +226,11 @@ UsbWarpEvtShutdown(
     KdPrint(("UsbWarp: system shutdown notification\n"));
 
     /* Perform emergency shutdown to release all resources. */
-    UsbWarpEmergencyShutdown(ctx);
+    if (ctx->SessionSyncInitialized) {
+        KeWaitForSingleObject(&ctx->SessionMutex, Executive, KernelMode, FALSE, NULL);
+        UsbWarpEmergencyShutdown(ctx);
+        KeReleaseMutex(&ctx->SessionMutex, FALSE);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -248,7 +279,11 @@ UsbWarpEvtDeviceCleanup(
         return;
 
     /* Run EmergencyShutdown if not already done (idempotent). */
-    UsbWarpEmergencyShutdown(ctx);
+    if (ctx->SessionSyncInitialized) {
+        KeWaitForSingleObject(&ctx->SessionMutex, Executive, KernelMode, FALSE, NULL);
+        UsbWarpEmergencyShutdown(ctx);
+        KeReleaseMutex(&ctx->SessionMutex, FALSE);
+    }
 
     /* Final DPC flush — absolute last chance before code unloads. */
     KeFlushQueuedDpcs();

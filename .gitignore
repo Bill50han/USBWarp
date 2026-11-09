@@ -369,3 +369,5 @@ usbwarp_module/*.mod.c
 usbwarp_module/.*.cmd
 usbwarp_module/Module.symvers
 usbwarp_module/modules.order
+
+/.agents

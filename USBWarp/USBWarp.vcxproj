@@ -125,6 +125,7 @@
     <ClCompile Include="usbwarp_device.c" />
     <ClCompile Include="usbwarp_entry.c" />
     <ClCompile Include="usbwarp_ioctl.c" />
+    <ClCompile Include="usbwarp_irq_host.c" />
     <ClCompile Include="usbwarp_poll_host.c" />
     <ClCompile Include="usbwarp_ring_host.c" />
     <ClCompile Include="usbwarp_safety.c" />

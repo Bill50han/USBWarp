@@ -43,6 +43,7 @@ typedef enum {
 } HDV_PCI_BAR_SELECTOR;
 
 #define HDV_PCI_BAR_COUNT  6
+#define USBWARP_HDV_DOORBELL_FLAGS 4ull /* HDV_DOORBELL_FLAG_TRIGGER_SIZE_QWORD */
 
 typedef enum {
     HdvPciDeviceInterfaceVersion1 = 1,
@@ -150,6 +151,13 @@ typedef HRESULT (WINAPI *T_HdvCreateSectionBackedMmioRange)(
     HDV_MMIO_MAPPING_FLAGS flags,
     HANDLE sectionHandle, UINT64 sectionOffsetInPages);
 
+typedef HRESULT (WINAPI *T_HdvDestroySectionBackedMmioRange)(
+    HDV_DEVICE device, HDV_PCI_BAR_SELECTOR bar, UINT64 offsetInPages);
+typedef HRESULT (WINAPI *T_HdvRegisterDoorbell)(HDV_DEVICE device, HDV_PCI_BAR_SELECTOR bar,
+    UINT64 offset, UINT64 trigger, UINT64 flags, HANDLE event);
+typedef HRESULT (WINAPI *T_HdvUnregisterDoorbell)(HDV_DEVICE device, HDV_PCI_BAR_SELECTOR bar,
+    UINT64 offset, UINT64 trigger, UINT64 flags);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §7  Global API function pointer table
  *
@@ -170,6 +178,9 @@ struct usbwarp_hdv_api {
     T_HdvTeardownDeviceHost             HdvTeardownHost;
     T_HdvCreateDeviceInstance           HdvCreateDevice;
     T_HdvCreateSectionBackedMmioRange   HdvCreateMmio;
+    T_HdvDestroySectionBackedMmioRange  HdvDestroyMmio;
+    T_HdvRegisterDoorbell              HdvRegisterDoorbell;
+    T_HdvUnregisterDoorbell            HdvUnregisterDoorbell;
 
     /* DLL handles (for FreeLibrary at shutdown) */
     HMODULE hComputeCore;

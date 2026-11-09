@@ -4,21 +4,20 @@
  *
  * Copyright (c) 2026 UsbWarp Project
  *
- * FIX (issue #10): 64-bit guest_heartbeat_ts written as two 32-bit
- *   stores with smp_wmb in between (low word first) to prevent tear
- *   on 32-bit or non-atomic-64-bit platforms.
- *
- * FIX (issue #3): Basic validation of Host messages before dispatch.
+ * Both WSL2 targets are 64-bit. Heartbeats use an aligned writeq rather
+ * than two independently visible 32-bit writes.
  */
 
 #include "usbwarp_guest.h"
 #include <linux/delay.h>
 #include <linux/sched.h>
+#include <linux/sched/task.h>
 
 #define ACTIVE_THRESHOLD   100
 #define LIGHT_THRESHOLD   1000
 #define LIGHT_SLEEP_US      10
 #define IDLE_SLEEP_US     1000
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Host message validation (issue #3)
@@ -28,7 +27,7 @@
  *   dispatching.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static bool validate_h2g_message(struct usbwarp_hcd *w,
+bool usbwarp_validate_h2g_message(struct usbwarp_hcd *w,
 				 const void *msg_buf, uint32_t msg_len)
 {
 	const struct usbwarp_msg_header *hdr =
@@ -42,9 +41,11 @@ static bool validate_h2g_message(struct usbwarp_hcd *w,
 			 "usbwarp: H2G bad magic 0x%x\n", hdr->magic);
 		return false;
 	}
+	if (hdr->protocol_version != USBWARP_PROTOCOL_VERSION)
+		return false;
 
 	if (hdr->message_length < sizeof(*hdr) ||
-	    hdr->message_length > msg_len) {
+	    hdr->message_length != msg_len) {
 		dev_warn(&w->pdev->dev,
 			 "usbwarp: H2G bad length %u (buf=%u)\n",
 			 hdr->message_length, msg_len);
@@ -54,11 +55,22 @@ static bool validate_h2g_message(struct usbwarp_hcd *w,
 	/* Validate device_id for device-specific messages. */
 	if (hdr->message_type == USBWARP_MSG_DEVICE_ADDED ||
 	    hdr->message_type == USBWARP_MSG_DEVICE_REMOVED ||
-	    hdr->message_type == USBWARP_MSG_URB_COMPLETE) {
-		if (hdr->device_id > USBWARP_MAX_PORTS) {
+	    hdr->message_type == USBWARP_MSG_URB_COMPLETE ||
+	    hdr->message_type == USBWARP_MSG_ISO_COMPLETE) {
+		if (hdr->device_id > USBWARP_MAX_DEVICES_LIMIT) {
 			dev_warn(&w->pdev->dev,
 				 "usbwarp: H2G device_id OOB %u\n",
 				 hdr->device_id);
+			return false;
+		}
+	}
+
+	/* ISO_COMPLETE carries a variable results array — its declared
+	 * length must fit in the received message. */
+	if (hdr->message_type == USBWARP_MSG_ISO_COMPLETE) {
+		const struct usbwarp_msg_iso_complete *ic =
+			(const struct usbwarp_msg_iso_complete *)msg_buf;
+		if (!usbwarp_iso_complete_valid(ic, msg_len)) {
 			return false;
 		}
 	}
@@ -70,7 +82,7 @@ static bool validate_h2g_message(struct usbwarp_hcd *w,
  * §2  Message dispatch
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void dispatch_message(struct usbwarp_hcd *w,
+void usbwarp_dispatch_message(struct usbwarp_hcd *w,
 			     const void *msg_buf, uint32_t msg_len)
 {
 	const struct usbwarp_msg_header *hdr =
@@ -90,6 +102,7 @@ static void dispatch_message(struct usbwarp_hcd *w,
 			if (w->max_pending_urbs == 0)
 				w->max_pending_urbs = USBWARP_PENDING_URBS_DEFAULT;
 			w->negotiation_done   = true;
+			iowrite32(USBWARP_STATE_RUNNING, &w->cb->guest_state);
 			dev_info(&w->pdev->dev,
 				 "usbwarp: negotiation OK ver=%u.%u caps=0x%x pending=%u devs=%u\n",
 				 USBWARP_VERSION_MAJOR(resp->negotiated_version),
@@ -132,7 +145,26 @@ static void dispatch_message(struct usbwarp_hcd *w,
 		break;
 	}
 
+	case USBWARP_MSG_ISO_COMPLETE: {
+		const struct usbwarp_msg_iso_complete *ic =
+			(const struct usbwarp_msg_iso_complete *)msg_buf;
+		if (msg_len < USBWARP_MSG_ISO_COMPLETE_BASE_SIZE)
+			break;
+		usbwarp_complete_iso_urb(w, ic, msg_len);
+		break;
+	}
+
+    case USBWARP_MSG_STREAMS_RESPONSE:
+        if (msg_len == sizeof(struct usbwarp_msg_streams_response))
+            usbwarp_complete_streams(w, msg_buf);
+        break;
+
 	case USBWARP_MSG_URB_CANCEL_ACK:
+		break;
+
+	case USBWARP_MSG_SHUTDOWN_ACK:
+		if (READ_ONCE(w->quiescing) && msg_len >= sizeof(struct usbwarp_msg_shutdown_ack))
+			complete(&w->shutdown_ack);
 		break;
 
 	case USBWARP_MSG_HEARTBEAT:
@@ -146,6 +178,10 @@ static void dispatch_message(struct usbwarp_hcd *w,
 			 (msg_len >= sizeof(*sd)) ? sd->reason : 0xFFu);
 		usbwarp_shutdown_all_devices(w, USBWARP_REMOVE_HOST_SHUTDOWN);
 
+        /* Free the MSI-X mapping while the HDV callbacks still exist. Once
+         * ACK is published the host may destroy its emulation endpoint. */
+        usbwarp_irq_cleanup(w);
+
 		{
 			struct usbwarp_msg_shutdown_ack ack;
 
@@ -157,6 +193,7 @@ static void dispatch_message(struct usbwarp_hcd *w,
 			ack.hdr.timestamp        = (uint64_t)ktime_get_ns();
 			usbwarp_ring_produce(&w->g2h, &ack, sizeof(ack));
 		}
+        usbwarp_retire_hcd(w);
 		break;
 	}
 
@@ -178,7 +215,7 @@ static void dispatch_message(struct usbwarp_hcd *w,
  * §3  Poll thread main function
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define POLL_MSG_BUF_SIZE  4096
+#define POLL_MSG_BUF_SIZE  USBWARP_MAX_MESSAGE_SIZE
 
 static int usbwarp_poll_fn(void *data)
 {
@@ -186,13 +223,11 @@ static int usbwarp_poll_fn(void *data)
 	uint8_t *msg_buf;
 	uint64_t heartbeat_interval_ns = 1000000000ULL; /* 1 s */
 	uint64_t last_heartbeat_ns = 0;
+    u64 host_tick = 0, host_progress_ns = ktime_get_ns();
+    u64 last_host_check_ns = host_progress_ns;
+	unsigned long next_cancel_scan = jiffies;
 
-	msg_buf = kmalloc(POLL_MSG_BUF_SIZE, GFP_KERNEL);
-	if (!msg_buf) {
-		dev_err(&w->pdev->dev,
-			"usbwarp: poll thread: cannot alloc msg buffer\n");
-		return -ENOMEM;
-	}
+    msg_buf = w->poll_buffer;
 
 	w->poll_state = POLL_BUSY;
 	w->idle_count = 0;
@@ -201,23 +236,36 @@ static int usbwarp_poll_fn(void *data)
 
 	while (!kthread_should_stop() && !READ_ONCE(w->shutting_down)) {
 
-		uint32_t msg_len = 0;
-		int ret;
-		bool got_msg = false;
+        bool got_msg;
+        usbwarp_irq_step(w);
+        got_msg = usbwarp_rx_worker(w);
 
-		ret = usbwarp_ring_consume(&w->h2g, msg_buf,
-					   POLL_MSG_BUF_SIZE, &msg_len);
-		if (ret == 0 && msg_len > 0) {
-			/* Validate before dispatch (issue #3). */
-			if (validate_h2g_message(w, msg_buf, msg_len))
-				dispatch_message(w, msg_buf, msg_len);
-			got_msg = true;
+		usbwarp_flush_queued(w);
+		if (time_after_eq(jiffies, next_cancel_scan)) {
+			usbwarp_retry_cancels(w);
+			next_cancel_scan = jiffies + max(1UL, msecs_to_jiffies(10));
 		}
 
+        if (usbwarp_rx_busy_poll(w)) got_msg = true;
+		/* Streaming completion must not fall back to millisecond sleeps. */
+		if ((atomic_read(&w->iso_pending) || atomic_read(&w->tx_pending)) && !got_msg) {
+			w->poll_state = POLL_LIGHT;
+			w->idle_count = 0;
+		}
 		/* Adaptive poll state machine. */
 		if (got_msg) {
+			cond_resched();
 			w->poll_state = POLL_BUSY;
 			w->idle_count = 0;
+		} else if (usbwarp_irq_wait(w)) {
+            w->idle_count = 0;
+		} else if (READ_ONCE(usbwarp_poll_us)) {
+            unsigned int interval = READ_ONCE(usbwarp_poll_us);
+            if (atomic_read(&w->iso_pending)) interval = min(interval, 10u);
+            /* A concurrent write of zero selects adaptive on the next pass. */
+            if (interval) usleep_range(interval, interval + max(1u, interval / 4));
+            w->poll_state = POLL_BUSY;
+            w->idle_count = 0;
 		} else {
 			w->idle_count++;
 
@@ -256,22 +304,33 @@ static int usbwarp_poll_fn(void *data)
 		{
 			uint64_t now = (uint64_t)ktime_get_ns();
 
+            if (!READ_ONCE(w->shutting_down) && now - last_host_check_ns >= heartbeat_interval_ns) {
+                u64 tick = readq(&w->cb->host_heartbeat_ts);
+                /* A debugger or VM pause stops this observer too. Start a
+                 * fresh observation window when we resume, not a false loss. */
+                if (now - last_host_check_ns > 3 * heartbeat_interval_ns)
+                    host_progress_ns = now;
+                last_host_check_ns = now;
+                if (tick != host_tick) {
+                    host_tick = tick;
+                    host_progress_ns = now;
+                } else if (now - host_progress_ns > 10000000000ULL) {
+                    dev_warn(&w->pdev->dev, "usbwarp: host heartbeat lost; retiring session\n");
+                    iowrite32(USBWARP_STATE_ERROR, &w->cb->guest_state);
+                    usbwarp_shutdown_all_devices(w, USBWARP_REMOVE_HOST_SHUTDOWN);
+                    usbwarp_retire_hcd(w);
+                }
+            }
+
 			if (!READ_ONCE(w->shutting_down) &&
+			    !READ_ONCE(w->quiescing) &&
 			    now - last_heartbeat_ns >= heartbeat_interval_ns &&
 			    !usbwarp_debugfs_g2h_paused()) {
 				usbwarp_send_heartbeat(w);
 
-				/* Write 64-bit guest_heartbeat_ts as two
-				 * 32-bit stores: low word first, barrier,
-				 * then high word.  This prevents the Host
-				 * from seeing a torn timestamp. */
-				iowrite32((u32)(now & 0xFFFFFFFF),
-					  (void __iomem *)&w->cb->guest_heartbeat_ts);
-				smp_wmb();
-				iowrite32((u32)(now >> 32),
-					  (void __iomem *)((u8 __iomem *)&w->cb->guest_heartbeat_ts + 4));
+				writeq(now, &w->cb->guest_heartbeat_ts);
 
-				iowrite32(USBWARP_STATE_RUNNING,
+				iowrite32(w->negotiation_done ? USBWARP_STATE_RUNNING : USBWARP_STATE_READY,
 					  (void __iomem *)&w->cb->guest_state);
 
 				last_heartbeat_ns = now;
@@ -279,7 +338,12 @@ static int usbwarp_poll_fn(void *data)
 		}
 	}
 
+    usbwarp_rx_stop(w);
+    usbwarp_irq_restore(w);
+	kfree(w->rx_buffer);
+    w->rx_buffer = NULL;
 	kfree(msg_buf);
+    w->poll_buffer = NULL;
 	dev_info(&w->pdev->dev, "usbwarp: poll thread stopped\n");
 	return 0;
 }
@@ -290,12 +354,23 @@ static int usbwarp_poll_fn(void *data)
 
 int usbwarp_poll_start(struct usbwarp_hcd *w)
 {
-	w->poll_thread = kthread_run(usbwarp_poll_fn, w, "usbwarp-poll");
+    w->poll_buffer = kmalloc(POLL_MSG_BUF_SIZE, GFP_KERNEL);
+    if (!w->poll_buffer) return -ENOMEM;
+    w->rx_buffer = kmalloc(POLL_MSG_BUF_SIZE, GFP_KERNEL);
+    if (!w->rx_buffer) { kfree(w->poll_buffer); w->poll_buffer = NULL; return -ENOMEM; }
+	w->poll_thread = kthread_create(usbwarp_poll_fn, w, "usbwarp-poll");
 	if (IS_ERR(w->poll_thread)) {
 		int err = PTR_ERR(w->poll_thread);
 		w->poll_thread = NULL;
+        kfree(w->poll_buffer);
+        w->poll_buffer = NULL;
+        kfree(w->rx_buffer);
+        w->rx_buffer = NULL;
 		return err;
 	}
+    // The poller may exit on host shutdown before the PCI remove callback.
+    get_task_struct(w->poll_thread);
+    wake_up_process(w->poll_thread);
 	return 0;
 }
 
@@ -304,6 +379,7 @@ void usbwarp_poll_stop(struct usbwarp_hcd *w)
 	if (w->poll_thread) {
 		WRITE_ONCE(w->shutting_down, true);
 		kthread_stop(w->poll_thread);
+        put_task_struct(w->poll_thread);
 		w->poll_thread = NULL;
 	}
 }
@@ -330,10 +406,11 @@ int usbwarp_send_negotiate(struct usbwarp_hcd *w)
 
 	neg.capabilities = USBWARP_CAP_INLINE_DATA |
 			   USBWARP_CAP_BATCH_SUBMIT |
-			   USBWARP_CAP_STATS;
+			   USBWARP_CAP_STATS | USBWARP_CAP_USB3 | USBWARP_CAP_STREAMS | USBWARP_CAP_DEVICE_EPOCH;
 
 	if (usbwarp_enable_iso)
-		neg.capabilities |= USBWARP_CAP_ISO_TRANSFER;
+		neg.capabilities |= USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED;
+    if (w->g2h.doorbell) neg.capabilities |= USBWARP_CAP_G2H_DOORBELL;
 
 	return usbwarp_ring_produce(&w->g2h, &neg, sizeof(neg));
 }
@@ -359,4 +436,33 @@ void usbwarp_send_heartbeat(struct usbwarp_hcd *w)
 	hb.pending_urb_count = (uint32_t)atomic_read(&w->total_pending);
 
 	usbwarp_ring_produce(&w->g2h, &hb, sizeof(hb));
+}
+
+/* Wait for physical I/O to stop before discarding pending URBs or the bitmap.
+ * Polling continues during this handshake to deliver completions and the ACK. */
+void usbwarp_guest_disconnect(struct usbwarp_hcd *w)
+{
+    struct usbwarp_msg_shutdown msg = { 0 };
+    unsigned long flags, deadline;
+    bool sent = false, drained = false;
+    if (READ_ONCE(w->shutting_down) || !w->negotiation_done)
+        return;
+    spin_lock_irqsave(&w->urb_lock, flags);
+    w->quiescing = true;
+    spin_unlock_irqrestore(&w->urb_lock, flags);
+    msg.hdr.magic = USBWARP_MSG_MAGIC;
+    msg.hdr.message_type = USBWARP_MSG_GUEST_SHUTDOWN;
+    msg.hdr.protocol_version = USBWARP_PROTOCOL_VERSION;
+    msg.hdr.message_length = sizeof(msg);
+    msg.reason = USBWARP_SHUTDOWN_NORMAL;
+    deadline = jiffies + msecs_to_jiffies(1000);
+    do {
+        if (!usbwarp_ring_produce(&w->g2h, &msg, sizeof(msg))) { sent = true; break; }
+        msleep(1);
+    } while (time_before(jiffies, deadline));
+    if (sent)
+        drained = wait_for_completion_timeout(&w->shutdown_ack, msecs_to_jiffies(10000)) != 0;
+    iowrite32(drained ? USBWARP_STATE_STOPPED : USBWARP_STATE_ERROR, &w->cb->guest_state);
+    if (!drained)
+        dev_warn(&w->pdev->dev, "usbwarp: host drain not acknowledged; restart service before reloading\n");
 }

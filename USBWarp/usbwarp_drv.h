@@ -11,7 +11,7 @@
 #ifndef USBWARP_DRV_H
 #define USBWARP_DRV_H
 
-#include <ntddk.h>
+#include <ntifs.h>
 #include <wdf.h>
 #include <wdmsec.h>
 #include <usb.h>
@@ -27,7 +27,8 @@ NTKERNELAPI PDEVICE_OBJECT IoGetDeviceAttachmentBaseRef(PDEVICE_OBJECT DeviceObj
  * WDK headers.  Declare it explicitly for ObReferenceObjectByHandle. */
 extern POBJECT_TYPE *MmSectionObjectType;
 
-#include "../include/usbwarp_shared.h"
+#include "../include/usbwarp_iso.h"
+#include "../include/usbwarp_usb3.h"
 #include "../include/usbwarp_ioctl.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -40,7 +41,7 @@ extern POBJECT_TYPE *MmSectionObjectType;
 
 #define USBWARP_HEARTBEAT_TIMEOUT_MS     6000   /* 6s: spec §06 §9.2     */
 #define USBWARP_ORPHAN_GRACE_PERIOD_MS  30000   /* 30s: spec §06 §9.2    */
-#define USBWARP_POLL_MSG_BUF_SIZE        4096
+#define USBWARP_POLL_MSG_BUF_SIZE        USBWARP_MAX_MESSAGE_SIZE
 #define USBWARP_SHM_MIN_SIZE       (4u << 20)   /* 4 MB                  */
 #define USBWARP_SHM_MAX_SIZE     (256u << 20)   /* 256 MB                */
 #define USBWARP_URB_TIMEOUT_MS          5000
@@ -49,8 +50,7 @@ extern POBJECT_TYPE *MmSectionObjectType;
 /* ═══════════════════════════════════════════════════════════════════════════
  * §2  Token bucket (per-device rate limiter)
  *
- *   Capacity 200 tokens, refill rate 100/sec (spec §05 §3.1 Layer 6,
- *   spec §03 §7.3).
+ *   Capacity and refill rate are configured by the bind path.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct _USBWARP_TOKEN_BUCKET {
@@ -110,9 +110,17 @@ typedef enum _USBWARP_URB_STATE {
     UURB_STATE_DEAD      = 2,
 } USBWARP_URB_STATE, *PUSBWARP_URB_STATE;
 
+typedef struct _USBWARP_COMPLETION {
+    LIST_ENTRY Link;
+    ULONG Length;
+    ULONG Reserved;
+    UCHAR Data[1];
+} USBWARP_COMPLETION, *PUSBWARP_COMPLETION;
+
 typedef struct _USBWARP_URB_CONTEXT {
     LIST_ENTRY           ListEntry;       /* per-device pending list        */
     ULONG                TransactionId;
+    ULONG                Epoch;
     ULONG                DeviceIndex;
 
     /* URB parameters (from Ring message) */
@@ -143,6 +151,9 @@ typedef struct _USBWARP_URB_CONTEXT {
     PVOID                FilterOutBuf;    /* heap alloc for response+data   */
     ULONG                FilterOutSize;
     PVOID                FilterReqBuf;    /* heap alloc for request struct  */
+    ULONG                NumberOfPackets;
+    PUSBWARP_COMPLETION   Completion;
+    struct _USBWARP_GLOBAL_CONTEXT *GlobalCtx;
 
     /* State */
     LONG                 State;           /* USBWARP_URB_STATE (interlocked)*/
@@ -159,6 +170,7 @@ typedef struct _USBWARP_URB_CONTEXT {
 typedef struct _USBWARP_DEVICE_CONTEXT {
     BOOLEAN              InUse;
     ULONG                DeviceIndex;     /* 1-based, = device_id in Ring  */
+    ULONG                Epoch;
     UCHAR                DeviceGuid[16];
 
     /* USB target — via UsbWarpFilter.sys proxy */
@@ -177,6 +189,7 @@ typedef struct _USBWARP_DEVICE_CONTEXT {
     USHORT               VendorId;
     USHORT               ProductId;
     UCHAR                Speed;           /* enum usbwarp_usb_speed        */
+    BOOLEAN              SpeedQueried;    /* authoritative hub query succeeded */
 
     /* Pending URBs */
     LIST_ENTRY           PendingUrbs;
@@ -200,6 +213,7 @@ typedef struct _USBWARP_DEVICE_CONTEXT {
 
     /* Atomic guard for concurrent cleanup (hot-remove vs manual unbind). */
     LONG                 Removing;
+    EX_RUNDOWN_REF        SubmitRundown;
 } USBWARP_DEVICE_CONTEXT, *PUSBWARP_DEVICE_CONTEXT;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -216,7 +230,22 @@ typedef struct _USBWARP_HOST_RING {
      * CPUs, IOCTL queue thread, PnP removal callbacks, poll thread).
      * Valid at DPC level.  The G2H consumer side stays lock-free. */
     KSPIN_LOCK                           ProduceLock;
+    struct _USBWARP_GLOBAL_CONTEXT      *NotifyContext;
 } USBWARP_HOST_RING, *PUSBWARP_HOST_RING;
+
+typedef ULONGLONG (NTAPI *USBWARP_HYPERCALL)(ULONGLONG, ULONGLONG, ULONGLONG);
+typedef struct _USBWARP_IRQ_HOST {
+    KSPIN_LOCK Lock;
+    USBWARP_HYPERCALL Invoke;
+    PVOID Pages;
+    ULONGLONG InputPa, OutputPa, NotifyPa;
+    volatile struct usbwarp_control_block *Cb;
+    USBWARP_CONFIGURE_IRQ_IN Config;
+    BOOLEAN Configured;
+    ULONG State, Request, Round;
+    ULONGLONG Deadline, Original, Partition, Challenge;
+    ULONGLONG LastToken, TestReceived;
+} USBWARP_IRQ_HOST;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §8  Orphan mode (spec §01 §8.4, §06 §9)
@@ -238,14 +267,24 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
     /* ── Driver / device ────────────────────────────────────────────────── */
     WDFDEVICE            ControlDevice;
     WDFQUEUE             DefaultQueue;
+    WDFQUEUE             ManagementQueue;
+    KMUTEX               SessionMutex;
+    KSPIN_LOCK           ServiceLock;
+    BOOLEAN              SessionSyncInitialized;
+    WDFWORKITEM          SessionCleanupWork;
+    LONG                 SessionCleanupQueued;
+    ULONG                SessionGeneration;
+    ULONG                CleanupGeneration;
+    LONG                 PublishedState;
+    ULONG                MaxDevices;
 
     /* ── Service registration ───────────────────────────────────────────── */
     BOOLEAN              ServiceRegistered;
     ULONG                ServiceProcessId;
     ULONG                HeartbeatIntervalMs;      /* from REGISTER_SERVICE  */
-    HANDLE               ServiceProcessHandle;
-    PVOID                ProcessNotifyRegistered;  /* flag for cleanup      */
-    KEVENT               ServiceLostEvent;
+    PEPROCESS            ServiceProcess;
+    PFILE_OBJECT         ServiceFile;
+    BOOLEAN              ServiceDisconnected;
 
     /* ── Shared memory ──────────────────────────────────────────────────── */
     BOOLEAN              ShmEstablished;
@@ -253,10 +292,12 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
     PVOID                ShmKernelBase;    /* MmMapViewInSystemSpace result */
     SIZE_T               ShmSize;
     PMDL                 ShmMdl;           /* locked pages for DISPATCH access */
+    PKEVENT              G2hDoorbell;     /* independently referenced user event */
 
     volatile struct usbwarp_control_block *ControlBlock;
     USBWARP_HOST_RING    G2hRing;         /* Guest→Host: we consume        */
     USBWARP_HOST_RING    H2gRing;         /* Host→Guest: we produce        */
+    USBWARP_IRQ_HOST     Irq;
     volatile UCHAR      *DataRegion;
     ULONG                DataRegionSize;
     ULONG                BufferSize;
@@ -265,6 +306,7 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
     /* ── Devices ────────────────────────────────────────────────────────── */
     USBWARP_DEVICE_CONTEXT  Devices[USBWARP_MAX_DEVICES_LIMIT];
     LONG                 ActiveDeviceCount;
+    LONG                 DeviceEpochCounter;
     KSPIN_LOCK           DeviceLock;
 
     /* ── Negotiation ────────────────────────────────────────────────────── */
@@ -274,12 +316,19 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
 
     /* ── Poll thread ────────────────────────────────────────────────────── */
     PETHREAD             PollThread;
+    PUCHAR               PollMessageBuffer;
     KEVENT               PollStopEvent;
+    KEVENT               PollWakeEvent;
     KEVENT               GuestShutdownAckEvent;
     LONG                 PollRunning;
+    LONG                 IsoPending;
+    LIST_ENTRY           Completions;
+    KSPIN_LOCK           CompletionLock;
+    LONG                 CompletionCount;
+    PUSBWARP_COMPLETION   ErrorReply; /* reserved before consuming G2H */
 
     /* ── Heartbeat / orphan ─────────────────────────────────────────────── */
-    LARGE_INTEGER        LastServiceHeartbeat;    /* QPC                    */
+    LARGE_INTEGER        LastServiceHeartbeat;    /* monotonic 100ns ticks  */
     LONG                 OrphanState;             /* USBWARP_ORPHAN_STATE   */
     LARGE_INTEGER        OrphanGraceStart;
 
@@ -305,13 +354,27 @@ typedef struct _USBWARP_GLOBAL_CONTEXT {
 
 } USBWARP_GLOBAL_CONTEXT, *PUSBWARP_GLOBAL_CONTEXT;
 
+BOOLEAN UsbWarpIrqSupported(VOID);
+VOID UsbWarpIrqInitialize(PUSBWARP_GLOBAL_CONTEXT Ctx);
+VOID UsbWarpIrqDestroy(PUSBWARP_GLOBAL_CONTEXT Ctx);
+NTSTATUS UsbWarpIrqConfigure(PUSBWARP_GLOBAL_CONTEXT Ctx, WDFREQUEST Request);
+VOID UsbWarpIrqProduced(PUSBWARP_GLOBAL_CONTEXT Ctx);
+VOID UsbWarpIrqPoll(PUSBWARP_GLOBAL_CONTEXT Ctx);
+
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(USBWARP_GLOBAL_CONTEXT, UsbWarpGetContext)
+
+typedef struct _USBWARP_FILE_CONTEXT {
+    BOOLEAN CleanedUp; /* protected by the control device's ServiceLock */
+} USBWARP_FILE_CONTEXT, *PUSBWARP_FILE_CONTEXT;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(USBWARP_FILE_CONTEXT, UsbWarpGetFileContext)
 
 /* Context attached to each filter IoTarget — maps Target back to device slot
  * for PnP removal callbacks (hot-plug auto-unbind). */
 typedef struct _USBWARP_TARGET_CONTEXT {
     PUSBWARP_GLOBAL_CONTEXT GlobalCtx;
     ULONG                   DeviceIndex;  /* 1-based */
+    ULONG                   Epoch;
+    KMUTEX                  StateMutex;   /* serialize Start/Stop/Purge */
 } USBWARP_TARGET_CONTEXT, *PUSBWARP_TARGET_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(USBWARP_TARGET_CONTEXT, UsbWarpGetTargetContext)
@@ -337,6 +400,11 @@ EVT_WDF_DEVICE_SHUTDOWN_NOTIFICATION UsbWarpEvtShutdown;
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL UsbWarpEvtIoDeviceControl;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL UsbWarpEvtManagementControl;
+EVT_WDF_FILE_CLEANUP UsbWarpEvtFileCleanup;
+EVT_WDF_WORKITEM UsbWarpEvtSessionCleanup;
+VOID UsbWarpQueueSessionCleanup(PUSBWARP_GLOBAL_CONTEXT Ctx);
+BOOLEAN UsbWarpRequestOwnsSession(PUSBWARP_GLOBAL_CONTEXT Ctx, WDFREQUEST Request);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §12  Function declarations — usbwarp_ring_host.c
@@ -346,7 +414,8 @@ VOID
 UsbWarpRingInit(
     _Out_ PUSBWARP_HOST_RING Ring,
     _In_  volatile struct usbwarp_ring_header *Hdr,
-    _In_  volatile UCHAR *Data
+    _In_  volatile UCHAR *Data,
+    _In_  ULONG DataSize
     );
 
 NTSTATUS
@@ -388,6 +457,8 @@ UsbWarpRingAdvanceConsumer(
 
 NTSTATUS UsbWarpPollStart(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx);
 VOID     UsbWarpPollStop(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx);
+VOID UsbWarpQueueCompletion(PUSBWARP_GLOBAL_CONTEXT Ctx, PUSBWARP_COMPLETION Completion);
+BOOLEAN UsbWarpFlushCompletions(PUSBWARP_GLOBAL_CONTEXT Ctx, BOOLEAN Discard);
 
 VOID
 UsbWarpSendNegotiateResp(
@@ -437,6 +508,12 @@ UsbWarpProcessUrbSubmit(
     _In_ const struct usbwarp_msg_urb_submit *Msg
     );
 
+VOID UsbWarpProcessIsoSubmit(PUSBWARP_GLOBAL_CONTEXT Ctx,
+                            const struct usbwarp_msg_iso_submit *Msg);
+VOID UsbWarpPurgeTarget(WDFIOTARGET Target);
+VOID UsbWarpProcessStreams(PUSBWARP_GLOBAL_CONTEXT Ctx,
+                           const struct usbwarp_msg_streams_request *Msg);
+
 VOID
 UsbWarpProcessUrbCancel(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
@@ -475,7 +552,6 @@ UsbWarpValidateMessage(
     );
 
 /* Orphan mode */
-VOID    UsbWarpEnterOrphanMode(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx, ULONG Reason);
 VOID    UsbWarpCheckOrphanTimeout(_In_ PUSBWARP_GLOBAL_CONTEXT Ctx);
 
 /* Emergency shutdown (spec §06 §8.3) */
@@ -488,14 +564,6 @@ UsbWarpSafeGetTransferVa(
     _In_  ULONG BufferOffset,
     _In_  ULONG TransferLength,
     _Out_ PVOID *OutVa
-    );
-
-/* Process notify callback */
-VOID
-UsbWarpProcessNotifyCallback(
-    _Inout_  PEPROCESS              Process,
-    _In_     HANDLE                 ProcessId,
-    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
     );
 
 #endif /* USBWARP_DRV_H */

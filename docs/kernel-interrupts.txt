@@ -1,0 +1,292 @@
+USBWarp native kernel interrupt backend (2026-11-08)
+
+Current default (2026-11-09): h2g_irq=0, poll_us=0, rx_busy_us=0 and
+rx_repoll_us=0. The original adaptive completion polling strategy is active.
+No MSI-X vector or partition-discovery marker is allocated/used by default.
+The backend described below is retained for explicit h2g_irq=1 experiments;
+the URB lifetime/cancellation and device-capture correctness fixes remain.
+
+Scope and interface limits
+
+The PCI function exposes one MSI-X vector, a 4 KiB BAR4 with a 16-byte
+table at offset 0 and a pending-bit array at 0x800. Linux pci-hyperv owns
+interrupt allocation and retargeting. MSI address/data are opaque Hyper-V
+mapping keys; they must not be decoded as a conventional APIC vector.
+
+The Windows service handles PCI configuration and lifecycle. Completion
+messages are published by the Windows kernel worker and notified directly
+through HvlInvokeHypercall. No HdvDeliverGuestInterrupt or user-mode relay
+runs per completion. Linux's hard IRQ records the interrupt and schedules
+a tasklet on its CPU. Data completions are drained in softirq context;
+management messages and housekeeping remain on the existing kernel thread.
+
+This is an optional, build-gated native backend, NOT a certification claim.
+Partition getters/enumeration and GuestOsId MSR semantics have public TLFS
+documentation. The 32-byte device-assertion ABI used by native
+winhvr!WinHvAssertDeviceInterrupt (control 0x80) does not have an equivalent
+complete public DDI contract in the currently available documentation.
+HvlInvokeHypercall appears in the installed WDK Universal DDI inventory;
+that alone does not establish Microsoft support or HLK/WHCP certification.
+The backend is restricted to x64 Microsoft Hyper-V build families 26100/26200 with
+parent-partition privileges and the expected export. A real trial IRQ must
+arrive before interrupt waits are enabled. Other configurations use polling.
+Runtime validation covers the stated Win11Debug configuration, not every
+revision in these families. The family gate is a compatibility restriction,
+not a vendor support guarantee. Changing it requires checking the native ABI.
+
+Discovery and lifetime
+
+Only the registered service session can configure a route. It supplies the
+trusted HDV instance GUID and a BCrypt-generated nonce. The kernel accepts
+no guest-supplied partition ID, arbitrary hypercall, or raw input buffer.
+Four temporary 16-bit GuestOsId tags identify one child partition through
+HvCallGetNextChildPartition and HvCallGetPartitionProperty. Enumeration must
+finish, every property query must succeed, each match must be unique, and
+all four matches must identify the same child. The guest's PCI VMBus GUID
+must also equal the trusted instance GUID. Route identity is immutable for
+the shared-memory session; config revisions reject stale callback updates.
+
+The guest preserves all upper 48 GuestOsId bits and never writes zero.
+A VM-wide mutex serializes marker ownership between USBWarp instances.
+Normal completion, abort, unload and an independent 3-second delayed-work
+watchdog restore the original value. Restoration checks ownership first;
+a foreign writer is reported rather than overwritten. The host verifies
+restoration through the property getter before its trial interrupt.
+The low 16 bits are OS/distro information, not a standardized mailbox.
+This handshake is discovery, not attestation or a security boundary.
+
+Notification ordering
+
+Ring publication precedes a monotonic event counter. The Linux consumer
+owning rx_lock changes its arm token: even while processing, new odd value
+when ready for notification. It publishes the acknowledged sequence, arms, executes a full
+barrier, then rechecks both ring indices and the event sequence. An ISR
+does not change the token. The host emits at most one interrupt per arm
+token while work is unacknowledged. Multiple queued completions coalesce.
+
+MSI-X function/vector masking and native assertion serialize under one
+kernel lock. Masked notifications set PBA pending; unmasking wakes the host
+worker, which replays pending work. The service keeps the MSI-X config
+model alive through HDV teardown even after its kernel session closes.
+The host poller is joined and producers drained before buffers are freed.
+The guest stops new tasklet scheduling, synchronizes in-flight hard IRQs and
+kills/drains the tasklet before freeing its receive buffers. It restores
+its marker and frees/synchronizes IRQs before its host-
+shutdown ACK, while the HDV callbacks still exist. Closing service callbacks
+do not acquire the driver lock that is held while waiting for that ACK.
+IRQ teardown also precedes BAR unmap on remove/error paths.
+
+Ring-full backpressure has an explicit NEED_SPACE producer flag. The
+producer sets it and rechecks space; after releasing storage the guest
+checks the flag and signals the existing kernel doorbell. This avoids a
+one-second liveness timeout becoming a data-path stall under large ISO
+completions. Older peers retain a bounded retry timeout.
+
+Linux retains a 10 ms liveness/timeout watchdog in interrupt mode. Actual
+queued TX backpressure keeps adaptive retries. The debugfs watchdog counter
+counts timeout discoveries of queued work, not normal idle timer ticks.
+With debug=1, ring_status reports route state, partition, GuestOsId restore
+state, sends, receives, failures, pending and watchdog recoveries.
+Load with h2g_irq=1 (default) to allocate the vector. Runtime writes of 0/1
+to /sys/module/usbwarp/parameters/h2g_irq select polling/interrupt waits for
+controlled comparisons. Loading with h2g_irq=0 skips vector allocation;
+switching it on afterwards does not retroactively allocate a vector.
+poll_us applies to the polling path, not successful interrupt waits.
+
+Completion-worker affinity
+
+irq_affinity=1 (default) follows irq_get_effective_affinity_mask() on the
+retained management/fallback thread. IRQ movement is picked up without
+holding driver locks. Disabling irq_affinity or h2g_irq, or falling back
+after an IRQ failure, restores that thread's original allowed CPUs.
+The driver does not change the system's IRQ routing or another driver's
+threads. debugfs reports irq_affinity: cpu=<single CPU or -1> active=<0/1>.
+
+An 8 GiB Win11Debug / two-vCPU WSL investigation found remote scheduler
+wakeups on the completion path. In one full trace, 13,677 of 21,109 IRQ-to-
+processing samples crossed virtual CPUs. The remote waking-to-wakeup stage
+averaged 43.96 us, versus 1.20 us locally. Following effective IRQ affinity
+eliminated cross-CPU processing in 21,609 paired samples; IRQ-to-processing
+averaged 11.31 us and the handler itself averaged 2.11 us. The Linux
+scheduler's remote wake-list path can send an IPI; sched_wakeup can be
+recorded on the receiving CPU, so its record CPU alone is not the waker.
+
+The production module's same-session untraced comparison (two samples per
+mode) measured random-read medians of 678.86 IOPS with affinity following
+disabled, 698.99 enabled, and 755.49 with polling. Sequential 1 MiB QD1
+medians were 124.58, 125.96, and 135.70 MiB/s respectively. These results
+confirm removal of a scheduling cost; they do not establish that interrupts
+are always the fastest mode. In separate complete traces the poll worker
+used about 1.72-1.80 CPU-seconds per roughly 10-second read run, versus
+0.08-0.09 for IRQ mode. These are traced guest-worker times, not total host
+or hypervisor CPU accounting.
+
+A lab-only experiment changing when HCD_BH callbacks run did not show a
+consistent random-read improvement and was not adopted. Windows publish-
+to-assert and assert-to-guest-entry times have not been separately measured;
+the remaining end-to-end gap cannot be assigned entirely to one stage.
+Raw evidence and scripts: x64/ReviewChecks/IrqCause/. cause_trace polling
+captures overflowed due to a high-frequency function probe and are excluded;
+the cause_clean and cause_pinned captures used for conclusions did not.
+
+Softirq event-ring processing
+
+irq_softirq=1 (default) avoids an ordinary-thread wakeup for URB and ISO
+completions. The hard handler schedules the transport tasklet; HCD_BH still
+delivers USB callbacks through the normal USB-core tasklet mechanism.
+irq_softirq=0 selects the earlier worker-based receive path for comparison.
+The two consumers serialize on a BH-safe rx_lock. After copying a control
+message out of the ring, the tasklet defers it to the worker and prevents
+any later message from passing it until management processing finishes.
+No sleeping management operation executes under rx_lock or in the tasklet.
+
+A batch is bounded by 32 messages or 100 us, checked between URBs. A single
+large bounded copy can exceed that time. Hard IRQs remain enabled during
+softirq data copying. Known remaining work is rescheduled while notification
+stays disarmed; an empty ring is re-armed and rechecked immediately. There
+is no new fixed interrupt-moderation delay. Queued transmit/ZLP work wakes
+the worker so backpressure does not wait for the housekeeping interval.
+
+Win11Debug traces measured IRQ entry to the START of URB completion handling
+at 10.20 us mean / 49 us p99 on the worker, versus 1.20 us / 7 us in softirq.
+Worker wakeups fell from 21,844 to 654 in paired roughly-ten-second runs.
+These are event-dispatch latency measurements, not full USB transfer times.
+Final same-session untraced medians (two runs each) were 673.26 -> 687.17
+random 4 KiB QD1 IOPS, 126.37 -> 130.55 MiB/s for 1 MiB QD1, and
+114.86 -> 118.07 MiB/s for 1 MiB QD4. Polling measured 769.36 IOPS,
+129.47 MiB/s and 117.78 MiB/s in that same session. Run-to-run variability
+remains significant; this is not a claim of universal throughput superiority.
+
+Production receive-code tests cover batch/time budgets, a sleeping control
+barrier, consumer switches, stop during a control handler, watchdog rescue,
+and ring corruption. Real USB tests cover 421 live consumer switches,
+MSI-X masking/replay, CPU migration, polling fallback, data integrity and
+host shutdown with reads in flight. IRQ migration may be deferred until
+the next actual interrupt, so tests generate traffic before awaiting the
+new effective affinity. Artifacts: x64/ReviewChecks/XhciPath/.
+
+Alternative Property investigation
+
+The strongest alternate candidates from Microsoft source were
+ReferenceTscPageActive (0x50019) and AutoEoiEnabled (0x5001a). In Win11Debug:
+
+* After switching Linux to the reference-counter clocksource, clearing the
+  reference-TSC enable bit, and separately clearing its GPA, the parent
+  ReferenceTscPageActive value stayed 1. Guest writes and page invalidation
+  were observed; clocksource and MSR were restored.
+* CPU0's unused, masked SINT15 changed from 0x10000 to 0x30000 and back,
+  toggling AutoEOI without enabling a vector. Parent AutoEoiEnabled stayed 0.
+  The original register was restored. Active VMBus SINT2 was not modified.
+
+These are negative results for usable, low-impact markers on this build,
+not a proof about all Hyper-V versions or live interrupt configurations.
+ReferenceTime is read-only. No evidenced guest-MSR alias was found for a
+generic monitoring ID or HypercallDoorbellPage marker.
+
+Deferred IRQ repoll experiment
+
+rx_repoll_us=0 (default) keeps immediate IRQ re-arming. Nonzero values
+1..250 select a same-CPU hrtimer recheck after progress, using the existing
+software arm/ack protocol to suppress redundant notifications. The timer
+only schedules the tasklet; it never takes rx_lock or spins for future data.
+rx_repoll_count=1 (default, range 0..16) limits consecutive empty rechecks.
+New progress replenishes the budget. The empty-window deadline is capped
+at min(interval * count, 1000 us) from progress. This is a policy deadline,
+not a hard scheduling guarantee. A timer delayed more than 1 ms beyond
+that deadline returns to IRQ mode even if data accumulated meanwhile.
+
+This follows the deferred-hard-IRQ / repoll-timer pattern in Linux NAPI,
+without registering a network device. New ISO admission wakes management
+to end an active repoll window; ISO completions/in-flight ISO bypass it.
+The timer is cancelled and synchronized before the tasklet/buffers are
+released. Mode changes, control-message deferral and protocol errors also
+cancel pending repolls. Debugfs reports timer arms/fires, hit/empty counts,
+actual timer delay and lateness. Counters are diagnostic snapshots.
+
+Win11Debug tests did not establish a net gain, so this remains opt-in.
+Three same-session samples each measured random-read medians:
+  immediate IRQ: 664.3 IOPS, p99 2514 us, guest busy CPU 2.03 s;
+  25 us / 8 empty rechecks: 661.7 IOPS, p99 2532 us, CPU 2.14 s;
+  50 us / 8 empty rechecks: 641.4 IOPS, p99 2681 us, CPU 2.02 s.
+Requested 25/50 us timers actually fired after roughly 59/90 us on average.
+The latter reduced PCI IRQs per completion from 1.0 to 0.358, but added
+about 3.47 timer callbacks per completion. Sequential 1 MiB QD1 fell from
+121.7 MiB/s to 119.2/118.8 MiB/s, with guest CPU rising from 0.73 to 0.92 s.
+CPU figures cover the guest's benchmark interval including warmup and
+background work, not total Windows/hypervisor CPU. Reducing PCI IRQ count
+does not by itself establish lower total processing cost.
+
+20 us / one recheck (a conservative NAPI-style reference) almost always
+found an empty queue; a single sample cannot establish a throughput gain.
+419 live mode/parameter switches, masked-IRQ replay, effective CPU migration,
+polling fallback, data hashing and host shutdown with active repolls passed.
+Physical ISO was not tested. Artifacts: x64/ReviewChecks/HybridRx/.
+
+Bounded URB busy-poll prototype
+
+rx_busy_us=0 (default) disables this separate experiment. Values 1..1000
+enable bounded worker polling after short Control/Bulk requests are actually
+published. rx_busy_bytes=128 limits candidate size (range 0..67108864).
+Queued-only requests do not start a window. Only successful candidates that
+complete within the budget renew it; long receives and cancellations do not.
+Interrupt/ISO submissions do not start windows, and in-flight ISO bypasses
+the experiment. This first version uses type/length hints, not protocol
+inspection or learned endpoint profiles.
+
+The worker directly drains the same RX consumer under rx_lock. Empty checks
+are preemptible and leave IRQ notification enabled, so the tasklet can still
+make progress when the worker is descheduled. Management barriers, bounded
+batches and arm/recheck are shared with the IRQ path. Timer repolls are
+cancelled during the busy window. Each slice checks a time budget, scheduling
+pressure and stop state. Continuous real progress can still consume a core;
+the budget is not an aggregate CPU utilization limit. Debugfs busy.elapsed_ns
+is elapsed time including preemption, not measured CPU consumption.
+
+The HCD no longer invents a 5/10-second transfer deadline (including ZLP and
+ISO requests). Async transfer deadlines belong to the USB client. Worker
+housekeeping only retries explicit cancellations; shared slots remain held
+until completion or DMA-safe teardown acknowledgement.
+
+Production-code regressions and ASan/UBSan passed. The module built in WSL
+Ubuntu-22.04 and loaded in Win11Debug, completing native IRQ negotiation and
+12 idle mode switches with zero busy windows. Subsequent U300 read-only tests
+used three interleaved samples per mode/case. Random 4 KiB QD1 medians were:
+  IRQ: 672.8 IOPS, p99 2359 us, guest CPU 1.81 s;
+  short-request 100 us: 738.0 IOPS, p99 2117 us, guest CPU 3.13 s;
+  short-request 200 us: 739.2 IOPS, p99 2129 us, guest CPU 4.24 s;
+  adaptive polling: 757.4 IOPS, p99 2203 us, guest CPU 3.45 s.
+Guest CPU covers the benchmark subprocess including warmup/background work,
+not Windows or hypervisor CPU. The 100-us mode improved sequential QD1 from
+125.0 to 133.4 MiB/s, but QD4 p99 rose from 68.4 to 86.0 ms. Therefore the
+prototype remains opt-in, without a universal performance claim.
+418 live mode switches, masked IRQ replay, actual CPU0/CPU1 interrupt delivery,
+polling fallback and the original first-64-MiB hash passed. Active-I/O shutdown
+took 2.335 s including Windows device restoration; the reader returned ENODEV
+and WSL stayed responsive. Module unload took about 102 ms including launch.
+See urb-scheduling.txt and x64/ReviewChecks/UrbPolicy{,Perf}/ for evidence.
+
+Primary references
+
+https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercall-interface
+https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallgetpartitionproperty
+https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallgetnextchildpartition
+https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/timers
+https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/inter-partition-communication
+https://github.com/microsoft/openvmm/blob/main/vm/hv1/hvdef/src/lib.rs
+https://github.com/microsoft/WSL2-Linux-Kernel/blob/linux-msft-wsl-6.6.y/drivers/pci/controller/pci-hyperv.c
+https://docs.kernel.org/networking/napi.html
+https://github.com/torvalds/linux/blob/v6.6/net/core/dev.c
+https://docs.kernel.org/networking/napi.html
+https://github.com/torvalds/linux/blob/v6.6/net/core/dev.c
+
+Validation artifacts (workspace, not committed binaries)
+
+x64/ReviewChecks/AltPropertyProbe/alternative-result.json
+x64/ReviewChecks/AutoEoiPropertyProbe/autoeoi-result.json
+x64/ReviewChecks/GuestMarkerProbe/
+x64/ReviewChecks/DeviceInterruptResearch/
+x64/ReviewChecks/KernelIrq/
+
+The final directory contains build/unit logs, performance JSON, masked IRQ
+replay/affinity evidence and environment cleanup records. Physical USB
+tests use read-only access and verify the original first-64-MiB SHA-256.

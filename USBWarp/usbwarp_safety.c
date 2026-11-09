@@ -25,7 +25,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Token bucket (per-device rate limiter)
  *
- *   Capacity 200 tokens, refill rate 100/sec (spec §03 §7.3).
+ *   Capacity and refill are configured at bind (currently 16000 URBs/sec).
  *   Each URB submit consumes 1 token.  If tokens <= 0, request denied.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -286,7 +286,7 @@ UsbWarpValidateMessage(
     }
 
     if (Hdr->message_length < sizeof(struct usbwarp_msg_header) ||
-        Hdr->message_length > MsgLen) {
+        Hdr->message_length != MsgLen) {
         KdPrint(("UsbWarp: L2 length invalid %u (buf=%u)\n",
                  Hdr->message_length, MsgLen));
         return STATUS_DATA_ERROR;
@@ -305,6 +305,8 @@ UsbWarpValidateMessage(
     case USBWARP_MSG_NEGOTIATE:
     case USBWARP_MSG_NEGOTIATE_RESP:
     case USBWARP_MSG_URB_SUBMIT:
+    case USBWARP_MSG_ISO_SUBMIT:
+    case USBWARP_MSG_STREAMS_REQUEST:
     case USBWARP_MSG_URB_COMPLETE:
     case USBWARP_MSG_URB_CANCEL:
     case USBWARP_MSG_URB_CANCEL_ACK:
@@ -314,6 +316,7 @@ UsbWarpValidateMessage(
     case USBWARP_MSG_DEVICE_REMOVE_ACK:
     case USBWARP_MSG_HEARTBEAT:
     case USBWARP_MSG_HOST_SHUTDOWN:
+    case USBWARP_MSG_GUEST_SHUTDOWN:
     case USBWARP_MSG_SHUTDOWN_ACK:
     case USBWARP_MSG_CIRCUIT_BREAKER_TRIP:
     case USBWARP_MSG_CIRCUIT_BREAKER_RESET:
@@ -329,6 +332,8 @@ UsbWarpValidateMessage(
     /* device_id 0 is valid for system-level messages (negotiate, heartbeat).
      * For device-specific messages, verify device is bound. */
     if (Hdr->message_type == USBWARP_MSG_URB_SUBMIT ||
+        Hdr->message_type == USBWARP_MSG_ISO_SUBMIT ||
+        Hdr->message_type == USBWARP_MSG_STREAMS_REQUEST ||
         Hdr->message_type == USBWARP_MSG_URB_CANCEL) {
         if (Hdr->device_id == 0 ||
             Hdr->device_id > USBWARP_MAX_DEVICES_LIMIT) {
@@ -336,11 +341,27 @@ UsbWarpValidateMessage(
                      Hdr->device_id));
             return STATUS_ACCESS_DENIED;
         }
-        if (!Ctx->Devices[Hdr->device_id - 1].InUse) {
-            KdPrint(("UsbWarp: L3 device_id %u not bound\n",
-                     Hdr->device_id));
-            return STATUS_ACCESS_DENIED;
-        }
+        /* A request racing unbind must receive DISCONNECTED, rather than
+         * disappear here and leave the guest holding its buffer forever. */
+    }
+
+    if (Hdr->message_type == USBWARP_MSG_STREAMS_REQUEST) {
+        const struct usbwarp_msg_streams_request *req = (const void *)Hdr;
+        if (!(Ctx->NegotiatedCaps & USBWARP_CAP_STREAMS) || MsgLen != sizeof(*req) ||
+            !usbwarp_stream_request_valid(req->endpoint_mask, req->num_streams))
+            return STATUS_DATA_ERROR;
+    }
+
+    if (Hdr->message_type == USBWARP_MSG_ISO_SUBMIT) {
+        const struct usbwarp_msg_iso_submit *iso = (const void *)Hdr;
+        PVOID transfer;
+        if (!Ctx->Negotiated ||
+            (Ctx->NegotiatedCaps & (USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED)) !=
+            (USBWARP_CAP_ISO_TRANSFER | USBWARP_CAP_ISO_PACKED) ||
+            !usbwarp_iso_submit_valid(iso, MsgLen))
+            return STATUS_DATA_ERROR;
+        return UsbWarpSafeGetTransferVa(Ctx, iso->buffer_offset,
+                                       max(iso->total_length, 1u), &transfer);
     }
 
     /* ── Layer 4: Payload field validation ──────────────────────────────── */
@@ -370,8 +391,17 @@ UsbWarpValidateMessage(
             sub->transfer_type != USBWARP_XFER_INTERRUPT)
             return STATUS_DATA_ERROR;
 
+        if (sub->stream_id && (!(Ctx->NegotiatedCaps & USBWARP_CAP_STREAMS) ||
+            sub->transfer_type != USBWARP_XFER_BULK || sub->stream_id > USBWARP_MAX_STREAMS))
+            return STATUS_DATA_ERROR;
+
         /* data_mode: known values */
         if (sub->data_mode > USBWARP_DATA_INLINE)
+            return STATUS_DATA_ERROR;
+        if (sub->transfer_length && sub->data_mode == USBWARP_DATA_NONE)
+            return STATUS_DATA_ERROR;
+        if (sub->data_mode == USBWARP_DATA_INLINE && !sub->direction &&
+            sub->transfer_length > MsgLen - USBWARP_MSG_URB_SUBMIT_BASE_SIZE)
             return STATUS_DATA_ERROR;
 
         /* transfer_length reasonable limit (64 MB) */
@@ -381,7 +411,7 @@ UsbWarpValidateMessage(
         /* ── Layer 5: Buffer bounds check ───────────────────────────────── */
         if (sub->data_mode == USBWARP_DATA_BUFFER &&
             sub->transfer_length > 0) {
-            ULONG64 drOffset = Ctx->ControlBlock->data_region_offset;
+            ULONG64 drOffset = (ULONG64)(Ctx->DataRegion - (PUCHAR)Ctx->ShmKernelBase);
             ULONG64 drSize   = Ctx->DataRegionSize;
 
             /* Integer overflow check. */
@@ -440,18 +470,21 @@ UsbWarpSafeGetTransferVa(
     )
 {
     PUCHAR base = (PUCHAR)Ctx->ShmKernelBase;
-    SIZE_T size = Ctx->ShmSize;
+    SIZE_T size = Ctx->DataRegionSize;
+    SIZE_T offset;
 
     *OutVa = NULL;
 
-    if (base == NULL || size == 0)
+    if (base == NULL || size == 0 || Ctx->DataRegion == NULL)
         return STATUS_INVALID_DEVICE_STATE;
 
+    offset = (SIZE_T)(Ctx->DataRegion - base);
+
     /* Overflow check. */
-    if (BufferOffset >= (ULONG)size)
+    if (BufferOffset < offset || (SIZE_T)BufferOffset - offset >= size)
         return STATUS_BUFFER_OVERFLOW;
 
-    if (TransferLength > (ULONG)(size - BufferOffset))
+    if (TransferLength > size - ((SIZE_T)BufferOffset - offset))
         return STATUS_BUFFER_OVERFLOW;
 
     *OutVa = base + BufferOffset;
@@ -462,105 +495,34 @@ UsbWarpSafeGetTransferVa(
  * §6  Orphan mode (spec §06 §9)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-VOID
-UsbWarpEnterOrphanMode(
-    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx,
-    ULONG Reason
-    )
-{
-    LONG old;
-
-    UNREFERENCED_PARAMETER(Reason);
-
-    old = InterlockedCompareExchange(&Ctx->OrphanState,
-                                          ORPHAN_GRACE, ORPHAN_NONE);
-    if (old == ORPHAN_NONE) {
-        KeQuerySystemTime(&Ctx->OrphanGraceStart);
-        KdPrint(("UsbWarp: ORPHAN MODE entered reason=%u "
-                 "(grace period %u ms)\n",
-                 Reason, USBWARP_ORPHAN_GRACE_PERIOD_MS));
-    }
-}
-
-VOID
-UsbWarpCheckOrphanTimeout(
-    _In_ PUSBWARP_GLOBAL_CONTEXT Ctx
-    )
+VOID UsbWarpCheckOrphanTimeout(PUSBWARP_GLOBAL_CONTEXT Ctx)
 {
     LARGE_INTEGER now;
-
-    if (!Ctx->ServiceRegistered)
-        return;
-
-    KeQuerySystemTime(&now);
-
-    /* Compute timeout dynamically: 3x the registered heartbeat interval,
-     * clamped to [3s, 30s].  Falls back to 6s if not yet registered. */
-    ULONG timeoutMs = Ctx->HeartbeatIntervalMs > 0 ?
-                      Ctx->HeartbeatIntervalMs * 3 :
-                      USBWARP_HEARTBEAT_TIMEOUT_MS;
-    if (timeoutMs < 3000)  timeoutMs = 3000;
-    if (timeoutMs > 30000) timeoutMs = 30000;
-
-    LONGLONG elapsed = (now.QuadPart - Ctx->LastServiceHeartbeat.QuadPart);
-    LONGLONG timeoutTicks = (LONGLONG)timeoutMs * 10000LL;
-
-    if (elapsed > timeoutTicks) {
-        LONG orphanState = InterlockedCompareExchange(&Ctx->OrphanState, 0, 0);
-
-        if (orphanState == ORPHAN_NONE) {
-            UsbWarpEnterOrphanMode(Ctx, 0 /* HEARTBEAT_TIMEOUT */);
-        }
-        else if (orphanState == ORPHAN_GRACE) {
-            /* Check if grace period expired. */
-            LONGLONG graceElapsed =
-                (now.QuadPart - Ctx->OrphanGraceStart.QuadPart);
-            LONGLONG graceTicks =
-                (LONGLONG)USBWARP_ORPHAN_GRACE_PERIOD_MS * 10000LL;
-
-            if (graceElapsed > graceTicks) {
-                InterlockedExchange(&Ctx->OrphanState, ORPHAN_EXPIRED);
-                KdPrint(("UsbWarp: orphan grace period EXPIRED — "
-                         "initiating emergency shutdown\n"));
-
-                /* Trip the global breaker. */
+    KIRQL irql;
+    BOOLEAN expired = FALSE;
+    now.QuadPart = (LONGLONG)KeQueryInterruptTime();
+    KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+    if (Ctx->ServiceRegistered) {
+        ULONG milliseconds = Ctx->HeartbeatIntervalMs * 3;
+        milliseconds = max(3000u, min(milliseconds, 30000u));
+        if (now.QuadPart - Ctx->LastServiceHeartbeat.QuadPart > (LONGLONG)milliseconds * 10000) {
+            if (Ctx->OrphanState == ORPHAN_NONE) {
+                Ctx->OrphanState = ORPHAN_GRACE;
+                Ctx->OrphanGraceStart = now;
+            } else if (Ctx->OrphanState == ORPHAN_GRACE &&
+                now.QuadPart - Ctx->OrphanGraceStart.QuadPart > (LONGLONG)USBWARP_ORPHAN_GRACE_PERIOD_MS * 10000) {
+                Ctx->OrphanState = ORPHAN_EXPIRED;
                 InterlockedExchange(&Ctx->GlobalBreakerOpen, TRUE);
-
-                /* Update Control Block. */
-                if (Ctx->ControlBlock) {
-                    Ctx->ControlBlock->host_state = USBWARP_STATE_ERROR;
-                }
+                InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_ERROR);
+                expired = TRUE;
             }
         }
     }
+    KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+    if (expired) UsbWarpQueueSessionCleanup(Ctx);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §7  Process notify context (P1#5: atomic pointer)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-PUSBWARP_GLOBAL_CONTEXT g_NotifyContext = NULL;
-
-static VOID SetNotifyContext(PUSBWARP_GLOBAL_CONTEXT ctx)
-{
-    InterlockedExchangePointer((PVOID *)&g_NotifyContext, ctx);
-}
-
-static VOID ClearNotifyContext(void)
-{
-    InterlockedExchangePointer((PVOID *)&g_NotifyContext, NULL);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §8  Emergency shutdown (spec §06 §8.3)
- *
- *   Priority 1: Stop DMA (cancel all pending USB requests)
- *   Priority 2: Stop poll thread
- *   Priority 3: Unmap shared memory
- *   Priority 4: Release Section reference
- *   Priority 5: Free kernel objects
- * ═══════════════════════════════════════════════════════════════════════════ */
-
+/* Session cleanup is serialized against management IOCTLs by SessionMutex. */
 VOID
 UsbWarpEmergencyShutdown(
     _In_ PUSBWARP_GLOBAL_CONTEXT Ctx
@@ -576,11 +538,19 @@ UsbWarpEmergencyShutdown(
     KdPrint(("UsbWarp: EMERGENCY SHUTDOWN initiated\n"));
 
     InterlockedExchange(&Ctx->GlobalBreakerOpen, TRUE);
+    InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_SHUTTING_DOWN);
 
     if (Ctx->ControlBlock)
         Ctx->ControlBlock->host_state = USBWARP_STATE_SHUTTING_DOWN;
 
-    if (Ctx->ShmEstablished && Ctx->H2gRing.Hdr) {
+    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i) {
+        if (Ctx->Devices[i].InUse) {
+            InterlockedExchange(&Ctx->Devices[i].Removing, 1);
+            UsbWarpDeviceClose(Ctx, &Ctx->Devices[i]);
+        }
+    }
+
+    if (Ctx->ShmEstablished && Ctx->Negotiated && Ctx->H2gRing.Hdr) {
         NTSTATUS notifyStatus;
 
         notifyStatus = UsbWarpSendHostShutdown(
@@ -597,26 +567,6 @@ UsbWarpEmergencyShutdown(
 
     InterlockedExchange(&Ctx->ShuttingDown, TRUE);
 
-    /* ── Priority 1: Stop DMA — cancel all pending USB requests ─────────── */
-    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
-        if (Ctx->Devices[i].InUse && Ctx->Devices[i].FilterTarget) {
-            WdfIoTargetStop(Ctx->Devices[i].FilterTarget,
-                            WdfIoTargetCancelSentIo);
-        }
-    }
-
-    /* P0#3: Wait for each device's pending URBs to drain (max 10s each).
-     * This ensures all DMA is complete before we unmap shared memory. */
-    timeout.QuadPart = -100000000LL;  /* 10 seconds */
-    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
-        if (Ctx->Devices[i].InUse &&
-            InterlockedCompareExchange(&Ctx->Devices[i].PendingCount, 0, 0) > 0) {
-            KeClearEvent(&Ctx->Devices[i].DrainEvent);
-            KeWaitForSingleObject(&Ctx->Devices[i].DrainEvent,
-                                  Executive, KernelMode, FALSE, &timeout);
-        }
-    }
-
     /* CRITICAL: Flush all queued DPCs across all processors.
      * UrbProxyCompletion runs as a DPC — even after DrainEvent fires,
      * the DPC may still be queued but not yet executed.  Without this
@@ -631,6 +581,8 @@ UsbWarpEmergencyShutdown(
 
     /* ── Priority 2: Stop poll thread ───────────────────────────────────── */
     UsbWarpPollStop(Ctx);
+    UsbWarpIrqDestroy(Ctx);
+    if (Ctx->G2hDoorbell) { ObDereferenceObject(Ctx->G2hDoorbell); Ctx->G2hDoorbell = NULL; }
 
     /* ── Priority 3: Unmap shared memory ────────────────────────────────── */
     if (Ctx->ShmMdl) {
@@ -652,61 +604,87 @@ UsbWarpEmergencyShutdown(
         Ctx->SectionObject = NULL;
     }
 
-    /* ── Priority 5: Free kernel objects ────────────────────────────────── */
-    for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; i++) {
-        if (Ctx->Devices[i].InUse) {
-            UsbWarpDeviceClose(Ctx, &Ctx->Devices[i]);
+    /* Publish final device state atomically with PnP cleanup callbacks. */
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&Ctx->DeviceLock, &irql);
+        for (ULONG i = 0; i < USBWARP_MAX_DEVICES_LIMIT; ++i)
             Ctx->Devices[i].InUse = FALSE;
-        }
-    }
-    Ctx->ActiveDeviceCount = 0;
-
-    /* Unregister process notification callback. */
-    if (Ctx->ProcessNotifyRegistered) {
-        PsSetCreateProcessNotifyRoutineEx(
-            UsbWarpProcessNotifyCallback, TRUE);
-        Ctx->ProcessNotifyRegistered = NULL;
-        ClearNotifyContext();  /* P1#5 */
+        Ctx->ActiveDeviceCount = 0;
+        KeReleaseSpinLock(&Ctx->DeviceLock, irql);
     }
 
-    Ctx->ServiceRegistered = FALSE;
+    {
+        KIRQL irql;
+        PFILE_OBJECT file;
+        PEPROCESS process;
+        KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+        file = Ctx->ServiceFile;
+        process = Ctx->ServiceProcess;
+        Ctx->ServiceFile = NULL;
+        Ctx->ServiceProcess = NULL;
+        Ctx->ServiceRegistered = FALSE;
+        Ctx->ServiceDisconnected = FALSE;
+        Ctx->ServiceProcessId = 0;
+        KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+        Ctx->Negotiated = FALSE;
+        Ctx->NegotiatedCaps = 0;
+        Ctx->G2hRing.Hdr = Ctx->H2gRing.Hdr = NULL;
+        Ctx->G2hRing.Data = Ctx->H2gRing.Data = NULL;
+        InterlockedExchange(&Ctx->PublishedState, USBWARP_STATE_STOPPED);
+        if (process) ObDereferenceObject(process);
+        if (file) ObDereferenceObject(file);
+    }
 
     KdPrint(("UsbWarp: emergency shutdown COMPLETE\n"));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §8  Process termination notify (spec §06 §9.2)
- *
- *   Registered via PsSetCreateProcessNotifyRoutineEx.
- *   Fires when ANY process exits.  We check if it's our Service.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-VOID
-UsbWarpProcessNotifyCallback(
-    _Inout_  PEPROCESS              Process,
-    _In_     HANDLE                 ProcessId,
-    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
-    )
+/* A real FILE_OBJECT reference keeps the control device alive until its
+ * session is drained. CLEANUP runs when the last user handle closes even
+ * though that kernel reference remains; CLOSE happens after it is released. */
+static VOID QueueCleanupLocked(PUSBWARP_GLOBAL_CONTEXT Ctx)
 {
-    PUSBWARP_GLOBAL_CONTEXT ctx;
+    if (!Ctx->ServiceRegistered || Ctx->SessionCleanupQueued) return;
+    Ctx->CleanupGeneration = Ctx->SessionGeneration;
+    Ctx->SessionCleanupQueued = 1;
+    WdfWorkItemEnqueue(Ctx->SessionCleanupWork);
+}
 
-    UNREFERENCED_PARAMETER(Process);
+VOID UsbWarpQueueSessionCleanup(PUSBWARP_GLOBAL_CONTEXT Ctx)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&Ctx->ServiceLock, &irql);
+    QueueCleanupLocked(Ctx);
+    KeReleaseSpinLock(&Ctx->ServiceLock, irql);
+}
 
-    if (CreateInfo != NULL)
-        return;  /* only care about termination */
-
-    /* P1#5: Read pointer atomically, validate before use. */
-    ctx = (PUSBWARP_GLOBAL_CONTEXT)InterlockedCompareExchangePointer(
-              (PVOID *)&g_NotifyContext, NULL, NULL);
-    if (!ctx)
-        return;
-
-    if (!ctx->ServiceRegistered)
-        return;
-
-    if ((ULONG)(ULONG_PTR)ProcessId == ctx->ServiceProcessId) {
-        KdPrint(("UsbWarp: Service process %u TERMINATED\n",
-                 ctx->ServiceProcessId));
-        UsbWarpEnterOrphanMode(ctx, 1 /* PROCESS_TERMINATED */);
+VOID UsbWarpEvtFileCleanup(WDFFILEOBJECT FileObject)
+{
+    PUSBWARP_GLOBAL_CONTEXT ctx = UsbWarpGetContext(WdfFileObjectGetDevice(FileObject));
+    KIRQL irql;
+    KeAcquireSpinLock(&ctx->ServiceLock, &irql);
+    UsbWarpGetFileContext(FileObject)->CleanedUp = TRUE;
+    if (ctx->ServiceRegistered && ctx->ServiceFile == WdfFileObjectWdmGetFileObject(FileObject)) {
+        ctx->ServiceDisconnected = TRUE;
+        InterlockedExchange(&ctx->GlobalBreakerOpen, TRUE);
+        InterlockedExchange(&ctx->PublishedState, USBWARP_STATE_ERROR);
+        QueueCleanupLocked(ctx);
     }
+    KeReleaseSpinLock(&ctx->ServiceLock, irql);
+}
+
+VOID UsbWarpEvtSessionCleanup(WDFWORKITEM WorkItem)
+{
+    PUSBWARP_GLOBAL_CONTEXT ctx = UsbWarpGetContext((WDFDEVICE)WdfWorkItemGetParentObject(WorkItem));
+    KIRQL irql;
+    BOOLEAN current;
+    KeWaitForSingleObject(&ctx->SessionMutex, Executive, KernelMode, FALSE, NULL);
+    KeAcquireSpinLock(&ctx->ServiceLock, &irql);
+    current = ctx->ServiceRegistered && ctx->CleanupGeneration == ctx->SessionGeneration;
+    KeReleaseSpinLock(&ctx->ServiceLock, irql);
+    if (current) UsbWarpEmergencyShutdown(ctx);
+    KeAcquireSpinLock(&ctx->ServiceLock, &irql);
+    ctx->SessionCleanupQueued = 0;
+    KeReleaseSpinLock(&ctx->ServiceLock, irql);
+    KeReleaseMutex(&ctx->SessionMutex, FALSE);
 }

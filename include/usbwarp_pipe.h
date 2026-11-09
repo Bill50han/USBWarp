@@ -5,7 +5,7 @@
  *
  * Binary message protocol over \\.\pipe\UsbWarpServicePipe.
  * Message mode (PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE).
- * Single concurrent connection; latecomers receive ERROR_PIPE_BUSY.
+ * Multiple concurrent local connections, bounded by the service.
  *
  * Requires <stdint.h> or equivalent before inclusion.
  */
@@ -19,9 +19,18 @@
  * §1  Pipe identity
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+#ifndef USBWARP_PIPE_NAME
 #define USBWARP_PIPE_NAME       "\\\\.\\pipe\\UsbWarpServicePipe"
+#endif
+#ifndef USBWARP_PIPE_NAME_W
 #define USBWARP_PIPE_NAME_W    L"\\\\.\\pipe\\UsbWarpServicePipe"
+#endif
 #define USBWARP_PIPE_MAGIC      0x50524157u   /* "WARP" LE */
+
+/* OW must be present to suppress the owner's implicit WRITE_DAC. An
+ * unelevated token for the service account gets client I/O, not permission
+ * to add server instances or rewrite the ACL. Elevated BA/SY retain control. */
+#define USBWARP_PIPE_SDDL L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;RC;;;OW)(A;;0x12019b;;;AU)"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §2  Message envelope
@@ -84,7 +93,8 @@ struct usbwarp_pipe_device_entry {
     uint8_t  device_protocol;
     uint8_t  bound;                      /* 1 = attached to guest             */
     uint16_t description_length;         /* UTF-8 bytes that follow           */
-    uint8_t  _pad[2];
+    uint8_t  speed;                      /* negotiated speed; former padding */
+    uint8_t  _pad;
     /* uint8_t description[];  — variable length UTF-8                        */
 };
 
@@ -105,6 +115,19 @@ struct usbwarp_pipe_bind_request {
 
 /* ── 4.4  QUERY_STATUS response ───────────────────────────────────────────── */
 
+enum usbwarp_session_stage {
+    USBWARP_SESSION_INITIALIZING = 0,
+    USBWARP_SESSION_CONNECTING = 1,
+    USBWARP_SESSION_RUNNING = 2,
+    USBWARP_SESSION_STOPPING = 3,
+    USBWARP_SESSION_STOPPED = 4,
+    USBWARP_SESSION_ERROR = 5,
+    USBWARP_SESSION_WAIT_DRIVER = 6,
+    USBWARP_SESSION_WAIT_VM = 7,
+    USBWARP_SESSION_WAIT_GUEST = 8,
+    USBWARP_SESSION_RETRYING = 9,
+};
+
 struct usbwarp_pipe_status {
     uint32_t session_state;
     uint32_t bound_device_count;
@@ -122,6 +145,9 @@ struct usbwarp_pipe_stats_request {
 };
 
 struct usbwarp_pipe_stats_response {
+    /* Current kernel snapshots provide total URBs, combined bytes in
+     * bytes_out, and global G2H ring usage. Other fields are reserved and
+     * zero, not measured zeros. Keep this layout for existing clients. */
     uint64_t urb_submit_count;
     uint64_t urb_complete_count;
     uint64_t urb_cancel_count;

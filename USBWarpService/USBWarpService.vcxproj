@@ -19,6 +19,11 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="config.cpp" />
+    <ClCompile Include="device_capture.cpp" />
+    <ClCompile Include="capture_pnp.cpp" />
+    <ClCompile Include="logging.cpp" />
+    <ClCompile Include="session.cpp" />
     <ClCompile Include="hdv_session.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="pipe_server.cpp" />
@@ -32,6 +37,7 @@
     <ClInclude Include="..\include\usbwarp_shared.h" />
     <ClInclude Include="hdv_defs.h" />
     <ClInclude Include="warp_service.h" />
+    <ClInclude Include="capture_pnp.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>

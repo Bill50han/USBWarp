@@ -26,8 +26,9 @@ BOOL ShmCreate(struct warp_session *s)
 {
     /* FIX #8: Prevent double-create / handle leak. */
     if (s->section != NULL || s->shm_base != NULL) {
-        LogError("ShmCreate called but section already exists — destroying first");
-        ShmDestroy(s);
+        LogError("ShmCreate called while a section is still owned by the session");
+        SetLastError(ERROR_INVALID_STATE);
+        return FALSE;
     }
 
     const uint32_t ring_data = s->cfg.ring_data_size;
@@ -38,16 +39,19 @@ BOOL ShmCreate(struct warp_session *s)
         ring_data < USBWARP_RING_DATA_SIZE_MIN ||
         ring_data > USBWARP_RING_DATA_SIZE_MAX) {
         LogError("ring_data_size 0x%X invalid", ring_data);
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     if (!USBWARP_IS_POWER_OF_2(buf_size) ||
         buf_size < USBWARP_BUFFER_SIZE_MIN ||
         buf_size > USBWARP_BUFFER_SIZE_MAX) {
         LogError("buffer_size 0x%X invalid", buf_size);
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     if (total < USBWARP_SHM_SIZE_MIN || total > USBWARP_SHM_SIZE_MAX) {
         LogError("shm_size %u out of range", total);
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
 
@@ -64,6 +68,7 @@ BOOL ShmCreate(struct warp_session *s)
             p2 <<= 1;
         if (p2 == 0) {
             LogError("SHM size overflow during power-of-2 rounding");
+            SetLastError(ERROR_ARITHMETIC_OVERFLOW);
             return FALSE;
         }
         if (p2 != total) {
@@ -85,6 +90,7 @@ BOOL ShmCreate(struct warp_session *s)
 
     if (dr_off >= total) {
         LogError("SHM too small: need 0x%X, have 0x%X", dr_off, total);
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
 
@@ -93,6 +99,7 @@ BOOL ShmCreate(struct warp_session *s)
 
     if (buf_cnt < USBWARP_BUFFER_QUOTA_MIN) {
         LogError("Only %u buffers, need >= %u", buf_cnt, USBWARP_BUFFER_QUOTA_MIN);
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
 
@@ -113,13 +120,22 @@ BOOL ShmCreate(struct warp_session *s)
 
     s->shm_base = MapViewOfFile(s->section, FILE_MAP_ALL_ACCESS, 0, 0, total);
     if (!s->shm_base) {
-        LogError("MapViewOfFile failed: %lu", GetLastError());
+        DWORD error = GetLastError();
+        LogError("MapViewOfFile failed: %lu", error);
         CloseHandle(s->section);
         s->section = NULL;
+        SetLastError(error);
         return FALSE;
     }
 
     memset(s->shm_base, 0, total);
+    if ((s->driverCaps & USBWARP_DRIVER_CAP_G2H_DOORBELL) &&
+        s->api.HdvRegisterDoorbell && s->api.HdvUnregisterDoorbell) {
+        s->doorbellEvent = CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if (!s->doorbellEvent) {
+            DWORD error=GetLastError(); ShmDestroy(s); SetLastError(error); return FALSE;
+        }
+    }
 
     /* Write Control Block. */
     volatile struct usbwarp_control_block *cb =
@@ -129,8 +145,11 @@ BOOL ShmCreate(struct warp_session *s)
     cb->protocol_version_major  = USBWARP_PROTOCOL_VERSION_MAJOR;
     cb->protocol_version_minor  = USBWARP_PROTOCOL_VERSION_MINOR;
     cb->shm_total_size          = total;
-    cb->flags                   = s->cfg.enable_iso ? USBWARP_FLAG_ISO_ENABLED : 0;
+    cb->flags                   = USBWARP_FLAG_COHERENT_RAM |
+                                  (s->cfg.enable_iso ? USBWARP_FLAG_ISO_ENABLED : 0);
     if (s->cfg.debug) cb->flags |= USBWARP_FLAG_DEBUG_ENABLED;
+    if (s->doorbellEvent) cb->flags |= USBWARP_FLAG_G2H_DOORBELL;
+    if (s->driverCaps & USBWARP_DRIVER_CAP_H2G_IRQ) cb->flags |= USBWARP_FLAG_H2G_IRQ;
     cb->g2h_ring_offset         = g2h_off;
     cb->g2h_ring_size           = ring_total;
     cb->h2g_ring_offset         = h2g_off;
@@ -147,19 +166,11 @@ BOOL ShmCreate(struct warp_session *s)
         (volatile struct usbwarp_ring_header *)(base + g2h_off);
     volatile struct usbwarp_ring_header *h2g =
         (volatile struct usbwarp_ring_header *)(base + h2g_off);
-    const uint32_t max_msg = 4096;
+    const uint32_t max_msg = USBWARP_MAX_MESSAGE_SIZE;   /* 1024 ISO results */
     InitRingHeader(g2h, ring_data, max_msg);
     InitRingHeader(h2g, ring_data, max_msg);
 
-    /* Populate session pointers. */
-    s->cb              = cb;
-    s->g2h_ring        = g2h;
-    s->h2g_ring        = h2g;
-    s->g2h_ring_data   = (volatile uint8_t *)g2h + USBWARP_RING_HEADER_SIZE;
-    s->h2g_ring_data   = (volatile uint8_t *)h2g + USBWARP_RING_HEADER_SIZE;
-    s->data_region     = (volatile uint8_t *)(base + dr_off);
-    s->data_region_size = dr_size;
-    s->buffer_count     = buf_cnt;
+    /* After initialization only the kernel and guest access transport state. */
     s->shm_size         = total;
 
     LogInfo("SHM created: section=%p  base=%p  cb.magic=0x%08X",
@@ -171,8 +182,6 @@ void ShmDestroy(struct warp_session *s)
 {
     if (s->shm_base) { UnmapViewOfFile(s->shm_base); s->shm_base = NULL; }
     if (s->section)  { CloseHandle(s->section);       s->section  = NULL; }
-    s->cb = NULL;
-    s->g2h_ring = NULL;
-    s->h2g_ring = NULL;
-    s->data_region = NULL;
+    if (s->doorbellEvent) { CloseHandle(s->doorbellEvent); s->doorbellEvent=nullptr; }
+    s->shm_size = 0;
 }

@@ -1,255 +1,190 @@
-/*
- * winsvc.cpp — SCM integration for UsbWarpService.
- *
- * Copyright (c) 2026 UsbWarp Project
- *
- * Dual-mode entry: wmain calls RunServiceDispatcher() first; started by
- * the SCM the process runs as a real Windows service, started from a
- * shell the dispatcher fails with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT
- * and main.cpp falls back to the console build.
- *
- * --install persists the configuration under HKLM\SOFTWARE\UsbWarp\Service
- * (the auto-start service reads it at boot) and creates the service with
- * AUTO_START + crash-restart failure actions.  Config errors terminate
- * with a clean SERVICE_STOPPED + error code (no restart loop).
- */
-
+// SPDX-License-Identifier: GPL-2.0-only
 #include "warp_service.h"
 #include <stdio.h>
+#include <string>
+#include <vector>
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §1  Status reporting (no-ops in console mode)
- * ═══════════════════════════════════════════════════════════════════════════ */
+namespace {
+SRWLOCK statusLock = SRWLOCK_INIT;
+SERVICE_STATUS_HANDLE statusHandle;
+SERVICE_STATUS currentStatus{};
+bool terminal;
+DWORD serviceExit;
 
-static SERVICE_STATUS_HANDLE g_statusHandle;
-static DWORD g_checkPoint;
-
-static void SetState(DWORD state, DWORD exitCode, DWORD waitHint)
+void SetState(DWORD state, DWORD error = ERROR_SUCCESS)
 {
-    SERVICE_STATUS st;
-
-    if (!g_statusHandle)
+    AcquireSRWLockExclusive(&statusLock);
+    if (!statusHandle || terminal ||
+        (currentStatus.dwCurrentState == SERVICE_STOP_PENDING &&
+         (state == SERVICE_RUNNING || state == SERVICE_START_PENDING))) {
+        ReleaseSRWLockExclusive(&statusLock);
         return;
-
-    memset(&st, 0, sizeof(st));
-    st.dwServiceType      = SERVICE_WIN32_OWN_PROCESS;
-    st.dwCurrentState     = state;
-    st.dwWin32ExitCode    = exitCode;
-    st.dwWaitHint         = waitHint;
-    st.dwCheckPoint       = (state == SERVICE_START_PENDING ||
-                             state == SERVICE_STOP_PENDING) ?
-                            ++g_checkPoint : 0;
-    st.dwControlsAccepted = (state == SERVICE_RUNNING) ?
-                            (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
-
-    SetServiceStatus(g_statusHandle, &st);
+    }
+    DWORD previous = currentStatus.dwCurrentState;
+    currentStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    currentStatus.dwCurrentState = state;
+    currentStatus.dwWin32ExitCode = error;
+    currentStatus.dwControlsAccepted = state == SERVICE_RUNNING ?
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN : 0;
+    bool pending = state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING;
+    currentStatus.dwWaitHint = pending ? 30000 : 0;
+    currentStatus.dwCheckPoint = pending ? (previous == state ? currentStatus.dwCheckPoint + 1 : 1) : 0;
+    SetServiceStatus(statusHandle, &currentStatus);
+    if (state == SERVICE_STOPPED) terminal = true;
+    ReleaseSRWLockExclusive(&statusLock);
 }
 
-void SvcCheckpoint(void) { SetState(SERVICE_START_PENDING, 0, 60000); }
-void SvcRunning(void)    { SetState(SERVICE_RUNNING, 0, 0); }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * §2  ServiceMain + control handler
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static DWORD WINAPI SvcHandlerEx(DWORD control, DWORD event,
-                                 LPVOID data, LPVOID context)
+DWORD WINAPI Control(DWORD control, DWORD, void *, void *context)
 {
-    struct warp_session *s = (struct warp_session *)context;
-
-    UNREFERENCED_PARAMETER(event);
-    UNREFERENCED_PARAMETER(data);
-
     switch (control) {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
-        LogInfo("Service stop requested");
-        SetState(SERVICE_STOP_PENDING, 0, 30000);
-        s->shutdown_requested = true;   /* same flag the Ctrl handler uses */
+    case SERVICE_CONTROL_PRESHUTDOWN:
+        // No logging, I/O, joins or teardown on the SCM control-handler thread.
+        RequestStop((warp_session *)context);
+        SetState(SERVICE_STOP_PENDING);
         return NO_ERROR;
-    default:
+    case SERVICE_CONTROL_INTERROGATE:
+        AcquireSRWLockShared(&statusLock);
+        if (statusHandle && !terminal) SetServiceStatus(statusHandle, &currentStatus);
+        ReleaseSRWLockShared(&statusLock);
         return NO_ERROR;
+    default: return ERROR_CALL_NOT_IMPLEMENTED;
     }
 }
 
-static VOID WINAPI UsbWarpServiceMain(DWORD argc, WCHAR **argv)
+void WINAPI ServiceMain(DWORD argc, WCHAR **argv)
 {
-    struct warp_session *s = &g_sess;
-    DWORD exitCode;
-
-    g_statusHandle = RegisterServiceCtrlHandlerExW(
-        USBWARP_SERVICE_NAME, SvcHandlerEx, s);
-    if (!g_statusHandle)
-        return;
-
-    /* Init chain: HcsWait alone can block 15s, VM-wait retries in 10s
-     * steps — a generous hint with checkpoints from ServiceRun. */
-    SetState(SERVICE_START_PENDING, 0, 60000);
-
-    LogInit(s, true);
-
-    exitCode = ServiceRun(s, true, (int)argc, argv);
-
-    /* Nothing may touch the log sink after this point. */
-    SetState(SERVICE_STOPPED, exitCode, 0);
+    statusHandle = RegisterServiceCtrlHandlerExW(USBWARP_SERVICE_NAME, Control, &g_sess);
+    if (!statusHandle) { serviceExit = GetLastError(); return; }
+    SetState(SERVICE_START_PENDING);
+    if (!LogInit(true)) {
+        serviceExit = ERROR_WRITE_FAULT;
+    } else {
+        SvcCheckpoint();
+        serviceExit = ServiceRun(&g_sess, true, (int)argc, argv);
+        if (serviceExit) LogError("Service exited with error %lu", serviceExit);
+        else LogInfo("Service stopped after all workers and sessions drained");
+        if (!g_sess.hdv_host) LogCleanup();
+    }
+    SetState(SERVICE_STOPPED, serviceExit);
 }
 
-int RunServiceDispatcher(void)
+DWORD WaitStopped(SC_HANDLE service)
 {
-    SERVICE_TABLE_ENTRYW table[] = {
-        { (LPWSTR)USBWARP_SERVICE_NAME, UsbWarpServiceMain },
-        { NULL, NULL }
-    };
-
-    if (StartServiceCtrlDispatcherW(table))
-        return 0;
-    if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
-        return -1;              /* not launched by the SCM */
-    return (int)GetLastError();
+    ULONGLONG end = GetTickCount64() + 120000;
+    bool requested = false;
+    for (;;) {
+        SERVICE_STATUS_PROCESS state{};
+        DWORD bytes;
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (BYTE *)&state, sizeof(state), &bytes))
+            return GetLastError();
+        if (state.dwCurrentState == SERVICE_STOPPED) return ERROR_SUCCESS;
+        if (!requested && state.dwCurrentState != SERVICE_START_PENDING && state.dwCurrentState != SERVICE_STOP_PENDING) {
+            SERVICE_STATUS ignored;
+            if (!ControlService(service, SERVICE_CONTROL_STOP, &ignored)) {
+                DWORD error = GetLastError();
+                if (error != ERROR_SERVICE_NOT_ACTIVE && error != ERROR_SERVICE_CANNOT_ACCEPT_CTRL) return error;
+            } else requested = true;
+        }
+        if (GetTickCount64() >= end) return ERROR_SERVICE_REQUEST_TIMEOUT;
+        Sleep(250);
+    }
+}
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * §3  --install / --uninstall
- * ═══════════════════════════════════════════════════════════════════════════ */
+void SvcCheckpoint() { SetState(SERVICE_START_PENDING); }
+void SvcRunning() { SetState(SERVICE_RUNNING); }
+void SvcStopping() { SetState(SERVICE_STOP_PENDING); }
 
-static void WriteRegDword(HKEY key, const WCHAR *name, uint32_t value)
+int RunServiceDispatcher()
 {
-    RegSetValueExW(key, name, 0, REG_DWORD,
-                   (const BYTE *)&value, sizeof(value));
-}
-
-static BOOL WriteRegConfig(const struct warp_config *cfg)
-{
-    HKEY key;
-
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, USBWARP_SERVICE_REG_KEY,
-                        0, NULL, 0, KEY_WRITE, NULL, &key, NULL) !=
-        ERROR_SUCCESS)
-        return FALSE;
-
-    RegSetValueExW(key, L"VmId", 0, REG_SZ, (const BYTE *)cfg->vm_id,
-                   (DWORD)((wcslen(cfg->vm_id) + 1) * sizeof(WCHAR)));
-    WriteRegDword(key, L"ShmSizeMb", cfg->shm_size / (1024u * 1024u));
-    WriteRegDword(key, L"RingSizeKb", cfg->ring_data_size / 1024u);
-    WriteRegDword(key, L"BufferSizeKb", cfg->buffer_size / 1024u);
-    WriteRegDword(key, L"MaxDevices", cfg->max_devices);
-    WriteRegDword(key, L"EnableIso", cfg->enable_iso ? 1 : 0);
-
-    RegCloseKey(key);
-    return TRUE;
+    SERVICE_TABLE_ENTRYW table[] = {{(LPWSTR)USBWARP_SERVICE_NAME, ServiceMain}, {nullptr, nullptr}};
+    if (StartServiceCtrlDispatcherW(table)) return (int)serviceExit;
+    DWORD error = GetLastError();
+    return error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT ? -1 : (int)error;
 }
 
 int SvcInstall(int argc, WCHAR *argv[])
 {
-    struct warp_config cfg;
-    WCHAR path[MAX_PATH];
-    SC_HANDLE scm, svc;
-
-    warp_config_defaults(&cfg);
-    if (!ParseArgOverrides(argc, argv, &cfg) || cfg.vm_id[0] == L'\0') {
-        fprintf(stderr, "--install requires --id <VM-GUID> [options]\n");
-        return 1;
+    warp_config config;
+    DWORD error = LoadConfig(argc, argv, &config, true);
+    if (error) { fprintf(stderr, "Invalid install configuration (%lu)\n", error); PrintUsage(); return (int)error; }
+    std::vector<WCHAR> path(32768);
+    DWORD n = GetModuleFileNameW(nullptr, path.data(), (DWORD)path.size());
+    if (!n || n >= path.size()) return ERROR_FILENAME_EXCED_RANGE;
+    std::wstring command = L"\"" + std::wstring(path.data(), n) + L"\"";
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (!manager) return (int)GetLastError();
+    for (const WCHAR *dep = USBWARP_SERVICE_DEPENDENCIES; *dep; dep += wcslen(dep) + 1) {
+        SC_HANDLE dependency = OpenServiceW(manager, dep, SERVICE_QUERY_STATUS);
+        if (!dependency) {
+            error = GetLastError();
+            fprintf(stderr, "Required driver service %ls is not installed/accessible (%lu)\n", dep, error);
+            CloseServiceHandle(manager); return (int)error;
+        }
+        CloseServiceHandle(dependency);
     }
-
-    if (!WriteRegConfig(&cfg)) {
-        fprintf(stderr, "Failed to write HKLM\\%ls (%lu)\n",
-                USBWARP_SERVICE_REG_KEY, GetLastError());
-        return 1;
+    bool created = false;
+    SC_HANDLE service = OpenServiceW(manager, USBWARP_SERVICE_NAME,
+        SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | DELETE);
+    if (!service) {
+        error = GetLastError();
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
+            service = CreateServiceW(manager, USBWARP_SERVICE_NAME, USBWARP_SERVICE_NAME,
+                SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | DELETE,
+                SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                command.c_str(), nullptr, nullptr, USBWARP_SERVICE_DEPENDENCIES, nullptr, nullptr);
+            created = service != nullptr;
+            error = service ? ERROR_SUCCESS : GetLastError();
+        }
+    } else {
+        error = ChangeServiceConfigW(service, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+            command.c_str(), nullptr, nullptr, USBWARP_SERVICE_DEPENDENCIES, nullptr, nullptr, nullptr) ?
+            ERROR_SUCCESS : GetLastError();
     }
-
-    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) {
-        fprintf(stderr, "GetModuleFileName failed (%lu)\n", GetLastError());
-        return 1;
+    if (service && !error) {
+        SERVICE_DESCRIPTIONW description{(LPWSTR)USBWARP_SERVICE_DESCR};
+        SC_ACTION actions[] = {{SC_ACTION_RESTART,5000}, {SC_ACTION_RESTART,15000},
+                               {SC_ACTION_RESTART,60000}, {SC_ACTION_NONE,0}};
+        SERVICE_FAILURE_ACTIONSW recovery{};
+        recovery.dwResetPeriod = 86400;
+        recovery.cActions = _countof(actions); recovery.lpsaActions = actions;
+        SERVICE_FAILURE_ACTIONS_FLAG failures{TRUE};
+        SERVICE_PRESHUTDOWN_INFO shutdown{180000};
+        if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description) ||
+            !ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &recovery) ||
+            !ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failures) ||
+            !ChangeServiceConfig2W(service, SERVICE_CONFIG_PRESHUTDOWN_INFO, &shutdown))
+            error = GetLastError();
+        if (!error) error = SaveRegistryConfig(&config);
     }
-
-    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
-    if (!scm) {
-        fprintf(stderr, "OpenSCManager failed (%lu) — run as administrator\n",
-                GetLastError());
-        return 1;
-    }
-
-    svc = CreateServiceW(
-        scm, USBWARP_SERVICE_NAME, USBWARP_SERVICE_NAME,
-        SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
-        SERVICE_ERROR_NORMAL, path, NULL, NULL, NULL, NULL, NULL);
-
-    if (!svc) {
-        DWORD err = GetLastError();
-        if (err == ERROR_SERVICE_EXISTS)
-            fprintf(stderr, "Service already installed (config updated).\n");
-        else
-            fprintf(stderr, "CreateService failed (%lu)\n", err);
-        CloseServiceHandle(scm);
-        return (err == ERROR_SERVICE_EXISTS) ? 0 : 1;
-    }
-
-    {
-        SERVICE_DESCRIPTIONW descr = { (LPWSTR)USBWARP_SERVICE_DESCR };
-        ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &descr);
-    }
-    {
-        /* Restart on crash (process death without clean SERVICE_STOPPED).
-         * Clean stops and config errors do NOT restart. */
-        SC_ACTION actions[1] = { { SC_ACTION_RESTART, 5000 } };
-        SERVICE_FAILURE_ACTIONSW fa;
-        memset(&fa, 0, sizeof(fa));
-        fa.cActions    = 1;
-        fa.lpsaActions = actions;
-        ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
-    }
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    printf("UsbWarpService installed (auto-start, VM=%ls).\n", cfg.vm_id);
-    printf("Start with: sc start UsbWarpService\n");
-    return 0;
+    if (error && created) DeleteService(service); // never leave a new half-configured service
+    if (service) CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    if (error) fprintf(stderr, "Service installation/update failed (%lu)\n", error);
+    else printf("%ls %s. Start/restart it to apply VM=%ls.\n", USBWARP_SERVICE_NAME,
+                created ? "installed" : "updated", config.vm_id);
+    return (int)error;
 }
 
-int SvcUninstall(void)
+int SvcUninstall()
 {
-    SC_HANDLE scm, svc;
-    SERVICE_STATUS st;
-    int i;
-
-    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (!scm) {
-        fprintf(stderr, "OpenSCManager failed (%lu) — run as administrator\n",
-                GetLastError());
-        return 1;
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) return (int)GetLastError();
+    SC_HANDLE service = OpenServiceW(manager, USBWARP_SERVICE_NAME, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+    DWORD error = service ? WaitStopped(service) : GetLastError();
+    if (!error || error == ERROR_SERVICE_DOES_NOT_EXIST) {
+        bool pending=false;
+        DWORD check=DeviceCapturePending(&pending);
+        if (check || pending) error=check ? check : ERROR_BUSY;
     }
-
-    svc = OpenServiceW(scm, USBWARP_SERVICE_NAME,
-                       DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
-    if (!svc) {
-        fprintf(stderr, "Service not installed.\n");
-        CloseServiceHandle(scm);
-        return 0;
-    }
-
-    if (ControlService(svc, SERVICE_CONTROL_STOP, &st)) {
-        for (i = 0; i < 30; i++) {
-            if (!QueryServiceStatus(svc, &st)) break;
-            if (st.dwCurrentState == SERVICE_STOPPED) break;
-            Sleep(1000);
-        }
-    }
-
-    if (!DeleteService(svc)) {
-        fprintf(stderr, "DeleteService failed (%lu)\n", GetLastError());
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-        return 1;
-    }
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    /* Remove only the key we own.  Note: the service entry is removed
-     * once the last handle to it closes. */
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, USBWARP_SERVICE_REG_KEY);
-
-    printf("UsbWarpService uninstalled.\n");
-    return 0;
+    if (service && !error && !DeleteService(service)) error = GetLastError();
+    if (service) CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    if (error == ERROR_SERVICE_DOES_NOT_EXIST) error = ERROR_SUCCESS;
+    if (!error) error = RemoveRegistryConfig();
+    if (error) fprintf(stderr, "Service removal failed (%lu); configuration retained if stop failed.\n", error);
+    else printf("%ls uninstalled.\n", USBWARP_SERVICE_NAME);
+    return (int)error;
 }

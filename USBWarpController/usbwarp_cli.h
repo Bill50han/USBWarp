@@ -19,7 +19,8 @@
 
 #include "../include/usbwarp_shared.h"
 #include "../include/usbwarp_pipe.h"
-#include "../USBWarpService/warp_service.h"
+#include <combaseapi.h>
+#pragma comment(lib, "ole32.lib")
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  USB device enumeration (host-side, SetupDi)
@@ -82,8 +83,15 @@ static inline const char *SessionStateName(uint32_t state)
 {
     switch (state) {
     case 0: return "INITIALIZING";
-    case 1: return "HDV_STARTED";
+    case 1: return "CONNECTING";
     case 2: return "RUNNING";
+    case 3: return "STOPPING";
+    case 4: return "STOPPED";
+    case 5: return "ERROR";
+    case 6: return "WAITING_FOR_DRIVER";
+    case 7: return "WAITING_FOR_VM";
+    case 8: return "WAITING_FOR_GUEST";
+    case 9: return "RETRYING";
     default: return "UNKNOWN";
     }
 }
@@ -93,15 +101,17 @@ static inline bool GuidsEqual(const GUID *a, const uint8_t b[16])
     return memcmp(a, b, 16) == 0;
 }
 
-/* lsusb-style speed letter for display ('?' = not queried). */
-static inline char SpeedLetter(uint8_t speed)
+static inline const char *SpeedName(uint8_t speed)
 {
     switch (speed) {
-    case USBWARP_SPEED_LOW:   return '1';   /* 1.5 Mbit/s   */
-    case USBWARP_SPEED_FULL:  return 'f';   /* 12 Mbit/s    */
-    case USBWARP_SPEED_HIGH:  return 'h';   /* 480 Mbit/s   */
-    case USBWARP_SPEED_SUPER: return 's';   /* 5 Gbit/s     */
-    default:                  return '?';
+    case USBWARP_SPEED_LOW: return "1.5M";
+    case USBWARP_SPEED_FULL: return "12M";
+    case USBWARP_SPEED_HIGH: return "480M";
+    case USBWARP_SPEED_SUPER: return "5G";
+    case USBWARP_SPEED_SUPER_PLUS: return "10G (2x1)";
+    case USBWARP_SPEED_SUPER_PLUS_2X: return "20G (2x2)";
+    case USBWARP_SPEED_SUPER_GEN1_2X: return "10G (1x2)";
+    default: return "unknown";
     }
 }
 

@@ -50,6 +50,23 @@ DEFINE_GUID(GUID_USBWARP_CONTROL_INTERFACE,
 
 #define USBWARP_DEVICE_TYPE  FILE_DEVICE_UNKNOWN
 
+#define IOCTL_USBWARP_CONFIGURE_IRQ \
+    CTL_CODE(USBWARP_DEVICE_TYPE, 0x808, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define USBWARP_DRIVER_CAP_H2G_IRQ 0x00000002u
+#define USBWARP_IRQ_CONFIG_ENABLED 1u
+#define USBWARP_IRQ_CONFIG_MASKED  2u
+/* Session-owner only. PCI configuration, never an arbitrary hypercall API. */
+typedef struct _USBWARP_CONFIGURE_IRQ_IN {
+    uint32_t Version;
+    uint32_t Flags;
+    uint8_t InstanceId[16];
+    uint64_t Nonce;
+    uint64_t Revision;
+    uint64_t MsiAddress;
+    uint32_t MsiData;
+    uint32_t Reserved;
+} USBWARP_CONFIGURE_IRQ_IN, *PUSBWARP_CONFIGURE_IRQ_IN;
+
 #define IOCTL_USBWARP_REGISTER_SERVICE \
     CTL_CODE(USBWARP_DEVICE_TYPE, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
@@ -102,8 +119,11 @@ typedef struct _USBWARP_REGISTER_SERVICE_OUT {
     uint32_t Version;
     uint32_t DriverVersion;              /* USBWARP_MAKE_VERSION              */
     uint32_t MaxDevices;
-    uint32_t Reserved[4];
+    uint32_t Capabilities;
+    uint32_t Reserved[3];
 } USBWARP_REGISTER_SERVICE_OUT, * PUSBWARP_REGISTER_SERVICE_OUT;
+
+#define USBWARP_DRIVER_CAP_G2H_DOORBELL 0x00000001u
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §5  IOCTL_USBWARP_SETUP_SHM
@@ -117,10 +137,11 @@ typedef struct _USBWARP_SETUP_SHM_IN {
     uint32_t Version;
     uint64_t SectionHandle;              /* user-mode HANDLE, cast to uint64  */
     uint64_t ExpectedSize;               /* must match section size           */
-    uint32_t RingSizePerDirection;       /* bytes, power of 2, incl. header   */
+    uint32_t RingSizePerDirection;       /* payload bytes, power of 2         */
     uint32_t BufferSize;                 /* per-slot, power of 2              */
     uint32_t Flags;                      /* reserved, 0                       */
-    uint32_t Reserved[2];
+    uint32_t MaxDevices;                 /* 0 = legacy default, otherwise 1..32 */
+    uint64_t DoorbellEventHandle;        /* optional event; uses old reserved/pad */
 } USBWARP_SETUP_SHM_IN, * PUSBWARP_SETUP_SHM_IN;
 
 typedef struct _USBWARP_SETUP_SHM_OUT {

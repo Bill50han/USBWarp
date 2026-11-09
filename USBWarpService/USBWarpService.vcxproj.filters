@@ -15,6 +15,21 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="config.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="device_capture.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_pnp.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="logging.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="session.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="hdv_session.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -39,6 +54,12 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="warp_service.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_pnp.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_pnp.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="..\include\usbwarp_ioctl.h">

@@ -1,0 +1,89 @@
+USBWarp v0.2.0-alpha - Windows x64 test package
+=============================================
+
+Use an elevated PowerShell on a test machine with test signing enabled. These
+are test signatures, not Microsoft/WHQL signatures. Use the public certificate
+only on the test machine; no private signing key is included.
+
+Before upgrading, stop UsbWarpService and allow it to restore every captured
+device. Resolve pending DeviceCapture/StorageCapture restoration records before
+replacing files. Stop the UsbWarp kernel service after the user-mode service.
+Do not remove unresolved recovery records. Retain the old binaries for rollback.
+
+1. Extract this package to a persistent directory, for example C:\USBWarp.
+   Run the following from that directory. Check SHA256SUMS.txt against the
+   downloaded release, and check the package's manifest.json for file hashes.
+
+2. Trust the supplied public test certificate on this test machine:
+
+   Import-Certificate -FilePath .\USBWarp-Test.cer -CertStoreLocation Cert:\LocalMachine\Root
+   Import-Certificate -FilePath .\USBWarp-Test.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+
+   If test signing is not enabled, enable it with bcdedit /set testsigning on
+   and reboot. Firmware Secure Boot policy can prevent this setting; choose
+   a suitable test VM. Do not change the boot configuration if already enabled.
+
+3. Stage the capture driver package:
+
+   .\install_capture.ps1 -ServiceDirectory C:\USBWarp -PackageDirectory .\capture
+
+   Reboot before proceeding if the script reports removal of the old global
+   class filter. The new package is assigned only when a device is explicitly
+   bound. Never add UsbWarpFilter to USB class UpperFilters.
+
+4. Install the core driver, or update an existing stopped installation:
+
+   sc.exe create UsbWarp type= kernel start= demand binPath= C:\USBWarp\USBWarp.sys
+   # If the service already exists, use sc.exe config instead of create.
+   sc.exe start UsbWarp
+
+5. Start your WSL distribution and obtain its current GUID with hcsdiag.exe list.
+   Install/update the service configuration (replace the GUID placeholder):
+
+   .\USBWarpService.exe --install --id <WSL-VM-GUID>
+
+   In services.msc, set UsbWarpService's Log On account to the WSL owner with
+   administrator/Hyper-V access and the Log on as a service right. The default
+   LocalSystem account could not initialize HDV for user-owned WSL in our tests.
+   Re-running --install preserves an existing service account. Then:
+
+   sc.exe start UsbWarpService
+
+6. Build the Linux module from the matching source archive in Ubuntu 22.04:
+
+   cd usbwarp_module
+   sudo ln -sf /path/to/prepared/WSL2-Linux-Kernel /lib/modules/$(uname -r)/build
+   KBUILD_MODPOST_WARN=1 make
+   sudo modprobe usbcore
+   sudo insmod usbwarp.ko
+
+   The optional prebuilt .ko only targets its named kernel/configuration; check
+   its build-info.txt, uname -r and modinfo before use. Do not force-load it.
+   Load the Linux class driver your device needs, such as usb-storage.
+   ISO is opt-in: use --iso when configuring the service and enable_iso=1
+   when inserting the Linux module. Leave the other parameters at their defaults.
+
+7. Close applications and flush/dismount filesystems using the target device.
+   Select the BUSID printed by list; never capture your system storage:
+
+   .\USBWarpController.exe list
+   .\USBWarpController.exe status
+   .\USBWarpController.exe bind <BUSID>
+
+   Flush/unmount in Linux before returning the device to Windows:
+
+   .\USBWarpController.exe unbind <BUSID>
+
+The service may be RUNNING while waiting for WSL or the module. Controller
+status shows the USB session separately. If WSL creates a different VM GUID,
+update --id and restart the service. New sessions require explicit binds.
+
+Removal: unbind devices, stop UsbWarpService, run USBWarpService.exe --uninstall,
+unload usbwarp in Linux and stop/delete the UsbWarp kernel service. Remove the
+capture package using its exact published oem*.inf name from pnputil /enum-drivers
+only after devices are restored. Remove this certificate from Root and
+TrustedPublisher by its manifest thumbprint when no installed test binaries
+need it. Never delete other certificates or driver packages by wildcard.
+
+Source/build details and test limitations are in the accompanying source ZIP,
+README.md and docs/release-0.2.0-alpha.txt. Keep matching PDBs for kernel debugging.

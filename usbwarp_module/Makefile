@@ -19,8 +19,13 @@ obj-m := usbwarp.o
 usbwarp-objs := usbwarp_pci.o  \
                 usbwarp_ring.o \
                 usbwarp_buf.o  \
+                usbwarp_copy.o \
+                usbwarp_queue.o \
+                usbwarp_hub.o \
                 usbwarp_hcd.o  \
                 usbwarp_poll.o \
+                usbwarp_irq.o \
+                usbwarp_rx.o \
                 usbwarp_debugfs.o
 
 # Extra include path for the shared protocol header.
@@ -29,9 +34,9 @@ ccflags-y := -I$(src)/../include -Wall
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 
 .PHONY: all clean

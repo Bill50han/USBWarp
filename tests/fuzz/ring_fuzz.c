@@ -46,7 +46,7 @@
 
 #define INJECT_PATH  "/sys/kernel/debug/usbwarp/inject_g2h"
 #define STATUS_PATH  "/sys/kernel/debug/usbwarp/ring_status"
-#define MAX_MSG_SIZE 4096
+#define MAX_MSG_SIZE USBWARP_MAX_MESSAGE_SIZE
 #define INTER_MSG_DELAY_US  1000   /* 1ms between injections */
 #define INTER_GROUP_DELAY_US 50000 /* 50ms between test groups */
 
@@ -55,6 +55,7 @@ static int  g_verbose = 0;
 static int  g_injected = 0;
 static int  g_failed = 0;
 static int  g_skipped = 0;
+static uint32_t g_epochs[USBWARP_MAX_DEVICES_LIMIT + 1];
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Injection helper
@@ -99,6 +100,7 @@ static void fill_hdr(struct usbwarp_msg_header *h, uint16_t type,
     h->message_length   = len;
     h->device_id        = dev_id;
     h->transaction_id   = txn_id;
+    h->flags = dev_id <= USBWARP_MAX_DEVICES_LIMIT ? g_epochs[dev_id] : 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -856,6 +858,19 @@ static void fuzz_combinations(void)
  * Main
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static void read_epochs(void)
+{
+    FILE *file = fopen(STATUS_PATH, "r");
+    char line[256];
+    unsigned id, epoch;
+    if (!file) return;
+    while (fgets(line, sizeof(line), file))
+        if (sscanf(line, "device_epoch %u %u", &id, &epoch) == 2 &&
+            id && id <= USBWARP_MAX_DEVICES_LIMIT)
+            g_epochs[id] = epoch;
+    fclose(file);
+}
+
 static void print_status(void)
 {
     int fd = open(STATUS_PATH, O_RDONLY);
@@ -886,6 +901,7 @@ int main(int argc, char **argv)
     printf("║  Pass:   Host is still alive after all vectors injected     ║\n");
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 
+    read_epochs();
     printf("Pre-test status:\n");
     print_status();
 

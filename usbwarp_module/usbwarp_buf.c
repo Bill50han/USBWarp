@@ -4,7 +4,14 @@
  *
  * Copyright (c) 2026 UsbWarp Project
  *
- * Zero-on-free: spec §04 §3.2 (cache hotness), spec §05 §6 (leak prevention).
+ * Only initialized OUT payload and completed IN bytes are transferred.
+ * Slots all belong to the same guest; clearing whole 64-KB slots on every
+ * small audio packet wastes MMIO bandwidth without isolating any principals.
+ *
+ * Multi-slot: a transfer larger than one slot gets a contiguous run.
+ * The host-side L5 bounds check validates buffer_offset+length against
+ * the whole data region, so a span crossing slot boundaries needs no
+ * wire-protocol change.
  */
 
 #include "usbwarp_guest.h"
@@ -32,43 +39,71 @@ void usbwarp_buf_cleanup(struct usbwarp_hcd *w)
 	w->buf_bitmap = NULL;
 }
 
-int usbwarp_buf_alloc(struct usbwarp_hcd *w)
+/* Allocate `count` contiguous free slots.  Returns the base index or
+ * -ENOMEM when no run is available (fragmentation is possible — class
+ * drivers retry with backoff). */
+int usbwarp_buf_alloc_contig(struct usbwarp_hcd *w, uint32_t count)
 {
-	unsigned long idx;
 	unsigned long flags;
+	unsigned long pos, found;
 
-	if (atomic_read(&w->buf_free_count) <= 0)
+	if (count == 0 || count > w->buffer_count)
+		return -EINVAL;
+
+	if ((uint32_t)atomic_read(&w->buf_free_count) < count)
 		return -ENOMEM;
 
 	spin_lock_irqsave(&w->buf_lock, flags);
 
-	idx = find_first_bit(w->buf_bitmap, w->buffer_count);
-	if (idx >= w->buffer_count) {
+	found = w->buffer_count;
+	pos = 0;
+	while (pos + count <= w->buffer_count) {
+		unsigned long bit =
+			find_next_bit(w->buf_bitmap, w->buffer_count, pos);
+
+		if (bit >= w->buffer_count || bit + count > w->buffer_count)
+			break;
+
+		/* First zero inside [bit, bit+count): the run breaks there. */
+		{
+			unsigned long zero =
+				find_next_zero_bit(w->buf_bitmap, bit + count, bit);
+
+			if (zero >= bit + count) {
+				found = bit;
+				break;
+			}
+			pos = zero + 1;
+		}
+	}
+
+	if (found >= w->buffer_count) {
 		spin_unlock_irqrestore(&w->buf_lock, flags);
 		return -ENOMEM;
 	}
 
-	clear_bit(idx, w->buf_bitmap);
-	atomic_dec(&w->buf_free_count);
+	bitmap_clear(w->buf_bitmap, found, count);
+	atomic_sub((int)count, &w->buf_free_count);
 
 	spin_unlock_irqrestore(&w->buf_lock, flags);
 
-	return (int)idx;
+	return (int)found;
 }
 
-void usbwarp_buf_free(struct usbwarp_hcd *w, int idx)
+void usbwarp_buf_free_range(struct usbwarp_hcd *w, int base, uint32_t count)
 {
-	if (idx < 0 || (uint32_t)idx >= w->buffer_count) {
+	unsigned long flags;
+
+	if (base < 0 || count == 0 ||
+	    (uint32_t)base + count > w->buffer_count) {
 		dev_warn(&w->pdev->dev,
-			 "usbwarp: buf_free: invalid index %d\n", idx);
+			 "usbwarp: buf_free_range: invalid base=%d count=%u\n",
+			 base, count);
 		return;
 	}
 
-	if (!READ_ONCE(w->shutting_down)) {
-		memset_io(usbwarp_buf_addr(w, idx), 0, w->buffer_size);
-		smp_wmb();
-	}
-
-	set_bit((unsigned long)idx, w->buf_bitmap);
-	atomic_inc(&w->buf_free_count);
+	spin_lock_irqsave(&w->buf_lock, flags);
+	bitmap_set(w->buf_bitmap, base, count);
+	atomic_add((int)count, &w->buf_free_count);
+	spin_unlock_irqrestore(&w->buf_lock, flags);
 }

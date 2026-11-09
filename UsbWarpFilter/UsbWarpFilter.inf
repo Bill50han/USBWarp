@@ -1,29 +1,61 @@
-;
-; UsbWarpFilter.inf
-;
-
+; Dedicated capture function driver, selected explicitly on one DEVINST.
 [Version]
 Signature="$WINDOWS NT$"
-Class=System
-ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
-Provider=%ManufacturerName%
-DriverVer=
+Class=USBDevice
+ClassGuid={88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider=%Provider%
+DriverVer=11/07/2026,2.0.0.0
 CatalogFile=UsbWarpFilter.cat
 PnpLockdown=1
 
+[Manufacturer]
+%Provider%=Models,NT$ARCH$.10.0...19041
+
+[Models.NT$ARCH$.10.0...19041]
+%Capture.DeviceDesc%=Capture,USBWarp\Capture
+
+[ControlFlags]
+ExcludeFromSelect=*
+
 [DestinationDirs]
-DefaultDestDir = 13
+Capture.Copy=13
 
 [SourceDisksNames]
-1 = %DiskName%,,,""
+1=%DiskName%,,,
 
 [SourceDisksFiles]
+UsbWarpFilter.sys=1
 
-[Manufacturer]
-%ManufacturerName%=Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+[Capture.NT]
+CopyFiles=Capture.Copy
 
-[Standard.NT$ARCH$.10.0...16299]
+[Capture.Copy]
+UsbWarpFilter.sys
+
+[Capture.NT.HW]
+AddReg=Capture.Security
+
+[Capture.Security]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Capture.NT.Services]
+AddService=UsbWarpFilter,0x00000002,Capture.Service
+
+[Capture.Service]
+DisplayName=%Capture.ServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\UsbWarpFilter.sys
+
+[Capture.NT.Wdf]
+KmdfService=UsbWarpFilter,Capture.Wdf
+
+[Capture.Wdf]
+KmdfLibraryVersion=$KMDFVERSION$
 
 [Strings]
-ManufacturerName="<Your manufacturer name>" ;TODO: Replace with your manufacturer name
-DiskName="UsbWarpFilter Source Disk"
+Provider="USBWarp"
+DiskName="USBWarp capture driver"
+Capture.DeviceDesc="USBWarp captured USB device"
+Capture.ServiceDesc="USBWarp target USB capture"
