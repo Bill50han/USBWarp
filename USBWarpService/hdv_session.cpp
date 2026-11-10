@@ -40,6 +40,7 @@ BOOL HdvLoadApis(struct usbwarp_hdv_api *api)
 
     HMODULE cc = api->hComputeCore;
     LOAD_OR_FAIL(cc, "HcsOpenComputeSystem",       T_HcsOpenComputeSystem,       HcsOpen);
+    LOAD_OR_FAIL(cc, "HcsEnumerateComputeSystems", T_HcsEnumerateComputeSystems, HcsEnumerate);
     LOAD_OR_FAIL(cc, "HcsCreateOperation",         T_HcsCreateOperation,         HcsCreateOp);
     LOAD_OR_FAIL(cc, "HcsModifyComputeSystem",     T_HcsModifyComputeSystem,     HcsModify);
     LOAD_OR_FAIL(cc, "HcsWaitForOperationResult",  T_HcsWaitForOperationResult,  HcsWait);
@@ -470,7 +471,7 @@ BOOL HdvSessionOpen(warp_session *s)
     s->memSpaceEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!s->memSpaceEvent) return FALSE;
     const char *operation = "HcsOpenComputeSystem";
-    HRESULT hr = s->api.HcsOpen(s->cfg.vm_id, GENERIC_ALL, &s->hcs_system);
+    HRESULT hr = s->api.HcsOpen(s->openingVmId, GENERIC_ALL, &s->hcs_system);
     if (SUCCEEDED(hr) && StopRequested(s)) hr = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
     if (SUCCEEDED(hr)) {
         operation = "CoCreateGuid(device instance)";
@@ -517,12 +518,12 @@ BOOL HdvSessionOpen(warp_session *s)
         DWORD error = ErrorCode(hr);
         // Once mapped, let SessionWorker drain the kernel/guest before unmap.
         if (!s->mmio_mapped) HdvSessionClose(s);
-        if (!StopRequested(s)) LogWarn("%s failed for VM %ls: 0x%08lX", operation, s->cfg.vm_id, (unsigned long)hr);
+        if (!StopRequested(s)) LogWarn("%s failed for VM %ls: 0x%08lX", operation, s->openingVmId, (unsigned long)hr);
         SetLastError(error);
         return FALSE;
     }
     WCHAR instance[80]; GuidBare(&s->instance_id, instance, _countof(instance));
-    LogInfo("HDV session attached to VM %ls (instance %ls)", s->cfg.vm_id, instance);
+    LogInfo("HDV session attached to VM %ls (instance %ls)", s->openingVmId, instance);
     return TRUE;
 }
 

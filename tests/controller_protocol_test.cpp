@@ -58,6 +58,7 @@ bool ParseGuid(const char *, GUID *) { return false; }
 void FormatGuid(const GUID *, char *, int) {}
 void FormatBytes(uint64_t, char *, int) {}
 void FormatDuration(uint64_t, char *, int) {}
+int CmdVm(void) { return 1; }
 
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while(0)
 static void response(uint32_t bytes, int32_t status=0)

@@ -163,8 +163,9 @@ int SvcInstall(int argc, WCHAR *argv[])
     if (service) CloseServiceHandle(service);
     CloseServiceHandle(manager);
     if (error) fprintf(stderr, "Service installation/update failed (%lu)\n", error);
-    else printf("%ls %s. Start/restart it to apply VM=%ls.\n", USBWARP_SERVICE_NAME,
-                created ? "installed" : "updated", config.vm_id);
+    else printf("%ls %s. Start/restart it to apply configuration.\n"
+                "Use USBWarpController vm list/use/status to select the target.\n", USBWARP_SERVICE_NAME,
+                created ? "installed" : "updated");
     return (int)error;
 }
 

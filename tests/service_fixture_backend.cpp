@@ -29,9 +29,24 @@ BOOL HdvLoadApis(usbwarp_hdv_api *)
 { controlThread = CreateThread(nullptr,0,FixtureControl,nullptr,0,nullptr); return controlThread != nullptr; }
 void HdvUnloadApis(usbwarp_hdv_api *)
 { if (controlThread) { WaitForSingleObject(controlThread,INFINITE); CloseHandle(controlThread); controlThread=nullptr; } }
+static const WCHAR *FixtureVmId()
+{ return marker(L"vm_new_id") ? L"22222222-2222-2222-2222-222222222222" : L"11111111-1111-1111-1111-111111111111"; }
+DWORD EnumerateVms(warp_session *, std::vector<warp_vm> &vms)
+{
+    vms.clear();
+    if (marker(L"discovery_error")) return ERROR_ACCESS_DENIED;
+    if (marker(L"vm_up")) {
+        warp_vm vm{};
+        wcscpy_s(vm.id,FixtureVmId()); wcscpy_s(vm.name,L"Fixture Linux");
+        wcscpy_s(vm.owner,L"WSL"); wcscpy_s(vm.state,L"Running");
+        vms.push_back(vm);
+        if (marker(L"vm_ambiguous")) {wcscpy_s(vm.id,L"33333333-3333-3333-3333-333333333333");vms.push_back(vm);}
+    }
+    return ERROR_SUCCESS;
+}
 BOOL HdvSessionOpen(warp_session *s)
 {
-    if (!marker(L"vm_up")) { SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+    if (!marker(L"vm_up") || wcscmp(s->openingVmId,FixtureVmId())) { SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
     s->memSpaceEvent = CreateEventW(nullptr,TRUE,TRUE,nullptr);
     if (!s->memSpaceEvent) return FALSE;
     s->hdv_host = (HDV_HOST)(ULONG_PTR)1;
@@ -46,7 +61,10 @@ BOOL HdvSessionClose(warp_session *s)
     if (s->memSpaceEvent) { CloseHandle(s->memSpaceEvent); s->memSpaceEvent = nullptr; }
     return TRUE;
 }
-BOOL ShmCreate(warp_session *s) { s->section = (HANDLE)(ULONG_PTR)2; return TRUE; }
+BOOL ShmCreate(warp_session *s) {
+    if(marker(L"forbid_shm")){SetLastError(ERROR_INVALID_STATE);return FALSE;}
+    s->section = (HANDLE)(ULONG_PTR)2;return TRUE;
+}
 void ShmDestroy(warp_session *s) { assert(!s->hDriver && !s->hdv_host); s->section = nullptr; }
 
 BOOL DrvClientOpen(warp_session *s)
@@ -84,7 +102,7 @@ BOOL DrvClientActive(warp_session *s)
 BOOL DrvClientHeartbeat(warp_session *s)
 {
     if (marker(L"driver_down")) { SetLastError(ERROR_DEVICE_NOT_CONNECTED); return FALSE; }
-    if (s->mmio_mapped && !marker(L"vm_up")) { s->hdv_torn_down = true; SetEvent(s->memSpaceEvent); }
+    if (s->mmio_mapped && (!marker(L"vm_up") || wcscmp(s->openingVmId,FixtureVmId()))) { s->hdv_torn_down = true; SetEvent(s->memSpaceEvent); }
     s->driverState.store(s->mmio_mapped ? USBWARP_STATE_RUNNING : USBWARP_STATE_READY);
     return TRUE;
 }
@@ -127,9 +145,24 @@ BOOL DrvClientUnbindGuid(warp_session *s, const uint8_t[16])
 }
 BOOL DeviceBind(warp_session *s,const uint8_t guid[16],const WCHAR *path,uint8_t speed,
                 uint32_t *index,uint16_t *vid,uint16_t *pid)
-{ return DrvClientBindGuid(s,guid,path,speed,index,vid,pid); }
-BOOL DeviceUnbind(warp_session *s,const uint8_t guid[16]) { return DrvClientUnbindGuid(s,guid); }
+{
+    AcquireSRWLockExclusive(&s->captureLock);
+    BOOL result;
+    if (!VmCanBind(s)) {SetLastError(ERROR_NOT_READY);result=FALSE;}
+    else result=DrvClientBindGuid(s,guid,path,speed,index,vid,pid);
+    ReleaseSRWLockExclusive(&s->captureLock);
+    return result;
+}
+BOOL DeviceUnbind(warp_session *s,const uint8_t guid[16]) {
+    AcquireSRWLockExclusive(&s->captureLock);
+    BOOL result=DrvClientUnbindGuid(s,guid);
+    ReleaseSRWLockExclusive(&s->captureLock);return result;
+}
 BOOL DeviceRecover(warp_session *) { return TRUE; }
-DWORD DeviceCloseSession(warp_session *s) { return DrvClientClose(s); }
+DWORD DeviceCloseSession(warp_session *s) {
+    AcquireSRWLockExclusive(&s->captureLock);
+    DWORD result=DrvClientClose(s);
+    ReleaseSRWLockExclusive(&s->captureLock);return result;
+}
 void DeviceReconcile(warp_session *) {}
 DWORD DeviceCapturePending(bool *pending) { *pending=false; return ERROR_SUCCESS; }

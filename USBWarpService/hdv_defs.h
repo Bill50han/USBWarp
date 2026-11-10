@@ -121,6 +121,7 @@ typedef struct {
 /* --- HCS (computecore.dll) ----------------------------------------------- */
 typedef HRESULT (WINAPI *T_HcsOpenComputeSystem)(
     const WCHAR *id, DWORD requestedAccess, HCS_SYSTEM *system);
+typedef HRESULT (WINAPI *T_HcsEnumerateComputeSystems)(const WCHAR *query, HCS_OPERATION operation);
 
 typedef HCS_OPERATION (WINAPI *T_HcsCreateOperation)(
     void *context, void *callback);
@@ -167,6 +168,7 @@ typedef HRESULT (WINAPI *T_HdvUnregisterDoorbell)(HDV_DEVICE device, HDV_PCI_BAR
 struct usbwarp_hdv_api {
     /* HCS */
     T_HcsOpenComputeSystem              HcsOpen;
+    T_HcsEnumerateComputeSystems        HcsEnumerate;
     T_HcsCreateOperation                HcsCreateOp;
     T_HcsModifyComputeSystem            HcsModify;
     T_HcsWaitForOperationResult         HcsWait;

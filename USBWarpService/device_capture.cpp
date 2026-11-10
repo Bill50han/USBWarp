@@ -192,6 +192,7 @@ BOOL DeviceBind(warp_session *s,const uint8_t guid[16],const WCHAR *path,uint8_t
                 uint32_t *index,uint16_t *vid,uint16_t *pid)
 {
     Lock lock(&s->captureLock);
+    if (!VmCanBind(s)) { SetLastError(ERROR_NOT_READY); return FALSE; }
     USBWARP_ENUM_DEVICES_OUT active{};
     if(!DrvClientEnumDevices(s,&active)) return FALSE;
     if(Listed(active,guid)) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }

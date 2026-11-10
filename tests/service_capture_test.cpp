@@ -60,6 +60,7 @@ static VOID WINAPI NoSleep(DWORD) {}
 #define GetTickCount64 Tick
 #define Sleep NoSleep
 #include "../USBWarpService/device_capture.cpp"
+bool VmCanBind(warp_session *) { return true; } // target admission is tested separately
 #undef RegOpenKeyExW
 #undef RegCreateKeyExW
 #undef RegCloseKey

@@ -20,6 +20,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="config.cpp" />
+    <ClCompile Include="target_value.cpp" />
+    <ClCompile Include="vm_target.cpp" />
+    <ClCompile Include="hcs_discovery.cpp" />
     <ClCompile Include="device_capture.cpp" />
     <ClCompile Include="capture_pnp.cpp" />
     <ClCompile Include="logging.cpp" />
@@ -38,6 +41,7 @@
     <ClInclude Include="hdv_defs.h" />
     <ClInclude Include="warp_service.h" />
     <ClInclude Include="capture_pnp.h" />
+    <ClInclude Include="vm_target.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
@@ -91,6 +95,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup>
+    <ClCompile><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

@@ -28,7 +28,9 @@ $setup = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 Push-Location $repoPath
 try {
     $commands = @(
-        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\service_config_test.cpp USBWarpService\config.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\config_test.exe',
+        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\service_config_test.cpp USBWarpService\config.cpp USBWarpService\target_value.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\config_test.exe',
+        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\vm_target_test.cpp USBWarpService\target_value.cpp USBWarpService\vm_target.cpp USBWarpService\hcs_discovery.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\vm_target_test.exe',
+        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\vm_controller_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\vm_controller_test.exe',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\service_driver_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\driver_test.exe',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\service_capture_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\capture_test.exe',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /DUNICODE /D_UNICODE /I. tests\capture_pnp_selection_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\capture_selection_test.exe',
@@ -41,7 +43,7 @@ try {
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\pipe_security_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\pipe_security_test.exe',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\pipe_timeout_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\pipe_timeout_test.exe /link advapi32.lib',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. tests\service_kernel_test.cpp USBWarpService\usbwarp_drv_client.cpp USBWarpService\shm_init.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\kernel_test.exe',
-        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. /FIx64\ReviewChecks\ServiceTests\fixture_config.h USBWarpService\main.cpp USBWarpService\config.cpp USBWarpService\logging.cpp USBWarpService\winsvc.cpp USBWarpService\session.cpp USBWarpService\pipe_server.cpp tests\service_fixture_backend.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\service_fixture.exe',
+        'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. /FIx64\ReviewChecks\ServiceTests\fixture_config.h USBWarpService\main.cpp USBWarpService\config.cpp USBWarpService\target_value.cpp USBWarpService\vm_target.cpp USBWarpService\logging.cpp USBWarpService\winsvc.cpp USBWarpService\session.cpp USBWarpService\pipe_server.cpp tests\service_fixture_backend.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\service_fixture.exe',
         'cl /nologo /EHsc /std:c++17 /utf-8 /W4 /I. /FIx64\ReviewChecks\ServiceTests\fixture_config.h tests\service_scm_test.cpp /Fox64\ReviewChecks\ServiceTests\ /Fex64\ReviewChecks\ServiceTests\scm_test.exe'
     )
     foreach ($command in $commands) {
@@ -51,6 +53,10 @@ try {
     if ($BuildOnly) { Write-Output "Built tests for target directory: $FixtureDirectory"; return }
     & (Join-Path $outputPath 'config_test.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Configuration regression failed' }
+    & (Join-Path $outputPath 'vm_target_test.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'VM discovery/selection regression failed' }
+    & (Join-Path $outputPath 'vm_controller_test.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'VM controller protocol regression failed' }
     & (Join-Path $outputPath 'driver_test.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Driver client regression failed' }
     & (Join-Path $outputPath 'capture_test.exe')

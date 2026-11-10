@@ -69,6 +69,7 @@ typedef struct _PIPE_CLIENT {
 
 int  PipeConnect(PIPE_CLIENT *pc);
 void PipeDisconnect(PIPE_CLIENT *pc);
+int CmdVm(void);
 int  PipeSendCommand(PIPE_CLIENT *pc,
                      uint32_t command,
                      const void *payload, uint32_t payloadLen,
@@ -92,6 +93,7 @@ static inline const char *SessionStateName(uint32_t state)
     case 7: return "WAITING_FOR_VM";
     case 8: return "WAITING_FOR_GUEST";
     case 9: return "RETRYING";
+    case 10: return "WAITING_FOR_TARGET";
     default: return "UNKNOWN";
     }
 }

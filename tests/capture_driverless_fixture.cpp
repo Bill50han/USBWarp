@@ -14,6 +14,7 @@ BOOL DrvClientEnumDevices(warp_session *,USBWARP_ENUM_DEVICES_OUT *) { SetLastEr
 BOOL DrvClientBindGuid(warp_session *,const uint8_t *,const WCHAR *,uint8_t,uint32_t *,uint16_t *,uint16_t *) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
 BOOL DrvClientUnbindGuid(warp_session *,const uint8_t *) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
 DWORD DrvClientClose(warp_session *) { return ERROR_NOT_SUPPORTED; }
+bool VmCanBind(warp_session *) { return false; } // this fixture never binds a device
 static DWORD Stopped()
 {
     SC_HANDLE manager=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);

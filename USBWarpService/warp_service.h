@@ -6,6 +6,7 @@
 #include "../include/usbwarp_pipe.h"
 #include "../include/usbwarp_ioctl.h"
 #include <atomic>
+#include "vm_target.h"
 
 #ifndef USBWARP_SERVICE_NAME
 #define USBWARP_SERVICE_NAME L"UsbWarpService"
@@ -22,7 +23,7 @@
 #define WARP_PIPE_CLIENTS 8
 
 struct warp_config {
-    WCHAR vm_id[256];
+    warp_target target;
     uint32_t shm_size, ring_data_size, buffer_size, max_devices;
     bool enable_iso, debug;
 };
@@ -73,7 +74,18 @@ struct warp_session {
     std::atomic<uint32_t> stage{USBWARP_SESSION_INITIALIZING};
     HANDLE stopEvent = nullptr, sessionStopEvent = nullptr, driverFaultEvent = nullptr;
     HANDLE sessionThread = nullptr, heartbeatThread = nullptr;
+    HANDLE targetChangedEvent = nullptr;
     bool serviceMode = false;
+
+    // Selection/cache are separate from immutable transport configuration.
+    SRWLOCK targetLock = SRWLOCK_INIT;
+    warp_target selectedTarget{};
+    uint64_t targetGeneration = 1, attachedGeneration = 0, vmListGeneration = 0;
+    std::vector<warp_vm> vms;
+    DWORD vmDiscoveryError = ERROR_NOT_READY, targetError = ERROR_NOT_READY;
+    uint32_t targetMatches = 0;
+    WCHAR resolvedVmId[256]{}, attachedVmId[256]{};
+    WCHAR openingVmId[256]{}; // SessionWorker exclusively owns this value
 
     SRWLOCK driverLock = SRWLOCK_INIT;
     uint8_t msixTable[16]{}; // protected by pciLock; initially masked
@@ -97,6 +109,7 @@ bool ParseArgOverrides(int argc, WCHAR *argv[], warp_config *cfg, bool install =
 DWORD ValidateConfig(warp_config *cfg);
 DWORD LoadConfig(int argc, WCHAR *argv[], warp_config *cfg, bool install = false);
 DWORD SaveRegistryConfig(const warp_config *cfg);
+DWORD DecodeRegistryConfig(const BYTE *data, DWORD bytes, warp_config *cfg);
 DWORD RemoveRegistryConfig();
 void PrintUsage();
 

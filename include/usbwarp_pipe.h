@@ -59,12 +59,15 @@ enum usbwarp_pipe_command {
     USBWARP_PIPE_CMD_QUERY_STATUS       = 2,
     USBWARP_PIPE_CMD_QUERY_DEVICE       = 3,
     USBWARP_PIPE_CMD_QUERY_STATS        = 4,
+    USBWARP_PIPE_CMD_LIST_VMS           = 5,
+    USBWARP_PIPE_CMD_QUERY_TARGET       = 6,
 
     /* ── Mutations (Controller → Service, Service replies) ────────────────── */
     USBWARP_PIPE_CMD_BIND_DEVICE        = 10,
     USBWARP_PIPE_CMD_UNBIND_DEVICE      = 11,
     USBWARP_PIPE_CMD_START_SESSION      = 12,
     USBWARP_PIPE_CMD_STOP_SESSION       = 13,
+    USBWARP_PIPE_CMD_SET_TARGET         = 14,
 
     /* ── Response (Service → Controller) ──────────────────────────────────── */
     USBWARP_PIPE_CMD_RESPONSE           = 100,
@@ -126,7 +129,58 @@ enum usbwarp_session_stage {
     USBWARP_SESSION_WAIT_VM = 7,
     USBWARP_SESSION_WAIT_GUEST = 8,
     USBWARP_SESSION_RETRYING = 9,
+    USBWARP_SESSION_WAIT_TARGET = 10,
 };
+
+/* VM selection is control-plane only. Existing messages retain their layout. */
+enum usbwarp_target_kind {
+    USBWARP_TARGET_NONE = 0,
+    USBWARP_TARGET_ID = 1,
+    USBWARP_TARGET_NAME = 2,
+    USBWARP_TARGET_WSL = 3,
+};
+#define USBWARP_VM_PAGE_SIZE 32u
+#define USBWARP_VM_VALUE_BYTES 1024u
+#define USBWARP_VM_OWNER_BYTES 256u
+
+/* Fixed UTF-8 fields must be terminated, valid UTF-8 and zero-padded. */
+struct usbwarp_pipe_target {
+    uint32_t kind;
+    uint32_t reserved;
+    char value[USBWARP_VM_VALUE_BYTES];
+    char owner[USBWARP_VM_OWNER_BYTES];
+};
+struct usbwarp_pipe_vm_entry {
+    char id[256];
+    char name[USBWARP_VM_VALUE_BYTES];
+    char owner[USBWARP_VM_OWNER_BYTES];
+    char state[32];
+};
+struct usbwarp_pipe_vm_list_request {
+    uint64_t generation; /* zero for the first page; prevents mixed snapshots */
+    uint32_t offset;
+    uint32_t reserved;
+};
+struct usbwarp_pipe_vm_list {
+    uint64_t generation;
+    uint32_t total_count;
+    uint32_t count;
+    uint32_t error; /* discovery error: entries are diagnostic, never used to attach */
+    uint32_t reserved;
+    /* usbwarp_pipe_vm_entry entries[count] */
+};
+struct usbwarp_pipe_target_status {
+    struct usbwarp_pipe_target selected;
+    char resolved_id[256];
+    char attached_id[256];
+    uint32_t matches;
+    uint32_t error;
+    uint32_t switching;
+    uint32_t reserved;
+};
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_target) == 1288, "target wire size");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_vm_entry) == 1568, "VM entry wire size");
+USBWARP_STATIC_ASSERT(sizeof(struct usbwarp_pipe_target_status) == 1816, "target status wire size");
 
 struct usbwarp_pipe_status {
     uint32_t session_state;

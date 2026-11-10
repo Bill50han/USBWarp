@@ -1,4 +1,4 @@
-USBWarp v0.2.0-alpha - Windows x64 test package
+USBWarp v0.2.1-alpha - Windows x64 test package
 =============================================
 
 Use an elevated PowerShell on a test machine with test signing enabled. These
@@ -9,6 +9,14 @@ Before upgrading, stop UsbWarpService and allow it to restore every captured
 device. Resolve pending DeviceCapture/StorageCapture restoration records before
 replacing files. Stop the UsbWarp kernel service after the user-mode service.
 Do not remove unresolved recovery records. Retain the old binaries for rollback.
+After restoring devices and before changing the saved target, back up the old
+service configuration, for example:
+
+  reg.exe export HKLM\SOFTWARE\UsbWarp\Service C:\USBWarp\Service-before-0.2.1.reg /y
+
+Saving a target upgrades Config to v2. A downgrade to v0.2.0-alpha requires the
+old binaries and compatible configuration backup; do not leave a v2 Config for
+the old service to read. Never restore a backup containing unresolved captures.
 
 1. Extract this package to a persistent directory, for example C:\USBWarp.
    Run the following from that directory. Check SHA256SUMS.txt against the
@@ -37,10 +45,9 @@ Do not remove unresolved recovery records. Retain the old binaries for rollback.
    # If the service already exists, use sc.exe config instead of create.
    sc.exe start UsbWarp
 
-5. Start your WSL distribution and obtain its current GUID with hcsdiag.exe list.
-   Install/update the service configuration (replace the GUID placeholder):
+5. Install/update the service independently of its target:
 
-   .\USBWarpService.exe --install --id <WSL-VM-GUID>
+   .\USBWarpService.exe --install
 
    In services.msc, set UsbWarpService's Log On account to the WSL owner with
    administrator/Hyper-V access and the Log on as a service right. The default
@@ -48,6 +55,20 @@ Do not remove unresolved recovery records. Retain the old binaries for rollback.
    Re-running --install preserves an existing service account. Then:
 
    sc.exe start UsbWarpService
+
+   Select and persist the target from the Controller:
+
+   .\USBWarpController.exe vm list
+   .\USBWarpController.exe vm use --wsl
+   .\USBWarpController.exe vm status
+
+   WSL may be stopped when selected; start it normally when needed. This
+   resolves the unique running HCS VM whose Owner is WSL, not a distribution
+   name or user-SID filter. Multiple matches are reported as ambiguous.
+   Other HCS-visible VMs can use vm use --name "Linux Dev" --owner VMMS.
+   An explicit vm use --id GUID retains fixed-ID behavior. vm clear leaves
+   the service running without a selected target. Unbind all devices and
+   finish pending restoration before switching or clearing the target.
 
 6. Build the Linux module from the matching source archive in Ubuntu 22.04:
 
@@ -74,9 +95,12 @@ Do not remove unresolved recovery records. Retain the old binaries for rollback.
 
    .\USBWarpController.exe unbind <BUSID>
 
-The service may be RUNNING while waiting for WSL or the module. Controller
-status shows the USB session separately. If WSL creates a different VM GUID,
-update --id and restart the service. New sessions require explicit binds.
+The service may be RUNNING while waiting for a target, WSL or the module.
+Controller status shows the USB session separately. WSL mode resolves the new
+ID automatically after WSL recreates its VM; the service does not need a restart.
+The Linux module must still be loaded, or installed for automatic loading, in
+the new guest. New sessions require explicit USB binds. Existing fixed-ID
+installations remain fixed-ID until you select vm use --wsl or a named target.
 
 Removal: unbind devices, stop UsbWarpService, run USBWarpService.exe --uninstall,
 unload usbwarp in Linux and stop/delete the UsbWarp kernel service. Remove the
@@ -86,4 +110,4 @@ TrustedPublisher by its manifest thumbprint when no installed test binaries
 need it. Never delete other certificates or driver packages by wildcard.
 
 Source/build details and test limitations are in the accompanying source ZIP,
-README.md and docs/release-0.2.0-alpha.txt. Keep matching PDBs for kernel debugging.
+README.md and docs/release-0.2.1-alpha.txt. Keep matching PDBs for kernel debugging.

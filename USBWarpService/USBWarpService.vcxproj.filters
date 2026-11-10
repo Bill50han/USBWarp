@@ -18,6 +18,9 @@
     <ClCompile Include="config.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="target_value.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="vm_target.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="hcs_discovery.cpp"><Filter>源文件</Filter></ClCompile>
     <ClCompile Include="device_capture.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -56,9 +59,7 @@
     <ClInclude Include="warp_service.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="capture_pnp.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
+    <ClInclude Include="vm_target.h"><Filter>头文件</Filter></ClInclude>
     <ClInclude Include="capture_pnp.h">
       <Filter>头文件</Filter>
     </ClInclude>

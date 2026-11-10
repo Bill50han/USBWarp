@@ -110,6 +110,24 @@ static void wait_stage(uint32_t wanted, DWORD timeout=15000)
     ULONGLONG end=GetTickCount64()+timeout;
     while (status().session_state!=wanted) { CHECK(GetTickCount64()<end); Sleep(100); }
 }
+static usbwarp_pipe_target_status target_status()
+{
+    auto reply=call(USBWARP_PIPE_CMD_QUERY_TARGET);
+    CHECK(!status_of(reply) && reply.size()==sizeof(usbwarp_pipe_header)+sizeof(usbwarp_pipe_response)+sizeof(usbwarp_pipe_target_status));
+    usbwarp_pipe_target_status target;
+    memcpy(&target,reply.data()+sizeof(usbwarp_pipe_header)+sizeof(usbwarp_pipe_response),sizeof(target));
+    return target;
+}
+static void select_wsl()
+{
+    usbwarp_pipe_target target{};target.kind=USBWARP_TARGET_WSL;
+    CHECK(status_of(call(USBWARP_PIPE_CMD_SET_TARGET,&target,sizeof(target)))==0);
+}
+static void wait_target(const char *id, DWORD error=ERROR_SUCCESS)
+{
+    ULONGLONG end=GetTickCount64()+20000;
+    for(;;) {auto target=target_status();if(!strcmp(target.attached_id,id) && target.error==error)return;CHECK(GetTickCount64()<end);Sleep(100);}
+}
 static std::vector<BYTE> bind_payload()
 {
     const char path[]="\\\\?\\USB#VID_1234&PID_ABCD#SELFTEST#{a5dcbf10-6530-11d2-901f-00c04fb951ed}";
@@ -159,10 +177,13 @@ static void stop_console(HANDLE process)
 }
 static void nonadmin_denied(const std::vector<BYTE> &binding)
 {
+    usbwarp_pipe_target target{};
     BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD size=sizeof(sid);
     CHECK(CreateWellKnownSid(WinBuiltinAdministratorsSid,nullptr,sid,&size));
     BOOL admin=FALSE; CHECK(CheckTokenMembership(nullptr,sid,&admin));
     if (!admin) {
+        CHECK(status_of(call(USBWARP_PIPE_CMD_SET_TARGET,&target,sizeof(target)))==-ERROR_ACCESS_DENIED);
+        CHECK(status_of(call(USBWARP_PIPE_CMD_QUERY_TARGET))==0);
         CHECK(status_of(call(USBWARP_PIPE_CMD_BIND_DEVICE,binding.data(),(uint32_t)binding.size()))==-ERROR_ACCESS_DENIED);
         CHECK(status_of(call(USBWARP_PIPE_CMD_QUERY_STATUS))==0);
         return;
@@ -174,6 +195,8 @@ static void nonadmin_denied(const std::vector<BYTE> &binding)
     CloseHandle(token);
     CHECK(ImpersonateLoggedOnUser(restricted));
     try {
+        CHECK(status_of(call(USBWARP_PIPE_CMD_SET_TARGET,&target,sizeof(target)))==-ERROR_ACCESS_DENIED);
+        CHECK(status_of(call(USBWARP_PIPE_CMD_QUERY_TARGET))==0);
         CHECK(status_of(call(USBWARP_PIPE_CMD_BIND_DEVICE,binding.data(),(uint32_t)binding.size()))==-ERROR_ACCESS_DENIED);
         CHECK(status_of(call(USBWARP_PIPE_CMD_QUERY_STATUS))==0);
     } catch (...) { RevertToSelf(); CloseHandle(restricted); throw; }
@@ -254,7 +277,8 @@ int main(int argc, char **argv)
         CHECK(CopyFileW((Root+L"\\service_fixture.exe").c_str(),executable.c_str(),FALSE));
         marker(L"vm_up",false); marker(L"driver_down",false); marker(L"device_gone",false);
         marker(L"stop_service",false); marker(L"backend_bound",false);
-        CHECK(run(executable,L"--install --id 11111111-1111-1111-1111-111111111111")==0);
+        marker(L"vm_new_id",false);marker(L"vm_ambiguous",false);marker(L"discovery_error",false);
+        CHECK(run(executable,L"--install")==0);
         installed=true;
         service=OpenServiceW(manager,Name,SERVICE_START|SERVICE_STOP|SERVICE_QUERY_STATUS|SERVICE_QUERY_CONFIG);
         CHECK(service);
@@ -266,9 +290,17 @@ int main(int argc, char **argv)
         CHECK(settings->lpBinaryPathName[0]==L'"' && wcsstr(settings->lpBinaryPathName,L"Install With Spaces"));
 
         ULONGLONG previousLogSize=log_size();
+        marker(L"forbid_shm",true);
         CHECK(StartServiceW(service,0,nullptr));
         auto first=wait_state(service,SERVICE_RUNNING);
-        wait_stage(USBWARP_SESSION_WAIT_VM);
+        wait_stage(USBWARP_SESSION_WAIT_TARGET);
+        CHECK(target_status().selected.kind==USBWARP_TARGET_NONE);
+        ULONGLONG idleUntil=GetTickCount64()+6000;
+        while(GetTickCount64()<idleUntil){CHECK(status().session_state==USBWARP_SESSION_WAIT_TARGET);Sleep(100);}
+        usbwarp_pipe_vm_list_request listRequest{};
+        CHECK(status_of(call(USBWARP_PIPE_CMD_LIST_VMS,&listRequest,sizeof(listRequest)))==0);
+        marker(L"forbid_shm",false);
+        select_wsl();wait_stage(USBWARP_SESSION_WAIT_VM);
         auto binding=bind_payload();
         CHECK(status_of(call(USBWARP_PIPE_CMD_BIND_DEVICE,binding.data(),(uint32_t)binding.size()))==-ERROR_NOT_READY);
         idle=connect_pipe(); // idle client must neither monopolize IPC nor delay stop
@@ -285,6 +317,9 @@ int main(int argc, char **argv)
         nonadmin_denied(binding);
         CHECK(status_of(call(USBWARP_PIPE_CMD_BIND_DEVICE,binding.data(),(uint32_t)binding.size()))==0);
         CHECK(status().bound_device_count==1);
+        usbwarp_pipe_target clearTarget{};
+        CHECK(status_of(call(USBWARP_PIPE_CMD_SET_TARGET,&clearTarget,sizeof(clearTarget)))==-ERROR_BUSY);
+        CHECK(target_status().selected.kind==USBWARP_TARGET_WSL);
         marker(L"device_gone",true); CHECK(status().bound_device_count==0); // backend truth, no mirror
         marker(L"device_gone",false);
         // Oversized message with an otherwise valid prefix must never execute.
@@ -297,8 +332,19 @@ int main(int argc, char **argv)
 
         marker(L"vm_up",false); wait_stage(USBWARP_SESSION_WAIT_VM);
         CHECK(state(service).dwProcessId==first.dwProcessId); // no process exit on VM loss
+        marker(L"vm_new_id",true); // WSL creates a different HCS system after shutdown
         marker(L"vm_up",true); wait_stage(USBWARP_SESSION_RUNNING);
+        wait_target("22222222-2222-2222-2222-222222222222");
         CHECK(status().bound_device_count==0);
+        marker(L"vm_up",false);wait_stage(USBWARP_SESSION_WAIT_VM);
+        marker(L"vm_ambiguous",true);marker(L"vm_up",true);
+        wait_target("",ERROR_DUP_NAME);CHECK(target_status().matches==2);
+        CHECK(status().session_state==USBWARP_SESSION_WAIT_VM);
+        marker(L"vm_ambiguous",false);wait_stage(USBWARP_SESSION_RUNNING);
+        CHECK(status_of(call(USBWARP_PIPE_CMD_SET_TARGET,&clearTarget,sizeof(clearTarget)))==0);
+        wait_stage(USBWARP_SESSION_WAIT_TARGET);wait_target("");
+        select_wsl();wait_stage(USBWARP_SESSION_RUNNING);
+        CHECK(state(service).dwProcessId==first.dwProcessId);
 
         // Verify the SCM failure action using only the fixture process ID.
         HANDLE process=OpenProcess(PROCESS_TERMINATE|SYNCHRONIZE,FALSE,first.dwProcessId);
@@ -310,6 +356,8 @@ int main(int argc, char **argv)
             CHECK(GetTickCount64()<deadline); Sleep(100);
         }
         wait_stage(USBWARP_SESSION_RUNNING);
+        CHECK(target_status().selected.kind==USBWARP_TARGET_WSL);
+        wait_target("22222222-2222-2222-2222-222222222222");
         result=0;
     } catch (const std::exception &error) { fprintf(stderr,"SCM regression failed: %s\n",error.what()); }
     if (idle!=INVALID_HANDLE_VALUE) CloseHandle(idle);
@@ -320,6 +368,8 @@ int main(int argc, char **argv)
         catch (...) { result=1; }
     }
     marker(L"vm_up",false); marker(L"driver_down",false); marker(L"device_gone",false);
+    marker(L"vm_new_id",false);marker(L"vm_ambiguous",false);marker(L"discovery_error",false);
+    marker(L"forbid_shm",false);
     if (!result) printf("SCM/IPC/session regression: %u checks passed (fixture backends; no real USB/VM I/O)\n",checks);
     return result;
 }

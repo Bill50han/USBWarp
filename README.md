@@ -4,16 +4,19 @@
 
 UsbWarp replaces network-based USB/IP with a shared-memory MMIO ring protocol. Windows and Linux kernels exchange USB transfers directly; the Windows service manages capture, configuration and session lifetime.
 
-> **Alpha release: v0.2.0-alpha**
+> **Alpha release: v0.2.1-alpha**
 >
-> This release rebuilds device capture and service management, adds USB 3.x
-> and ISO transfer support, and hardens the shared-memory and control interfaces.
+> This release adds persistent VM selection and automatic discovery of WSL's
+> current HCS ID, building on the USB 3.x, ISO and capture support in v0.2.0-alpha.
 > The current hardware validation uses one USB 3 mass-storage device through a
 > hub in Windows 11 / nested WSL2. ISO peripherals, UAS and all SSP lane modes
-> still need hardware testing. See [release notes](docs/release-0.2.0-alpha.txt).
+> still need hardware testing. See [release notes](docs/release-0.2.1-alpha.txt).
 >
 > Drivers are test-signed, not WHQL-certified. This is a prerelease for test
 > environments; use a VM with a snapshot.
+
+The `vm` commands below require the v0.2.1-alpha Service and Controller.
+Upgrades retain an existing fixed-ID selection until `vm use` changes it.
 
 ## How It Works
 
@@ -182,15 +185,17 @@ The executable supports both a console host and an SCM-managed Windows service.
 Install the kernel driver first; the installed service depends on `UsbWarp`.
 
 ```powershell
-# Find your WSL2 VM GUID
-# (Use hcsdiag.exe list)
-
 # Console mode (requires an elevated shell — the manifest asks for admin):
-.\USBWarpService.exe --id <WSL2-VM-GUID>
+.\USBWarpService.exe --wsl
 
 # --- or install as an auto-start Windows service (admin) ---
-.\USBWarpService.exe --install --id <WSL2-VM-GUID> --iso
+.\USBWarpService.exe --install
+# Configure the WSL owner's service Log On account as described below.
 sc.exe start UsbWarpService
+# Select a persistent target separately from service installation:
+.\USBWarpController.exe vm list
+.\USBWarpController.exe vm use --wsl
+.\USBWarpController.exe vm status
 # Stop or restart through SCM:
 sc.exe stop UsbWarpService
 sc.exe start UsbWarpService
@@ -214,17 +219,36 @@ access denied; running the SCM service as the WSL owner succeeded. Re-running
 
 SCM `RUNNING` means that the host and its local control interface are ready.
 `USBWarpController.exe status` reports the separate USB session stage, including
-`WAITING_FOR_DRIVER`, `WAITING_FOR_VM` and `WAITING_FOR_GUEST`. The service can be
+`WAITING_FOR_TARGET`, `WAITING_FOR_DRIVER`, `WAITING_FOR_VM` and `WAITING_FOR_GUEST`. The service can be
 stopped while waiting. Driver/VM disconnects close the old session and retry the
 configured VM without exiting the process. Bind requests fail until the kernel
 has completed guest negotiation; `--debug` only changes diagnostics.
 
-The VM GUID is fixed configuration, not a distribution name. If WSL recreates its
-utility VM with another GUID, update `--id` and restart the service. Reconnected
-sessions begin with no device bindings; bind the intended devices explicitly.
+Installation does not require a VM ID. `vm use --wsl` persists a WSL selector;
+the service uses the public `HcsEnumerateComputeSystems` API to resolve the
+current ID on connection and reconnection. Starting WSL normally is sufficient;
+the service does not launch a distribution or boot a VM. Reconnected sessions
+begin with no USB bindings; bind the intended devices explicitly.
+
+For other HCS-visible virtual machines use `vm use --name "VM name"`, optionally
+with `--owner "VMMS"` (or the Owner displayed by `vm list`). Names and owners
+match exactly, ignoring case; wildcards are not interpreted. An explicit
+`vm use --id GUID` retains fixed-ID behavior. `vm clear` releases the empty
+session and leaves the service running without a selected target. Selection
+changes require elevation, persist atomically and do not require reinstalling
+or restarting the service. Existing bindings or pending restoration records
+prevent switching; unbind and finish recovery first.
+
+WSL often has no HCS Name: `--wsl` means the unique running virtual machine with
+HCS Owner `WSL` visible to the service. This is not a distribution-name or user-SID
+filter. Multiple matches are reported as ambiguous and never resolved by taking
+the first entry. Configure the service's appropriate account, and use an explicit
+ID when a shared multi-user host cannot identify one WSL target unambiguously.
+HCS visibility does not guarantee HDV support or access: `vm status` distinguishes
+the saved selector, resolved ID, attached ID and errors. See [VM selection](docs/vm-selection.txt).
 
 IPC accepts up to eight concurrent local clients. Authenticated users can query;
-bind/unbind requires an enabled Administrator or LocalSystem token. Remote clients,
+bind/unbind and target changes require an enabled Administrator or LocalSystem token. Remote clients,
 oversized/partial messages and invalid paths are rejected. Service/session start
 and stop are managed through SCM (or Ctrl+C in console mode); the old reserved
 pipe command numbers for those actions are not implemented.

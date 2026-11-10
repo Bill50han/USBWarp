@@ -491,6 +491,7 @@ static void PrintUsage(void)
         "  usbwarp unbind <BUSID>         Unbind device from guest\n"
         "  usbwarp status                 Show session status\n"
         "  usbwarp stats                  Show performance statistics\n"
+        "  usbwarp vm list|use|status|clear Select the guest VM (vm --help)\n"
         "\n"
         "Examples:\n"
         "  usbwarp list\n"
@@ -512,6 +513,7 @@ int main(int argc, char *argv[])
     }
 
     cmd = argv[1];
+    if (strcmp(cmd, "vm") == 0) return CmdVm();
 
     if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
         PrintUsage();

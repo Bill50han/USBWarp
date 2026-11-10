@@ -18,6 +18,7 @@
     <ClCompile Include="main.c">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="vm_commands.c"><Filter>源文件</Filter></ClCompile>
     <ClCompile Include="pipe_client.c">
       <Filter>源文件</Filter>
     </ClCompile>

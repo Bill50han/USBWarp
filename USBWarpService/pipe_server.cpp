@@ -4,6 +4,7 @@
 #include "warp_service.h"
 #include <stdio.h>
 #include <sddl.h>
+#include <new>
 
 namespace {
 constexpr DWORD MaxFrame = 65536;
@@ -97,11 +98,39 @@ BOOL Status(warp_session *s, HANDLE pipe, uint32_t seq)
 BOOL Dispatch(warp_session *s, HANDLE pipe, const usbwarp_pipe_header &header, const BYTE *payload)
 {
     uint32_t size = header.payload_length, seq = header.sequence_id;
-    bool mutation = header.command == USBWARP_PIPE_CMD_BIND_DEVICE || header.command == USBWARP_PIPE_CMD_UNBIND_DEVICE;
+    bool mutation = header.command == USBWARP_PIPE_CMD_BIND_DEVICE || header.command == USBWARP_PIPE_CMD_UNBIND_DEVICE ||
+        header.command == USBWARP_PIPE_CMD_SET_TARGET;
     if (mutation && !Administrator(s, pipe)) return Error(s, pipe, seq, ERROR_ACCESS_DENIED, "administrator privileges required");
     if (header.command == USBWARP_PIPE_CMD_QUERY_STATUS) {
         if (size) return Error(s, pipe, seq, ERROR_INVALID_DATA, "unexpected payload");
         return Status(s, pipe, seq);
+    }
+    if (header.command == USBWARP_PIPE_CMD_QUERY_TARGET) {
+        if (size) return Error(s, pipe, seq, ERROR_INVALID_DATA, "unexpected payload");
+        usbwarp_pipe_target_status target{};
+        VmTargetStatus(s, &target);
+        return Respond(s, pipe, seq, 0, &target, sizeof(target));
+    }
+    if (header.command == USBWARP_PIPE_CMD_LIST_VMS) {
+        if (size != sizeof(usbwarp_pipe_vm_list_request)) return Error(s, pipe, seq, ERROR_INVALID_DATA, "invalid VM list request");
+        usbwarp_pipe_vm_list_request request;
+        memcpy(&request, payload, sizeof(request));
+        std::vector<BYTE> reply;
+        DWORD error;
+        try { error = VmList(s, request, reply); }
+        catch (const std::bad_alloc &) { error = ERROR_NOT_ENOUGH_MEMORY; }
+        if (error) return Error(s, pipe, seq, error, "VM list changed or request is invalid; retry");
+        return Respond(s, pipe, seq, 0, reply.data(), (uint32_t)reply.size());
+    }
+    if (header.command == USBWARP_PIPE_CMD_SET_TARGET) {
+        if (size != sizeof(usbwarp_pipe_target)) return Error(s, pipe, seq, ERROR_INVALID_DATA, "invalid target request");
+        usbwarp_pipe_target wire; memcpy(&wire, payload, sizeof(wire));
+        warp_target target{};
+        DWORD error = TargetFromWire(wire, &target);
+        if (!error) error = VmSelect(s, target);
+        if (error) return Error(s, pipe, seq, error, error == ERROR_BUSY ?
+            "unbind all USB devices and finish pending restoration before changing target" : "target selection was not saved");
+        return Simple(s, pipe, seq, "target saved; service resolves and connects asynchronously; use vm status");
     }
     if (s->stage.load() != USBWARP_SESSION_RUNNING || !DrvClientActive(s))
         return Error(s, pipe, seq, ERROR_NOT_READY, "USB session is not ready");

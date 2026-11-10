@@ -44,6 +44,8 @@ DWORD ServiceRun(warp_session *s, bool serviceMode, int argc, WCHAR *argv[])
     s->serviceMode = serviceMode;
     DWORD error = LoadConfig(argc, argv, &s->cfg);
     if (error) { LogError("Invalid service configuration: %lu", error); return error; }
+    s->selectedTarget = s->cfg.target;
+    s->targetError = s->cfg.target.kind == USBWARP_TARGET_NONE ? ERROR_SUCCESS : ERROR_NOT_READY;
     s->start_time_ns = NowNs();
     AcquireSRWLockExclusive(&s->lifecycleLock);
     s->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -55,6 +57,10 @@ DWORD ServiceRun(warp_session *s, bool serviceMode, int argc, WCHAR *argv[])
     if (!error) {
         s->driverFaultEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!s->driverFaultEvent) error = GetLastError();
+    }
+    if (!error) {
+        s->targetChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!s->targetChangedEvent) error = GetLastError();
     }
     ReleaseSRWLockExclusive(&s->lifecycleLock);
     if (error) goto cleanup;
@@ -91,9 +97,11 @@ cleanup:
         HdvUnloadApis(&s->api);
         AcquireSRWLockExclusive(&s->lifecycleLock);
         if (s->driverFaultEvent) CloseHandle(s->driverFaultEvent);
+        if (s->targetChangedEvent) CloseHandle(s->targetChangedEvent);
         if (s->sessionStopEvent) CloseHandle(s->sessionStopEvent);
         if (s->stopEvent) CloseHandle(s->stopEvent);
         s->driverFaultEvent = s->sessionStopEvent = s->stopEvent = nullptr;
+        s->targetChangedEvent = nullptr;
         ReleaseSRWLockExclusive(&s->lifecycleLock);
     }
     s->stage.store(USBWARP_SESSION_STOPPED);

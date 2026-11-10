@@ -1,0 +1,121 @@
+VM selection (v0.2.1-alpha)
+==========================
+
+Install the service independently of the guest:
+  USBWarpService.exe --install
+  sc.exe start UsbWarpService
+
+Configure the service Log On account as described in README.md. On the tested
+WSL 2.6.3 setup, HDV initialization requires the WSL owner's account even though
+LocalSystem can enumerate and open the HCS system. Administrative privileges
+alone do not imply permission to initialize every device host.
+
+Inspect and select through the Controller:
+  USBWarpController.exe vm list
+  USBWarpController.exe vm use --wsl
+  USBWarpController.exe vm status
+  USBWarpController.exe status
+  USBWarpController.exe bind <BUSID>
+
+The service keeps one selected target and one active USB session. Selection is
+acknowledged once validated and persisted; discovery, old-session teardown and
+attachment happen asynchronously. The reply does not claim that the guest is
+already connected. vm status reports saved selection, resolved/attached IDs,
+ambiguity or access errors and the current USB session stage.
+
+WSL mode matches SystemType=VirtualMachine and Owner=WSL. The WSL HCS object
+observed in Win11Debug has no Name field. Ubuntu-22.04 and other distribution
+names are not HCS VM names; distributions can share the same WSL2 VM and USB
+devices. --wsl is a unique-visible-WSL selector, not a user-SID boundary. If more
+than one running WSL system is visible, selection waits with ERROR_DUP_NAME.
+It never selects the first, newest or arbitrary compute system. No distribution
+is automatically started. When WSL restarts with a different ID, that new ID is
+resolved from a fresh enumeration; USB devices must be explicitly bound again.
+Guest reconnection still requires the usbwarp module to be loaded (or installed
+for automatic loading). Until then the attached target reports WAITING_FOR_GUEST.
+
+Other targets:
+  USBWarpController.exe vm use --name "Linux Dev" --owner VMMS
+  USBWarpController.exe vm use --id 11111111-1111-1111-1111-111111111111
+  USBWarpController.exe vm clear
+
+Name and optional owner are literal case-insensitive matches, not patterns.
+Names are not a cryptographic identity: the selection follows the matching
+HCS object. Control characters and malformed Unicode are rejected. Fixed IDs
+are normalized GUIDs and are never silently changed to a discovered different
+VM. Explicit ID mode can attempt a direct open if enumeration is unavailable.
+Paused/stopped/template VMs are not automatically chosen; VMMS can omit State
+for an existing VM, in which case opening the specific system is authoritative.
+An enumerated VM still needs compatible HDV facilities and a UsbWarp guest.
+
+Switching/clearing is refused while the kernel has bound USB devices or capture
+restoration records remain. The same capture lock serializes this check with
+binding. A generation check also prevents a delayed open or stale session worker
+from accepting binds for a superseded target. Clear leaves SCM running in
+WAITING_FOR_TARGET after the previous resources drain. Stop remains available
+while waiting for a VM, a guest or a target.
+
+Persistence and compatibility
+-----------------------------
+The existing Config registry value is upgraded to version 2 when configuration
+is saved. It stores the selector, not the last discovered ID. Version 1 and
+legacy VmId values are read as explicit fixed-ID selectors; existing installs
+are not redirected automatically. Transport sizes, ISO and diagnostic settings
+are preserved. Downgrading to the published v0.2.0-alpha requires restoring a
+compatible configuration backup; that version cannot read the v2 Config value.
+
+Console/install overrides are --wsl, --vm-name NAME [--vm-owner OWNER], --id GUID
+or --no-vm. A new install without one starts unselected. Re-running --install
+retains a saved target unless explicitly overridden. Controller selection changes
+apply to the running service and survive its restart. Re-running --install still
+requires a service restart to apply unrelated transport configuration changes.
+
+New pipe commands are additive; the existing status/device/transfer wire layouts
+are unchanged. VM listing is a bounded paginated snapshot and includes a generation
+to reject mixed pages. Read-only queries retain the existing authenticated-user
+policy; target mutations require an enabled administrator or LocalSystem token.
+All fixed UTF-8 request fields are checked for terminators, valid encoding, zero
+padding and reserved fields. Names are never substituted into shell commands.
+
+Discovery uses public HcsEnumerateComputeSystems and its documented JSON Properties
+result, parsed with Windows.Data.Json. Results are refreshed while waiting and
+periodically during an active session. A failed enumeration is reported rather
+than using stale IDs for name/WSL attachment. The cache and target state are
+service control data; the kernel remains authoritative for USB binding and URBs.
+No Linux/kernel transport or per-URB polling path changes are required.
+
+Validation on 2026-11-10
+------------------------
+Release x64 Service and Controller builds passed without warnings. Tests covered
+28 configuration/migration checks, 54 target/discovery checks and 19 Controller
+Unicode/protocol checks, plus the existing capture, HDV, pipe security/cancellation,
+console and isolated SCM suites. The SCM fixture installs without a target,
+rejects target changes from restricted tokens, tests WSL ID replacement and
+ambiguous targets, and verifies persistence after process recovery. Its idle
+phase forbids shared-memory transport creation and checks stable target-wait status.
+
+In Win11Debug, a real wsl --shutdown / startup changed the nested WSL HCS ID
+from 8AFDC4F9-E31D-4F28-A356-EDC2A21D895B to
+D914A298-215F-46D9-998F-B19AFB82E66C. Service PID 7044 remained unchanged and
+the new ID was resolved automatically; no registry GUID edits were made.
+Both sessions captured/read/restored the authorized USB 3 storage device with
+matching 64 MiB SHA-256 checks. A third read checked the final Service build.
+All three snapshots drained to zero URBs with all 503 buffers free; default
+polling remained selected. This was read-only validation, not a throughput test.
+
+The real test also verified Unicode name round trips, refusing a switch while
+bound, retaining the WSL selector after service restart, and clearing the target
+without stopping the service. The final idle check sampled WAITING_FOR_TARGET
+24 times across a discovery interval. No new kernel fault signatures appeared
+in the collected Linux log. Core/capture drivers and the Linux module were not
+changed by this feature. Named non-WSL matching is covered by software tests;
+physical HDV operation on every HCS/VMMS VM type is not claimed.
+
+The VM's original binaries/configuration were restored, added test trust removed,
+and the original USB file hash verified unchanged. Raw evidence and binary hashes
+are retained locally under x64/ReviewChecks/VmSelection (not in source archives).
+
+References:
+https://learn.microsoft.com/en-us/virtualization/api/hcs/reference/hcsenumeratecomputesystems
+https://learn.microsoft.com/en-us/virtualization/api/hcs/schemareference#properties
+https://github.com/dorssel/usbipd-win/wiki/WSL-support

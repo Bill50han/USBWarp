@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.c" />
+    <ClCompile Include="vm_commands.c" />
     <ClCompile Include="pipe_client.c" />
     <ClCompile Include="usb_enum.c" />
   </ItemGroup>

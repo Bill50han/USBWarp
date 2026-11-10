@@ -54,7 +54,8 @@ int PipeConnect(PIPE_CLIENT *pc)
         if (err == ERROR_FILE_NOT_FOUND) {
             fprintf(stderr, "Error: UsbWarp Service is not running.\n");
             fprintf(stderr, "Start the service first:\n");
-            fprintf(stderr, "  UsbWarpService.exe --id <VM-GUID>\n");
+            fprintf(stderr, "  sc.exe start UsbWarpService\n");
+            fprintf(stderr, "  Then select a target with: USBWarpController vm use --wsl\n");
         } else if (err == ERROR_SEM_TIMEOUT) {
             fprintf(stderr, "Error: Service pipe is busy.\n");
         } else {

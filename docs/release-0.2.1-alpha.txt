@@ -1,0 +1,88 @@
+USBWarp v0.2.1-alpha
+===================
+
+The service no longer needs a VM GUID at installation. Select a persistent
+target through the Controller, and let the service discover its current HCS
+ID on connection and reconnection. This fixes the fixed-GUID workflow that
+required manual reconfiguration when WSL recreated its utility VM.
+
+New workflow (elevated shell, after deploying the updated binaries)
+----------------------------------------------------------------
+  USBWarpService.exe --install
+  sc.exe start UsbWarpService
+  USBWarpController.exe vm list
+  USBWarpController.exe vm use --wsl
+  USBWarpController.exe vm status
+
+For other HCS-visible virtual machines:
+  USBWarpController.exe vm use --name "Linux Dev" --owner VMMS
+  USBWarpController.exe vm use --id <GUID>
+  USBWarpController.exe vm clear
+
+Changes since v0.2.0-alpha
+-------------------------
+* Service installation and target selection are separate. A new installation
+  can remain in WAITING_FOR_TARGET without allocating a shared-memory transport.
+* The service uses the public HcsEnumerateComputeSystems API and documented
+  JSON fields to resolve named VMs or the unique visible running WSL VM.
+  It does not parse hcsdiag output or construct shell commands from names.
+* Selection persists and takes effect without reinstalling/restarting the
+  service. WSL shutdown/startup can produce a new ID, which is resolved anew.
+  Guest module availability and USB binding remain separate steps.
+* Multiple matches are rejected as ambiguous. Switching/clearing while USB
+  devices are bound or restoration is pending is refused. Generation checks
+  prevent a superseded session from accepting bindings.
+* VM list/status remain available independently of guest readiness. Discovery
+  uses bounded, consistent paginated snapshots. Unicode names, malformed UTF-8,
+  terminators, padding, reserved fields and mutation permissions are checked.
+* Existing fixed-ID and legacy configurations remain readable. Saved configuration
+  is upgraded atomically to v2, including compatibility with old GUID padding.
+* Windows driver and Linux transport logic are unchanged. The base protocol
+  remains 1.0 and adaptive polling remains the default. No per-URB discovery,
+  new data copy or changed interrupt policy was introduced.
+
+Target and account semantics
+----------------------------
+WSL commonly has Owner=WSL and no HCS Name. --wsl selects the unique running
+WSL VM visible to the service, not a distribution or a user SID. Distributions
+can share one WSL2 VM and its USB devices. A shared host with multiple WSL VMs
+must resolve ambiguity rather than relying on an arbitrary first match.
+
+Names and optional owners match literally, ignoring case; they are not patterns
+or cryptographic identities. HCS visibility does not guarantee HDV support or
+access. Configure the service's Log On account appropriately: in the tested
+WSL 2.6.3 environment, the WSL owner's account can initialize HDV where
+LocalSystem cannot. The service does not automatically boot a VM/distribution.
+
+Validation
+----------
+Configuration migration, target matching, stale-session admission, Unicode/IPC
+boundaries, restricted-token permissions, service lifetime and SCM recovery
+tests passed. In Win11Debug, a real WSL restart changed its HCS ID while the
+service PID remained unchanged, and USB reads worked after reconnection.
+Target persistence across a service restart, rejection of a switch while bound,
+clearing selection and stable idle status were also checked. The development
+run performed three 64 MiB hash reads with matching data and no USB writes.
+See validation.txt beside the archives for checks of the final release package.
+
+This remains an alpha release. Physical ISO/HID/UAS/SSP combinations and every
+HCS/VMMS VM type are not covered by the current hardware matrix. Earlier
+Driver Verifier and longer storage tests remain documented with their original
+build scope; this release does not claim new Verifier or throughput results.
+
+Upgrade
+-------
+Stop the old service and restore captured devices before replacing files.
+Back up the existing service configuration. After upgrading, an existing GUID
+remains an explicit fixed-ID selector until vm use changes it. Re-running
+--install without target arguments preserves a saved selection.
+
+Saving a target writes Config v2. Downgrading to v0.2.0-alpha requires restoring
+a compatible configuration backup as well as its binaries. Do not remove
+pending capture restoration records. Follow INSTALL.txt in the Windows ZIP.
+
+Drivers remain test-signed, not WHQL-certified. The optional prebuilt Linux
+module targets only 6.6.87.2-microsoft-standard-WSL2 x86_64 with the recorded
+configuration; do not force-load it on other kernels. Full corresponding source,
+PDBs, public test certificate, manifests and SHA-256 checksums accompany the
+release. Private signing keys and lab credentials are not distributed.
